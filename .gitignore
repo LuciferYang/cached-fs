@@ -1,0 +1,14 @@
+target/
+.idea/
+*.iml
+*.iws
+*.ipr
+.project
+.classpath
+.settings/
+.factorypath
+.vscode/
+.DS_Store
+out/
+build/maven/
+dependency-reduced-pom.xml

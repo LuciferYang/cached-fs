@@ -1,0 +1,10 @@
+cached-fs
+Copyright (c) 2026 The cached-fs Authors
+
+This product includes software developed by The cached-fs Authors
+(https://github.com/luciferyang/cached-fs).
+
+Portions of this software are derived from the Velox project
+(https://github.com/facebookincubator/velox), licensed under the
+Apache License, Version 2.0. See `velox-file-read-cache.md` for the
+design specification.
