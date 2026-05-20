@@ -188,8 +188,11 @@ class SsdFileTest {
   }
 
   @Test
-  @DisplayName("write returns Optional.empty when maxEntries cap is hit")
+  @DisplayName("write returns Optional.empty when maxEntries cap is hit (velox SsdFile.cpp:376)")
   void maxEntriesCap(@TempDir Path dir) throws IOException {
+    // Velox uses `entries.size() + pins.size() >= maxEntries`. For Java's single-entry write API
+    // that means the cap admits `maxEntries - 1` entries and rejects the next one — set
+    // maxEntries=2 so the first write succeeds and the second is rejected.
     StringIdMap ids = new StringIdMap();
     long fn = ids.makeId("file://cap");
     SsdFile.Config cfg =
@@ -199,7 +202,7 @@ class SsdFileTest {
             dir.resolve("log"),
             dir.resolve("cpt.tmp"),
             /* maxRegions= */ 2,
-            /* maxEntries= */ 1,
+            /* maxEntries= */ 2,
             /* checkpointIntervalBytes= */ 0L,
             /* checksumEnabled= */ false,
             /* checksumReadVerificationEnabled= */ false);

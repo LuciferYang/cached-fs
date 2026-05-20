@@ -128,12 +128,15 @@ class CacheEntryTest {
   }
 
   @Test
-  @DisplayName("setSsdFile does NOT clear ssdSaveable flag")
-  void setSsdFileDoesNotClearSaveable() {
+  @DisplayName("setSsdFile clears ssdSaveable (velox AsyncDataCache.h:277-281 parity)")
+  void setSsdFileClearsSaveable() {
+    // The entry was marked saveable while RAM-only; once it becomes SSD-resident the SSD-save
+    // path must not re-flush it. completeExclusive avoids re-marking, but setSsdFile is the
+    // boundary that flips the flag when an entry transitions to SSD-backed.
     CacheEntry e = new CacheEntry();
     e.setSsdSaveable(true);
     e.setSsdFile(new Object(), 1024L);
-    assertThat(e.ssdSaveable()).isTrue();
+    assertThat(e.ssdSaveable()).isFalse();
     assertThat(e.ssdOffset()).isEqualTo(1024L);
   }
 
