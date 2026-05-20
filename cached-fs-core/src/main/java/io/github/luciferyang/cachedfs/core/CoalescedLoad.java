@@ -52,11 +52,11 @@ public abstract class CoalescedLoad implements AutoCloseable {
   /** Sealed result of {@link #loadOrFuture(boolean, boolean)}. */
   public sealed interface LoadResult {
     /**
-     * No further action available on this call: the load is either terminally finished
-     * (LOADED or CANCELLED) or the caller passed {@code wait=false} while another thread was
-     * already filling — the caller will not be notified of that fill's completion. Callers
-     * relying on the entries being live MUST re-probe the cache rather than assume {@code
-     * pins()} reflects the in-flight load.
+     * No further action available on this call: the load is either terminally finished (LOADED or
+     * CANCELLED) or the caller passed {@code wait=false} while another thread was already filling —
+     * the caller will not be notified of that fill's completion. Callers relying on the entries
+     * being live MUST re-probe the cache rather than assume {@code pins()} reflects the in-flight
+     * load.
      */
     record Done() implements LoadResult {}
 
@@ -265,10 +265,9 @@ public abstract class CoalescedLoad implements AutoCloseable {
 
   /**
    * Cancels any waiters and releases the shared pins so their entries become evictable. Safe to
-   * call multiple times; idempotent. The state flip, pin drain, and promise drain all happen
-   * inside one mutex section so a concurrent runLoad observes a single atomic transition
-   * (either it publishes before close arrives and close drains, or it sees CANCELLED and closes
-   * its own pins).
+   * call multiple times; idempotent. The state flip, pin drain, and promise drain all happen inside
+   * one mutex section so a concurrent runLoad observes a single atomic transition (either it
+   * publishes before close arrives and close drains, or it sees CANCELLED and closes its own pins).
    */
   @Override
   public void close() {

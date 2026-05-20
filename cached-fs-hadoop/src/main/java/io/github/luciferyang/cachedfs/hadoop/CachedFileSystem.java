@@ -34,10 +34,11 @@ import org.apache.hadoop.util.ReflectionUtils;
  * tiers. All non-read operations (create, rename, delete, listStatus, getFileStatus, …) inherit
  * unchanged from {@link FilterFileSystem} and delegate straight to the wrapped inner FS.
  *
- * <p><b>Wiring:</b> set {@code fs.<scheme>.impl=io.github.luciferyang.cachedfs.hadoop.CachedFileSystem}
- * plus {@code fs.cached.inner.impl=<original-impl-class>}. The decorator instantiates the inner FS
- * privately so consumers that resolve the scheme via {@link FileSystem#get(URI, Configuration)}
- * receive the decorator, not the inner.
+ * <p><b>Wiring:</b> set {@code
+ * fs.<scheme>.impl=io.github.luciferyang.cachedfs.hadoop.CachedFileSystem} plus {@code
+ * fs.cached.inner.impl=<original-impl-class>}. The decorator instantiates the inner FS privately so
+ * consumers that resolve the scheme via {@link FileSystem#get(URI, Configuration)} receive the
+ * decorator, not the inner.
  *
  * <p><b>Toggle:</b> {@code fs.cached.enabled=false} makes {@link #open} delegate straight to the
  * inner without consulting the cache — useful for A/B benchmarking without redeploying.
@@ -111,9 +112,9 @@ public final class CachedFileSystem extends FilterFileSystem {
    *
    * <p><b>Note on {@code bufferSize}:</b> when {@code fs.cached.enabled=true} the parameter is
    * forwarded to the inner FS only when the cache is bypassed; the caching path uses {@code
-   * fs.cached.load-quantum-bytes} as the read granularity instead, so a Spark / MR job that
-   * tuned {@code bufferSize} sees that knob effectively ignored. Document this in any consumer
-   * tuning guide.
+   * fs.cached.load-quantum-bytes} as the read granularity instead, so a Spark / MR job that tuned
+   * {@code bufferSize} sees that knob effectively ignored. Document this in any consumer tuning
+   * guide.
    */
   @Override
   public FSDataInputStream open(Path f, int bufferSize) throws IOException {

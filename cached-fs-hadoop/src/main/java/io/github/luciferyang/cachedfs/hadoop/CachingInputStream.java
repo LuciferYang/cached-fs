@@ -195,8 +195,8 @@ public final class CachingInputStream extends InputStream implements Seekable, P
   // --- core read-with-cache loop ------------------------------------------
 
   /**
-   * Copies exactly {@code length} bytes starting at file offset {@code pos} into {@code dst[off..]}.
-   * Walks the overlapping cache chunks; each chunk is hit-or-fill via {@link
+   * Copies exactly {@code length} bytes starting at file offset {@code pos} into {@code
+   * dst[off..]}. Walks the overlapping cache chunks; each chunk is hit-or-fill via {@link
    * AsyncDataCache#findOrCreate}.
    */
   private void readFullyFromCache(long pos, byte[] dst, int off, int length) throws IOException {

@@ -39,8 +39,8 @@ public final class HadoopReadFile implements ReadFile {
 
   /**
    * Lazily opened on first read; {@code volatile} so the unlocked fast-path check in {@link
-   * #openIfNeeded()} sees publication writes from the slow path. Plain visibility is not enough —
-   * a reader observing a non-null reference could otherwise see a partially-constructed stream.
+   * #openIfNeeded()} sees publication writes from the slow path. Plain visibility is not enough — a
+   * reader observing a non-null reference could otherwise see a partially-constructed stream.
    */
   private volatile FSDataInputStream stream;
 

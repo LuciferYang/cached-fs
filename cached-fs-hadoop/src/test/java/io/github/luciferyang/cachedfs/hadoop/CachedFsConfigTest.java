@@ -51,8 +51,7 @@ class CachedFsConfigTest {
     SsdCache.Config cfg = CachedFsConfig.ssdConfig(conf);
     assertThat(cfg).isNotNull();
     assertThat(cfg.directories())
-        .containsExactly(
-            Paths.get("/mnt/nvme0"), Paths.get("/mnt/nvme1"), Paths.get("/mnt/nvme2"));
+        .containsExactly(Paths.get("/mnt/nvme0"), Paths.get("/mnt/nvme1"), Paths.get("/mnt/nvme2"));
   }
 
   @Test

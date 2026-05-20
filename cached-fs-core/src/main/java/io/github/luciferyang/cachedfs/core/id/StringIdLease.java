@@ -67,11 +67,11 @@ public final class StringIdLease implements AutoCloseable {
   }
 
   /**
-   * Releases the reference. Safe to call multiple times AND safe under accidental concurrent
-   * close (exception-handler double-close or contract violation): the synchronized guard
-   * ensures {@code map.release} fires at most once per lease, preventing a sub-zero refcount
-   * that would let {@link StringIdMap} reissue the id under a different name while a caller
-   * still believes the old binding is alive.
+   * Releases the reference. Safe to call multiple times AND safe under accidental concurrent close
+   * (exception-handler double-close or contract violation): the synchronized guard ensures {@code
+   * map.release} fires at most once per lease, preventing a sub-zero refcount that would let {@link
+   * StringIdMap} reissue the id under a different name while a caller still believes the old
+   * binding is alive.
    */
   @Override
   public synchronized void close() {

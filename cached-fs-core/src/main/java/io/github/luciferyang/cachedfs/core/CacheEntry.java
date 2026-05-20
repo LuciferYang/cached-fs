@@ -419,9 +419,9 @@ public final class CacheEntry {
   }
 
   /**
-   * Records that this entry has an SSD copy at {@code offset} on {@code ssdFile}. Clears
-   * {@link #ssdSaveable()} so the entry is not subsequently re-flushed to SSD as if it were
-   * RAM-only — matches velox {@code AsyncDataCacheEntry::setSsdFile} (AsyncDataCache.h:277-281).
+   * Records that this entry has an SSD copy at {@code offset} on {@code ssdFile}. Clears {@link
+   * #ssdSaveable()} so the entry is not subsequently re-flushed to SSD as if it were RAM-only —
+   * matches velox {@code AsyncDataCacheEntry::setSsdFile} (AsyncDataCache.h:277-281).
    */
   void setSsdFile(Object ssdFile, long offset) {
     this.ssdFile = ssdFile;

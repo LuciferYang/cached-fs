@@ -246,9 +246,7 @@ class SsdCacheTest {
   @DisplayName("multi-directory: numShards independent of directory count (8 shards / 2 dirs)")
   void multiDirShardsExceedDirs(@TempDir Path dirA, @TempDir Path dirB) throws IOException {
     StringIdMap ids = new StringIdMap();
-    var cfg =
-        new SsdCache.Config(
-            List.of(dirA, dirB), "ssd", 8, 2, 0, 0L, false, false);
+    var cfg = new SsdCache.Config(List.of(dirA, dirB), "ssd", 8, 2, 0, 0L, false, false);
     try (SsdCache c = new SsdCache(cfg, ids)) {
       assertThat(c.numShards()).isEqualTo(8);
       // Even shards in dirA, odd shards in dirB.
@@ -265,8 +263,7 @@ class SsdCacheTest {
     StringIdMap ids = new StringIdMap();
     long fnA = ids.makeId("file://A");
     long fnB = ids.makeId("file://B");
-    var cfg =
-        new SsdCache.Config(List.of(dirA, dirB), "ssd", 2, 2, 0, 0L, false, false);
+    var cfg = new SsdCache.Config(List.of(dirA, dirB), "ssd", 2, 2, 0, 0L, false, false);
     try (SsdCache c = new SsdCache(cfg, ids)) {
       // Force shard 0 (on dirA) into NO_SPACE; shard 1 (on dirB) stays ACTIVE and serves writes.
       c.shard(0).testingForceState(SsdFile.State.NO_SPACE);
@@ -289,8 +286,7 @@ class SsdCacheTest {
   void multiDirFailFastOnMissing(@TempDir Path dir) {
     StringIdMap ids = new StringIdMap();
     Path missing = dir.resolve("not-mounted");
-    var cfg =
-        new SsdCache.Config(List.of(dir, missing), "ssd", 2, 2, 0, 0L, false, false);
+    var cfg = new SsdCache.Config(List.of(dir, missing), "ssd", 2, 2, 0, 0L, false, false);
     assertThatThrownBy(() -> new SsdCache(cfg, ids))
         .isInstanceOf(IOException.class)
         .hasMessageContaining("not-mounted");
@@ -302,8 +298,7 @@ class SsdCacheTest {
     StringIdMap ids = new StringIdMap();
     Path file = dirB.resolve("not-a-directory");
     Files.writeString(file, "blocker");
-    var cfg =
-        new SsdCache.Config(List.of(dirA, file), "ssd", 2, 2, 0, 0L, false, false);
+    var cfg = new SsdCache.Config(List.of(dirA, file), "ssd", 2, 2, 0, 0L, false, false);
     assertThatThrownBy(() -> new SsdCache(cfg, ids))
         .isInstanceOf(IOException.class)
         .hasMessageContaining("not-a-directory");
@@ -312,8 +307,7 @@ class SsdCacheTest {
   @Test
   @DisplayName("multi-directory: empty directories list rejected at construction")
   void multiDirEmptyListRejected() {
-    assertThatThrownBy(
-            () -> new SsdCache.Config(List.of(), "ssd", 1, 1, 0, 0L, false, false))
+    assertThatThrownBy(() -> new SsdCache.Config(List.of(), "ssd", 1, 1, 0, 0L, false, false))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining("directories");
   }
@@ -321,8 +315,7 @@ class SsdCacheTest {
   @Test
   @DisplayName("multi-directory: null directories list rejected at construction")
   void multiDirNullListRejected() {
-    assertThatThrownBy(
-            () -> new SsdCache.Config(null, "ssd", 1, 1, 0, 0L, false, false))
+    assertThatThrownBy(() -> new SsdCache.Config(null, "ssd", 1, 1, 0, 0L, false, false))
         .isInstanceOf(NullPointerException.class);
   }
 }

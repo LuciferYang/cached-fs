@@ -81,8 +81,8 @@ public final class CacheBootstrap {
    * used to manufacture {@link FileHandle} instances for new URIs; in production this is wired to
    * the inner Hadoop {@link org.apache.hadoop.fs.FileSystem}.
    */
-  public static CacheBootstrap installIfNeeded(
-      Configuration conf, HandleOpener opener) throws IOException {
+  public static CacheBootstrap installIfNeeded(Configuration conf, HandleOpener opener)
+      throws IOException {
     CacheBootstrap snapshot = installed;
     if (snapshot != null) {
       return snapshot;

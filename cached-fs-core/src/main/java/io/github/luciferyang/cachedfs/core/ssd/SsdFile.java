@@ -137,8 +137,8 @@ public final class SsdFile implements AutoCloseable {
    * Coordinator between {@link #load} (which reads {@link #channel} outside the shard lock) and
    * {@link #close} (which must close the channel). {@code closed} is set first; close then waits
    * for {@code activeReads} to reach zero before invoking {@code channel.close()} so an in-flight
-   * read can never observe a torn-down channel. Pin protection alone is not enough — the pin
-   * blocks region overwrite, not channel teardown.
+   * read can never observe a torn-down channel. Pin protection alone is not enough — the pin blocks
+   * region overwrite, not channel teardown.
    */
   private volatile boolean closed;
 

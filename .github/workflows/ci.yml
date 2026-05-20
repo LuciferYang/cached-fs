@@ -23,7 +23,9 @@ jobs:
           java-version: ${{ matrix.jdk }}
           cache: 'maven'
       - name: Build & test
-        run: mvn -B -ntp verify
+        # Spotless / google-java-format is pinned at a JDK 21-compatible version; gate the check
+        # to that one matrix entry so newer JDKs (25+) don't trip on parser internals.
+        run: mvn -B -ntp verify -Dspotless.check.skip=${{ matrix.jdk != '21' }}
       - name: Upload coverage
         if: matrix.jdk == '21'
         uses: actions/upload-artifact@v4

@@ -24,8 +24,8 @@ import java.util.List;
 import org.apache.hadoop.conf.Configuration;
 
 /**
- * Hadoop {@link Configuration} keys for the cached-fs decorator, plus parsers that convert them into
- * the core library's typed config records.
+ * Hadoop {@link Configuration} keys for the cached-fs decorator, plus parsers that convert them
+ * into the core library's typed config records.
  *
  * <p>All keys are flat namespace-scoped under {@code fs.cached.*} so a single deployment can enable
  * caching globally via {@code fs.cached.enabled=true} without per-scheme plumbing.
