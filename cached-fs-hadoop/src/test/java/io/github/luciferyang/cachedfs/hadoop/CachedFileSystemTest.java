@@ -107,7 +107,7 @@ class CachedFileSystemTest {
       try (FSDataInputStream in = cfs.open(p, 1024)) {
         in.readFully(0, new byte[1024]);
       }
-      var statsBefore = CacheBootstrap.get().ramCache().refreshStats();
+      var statsBefore = CacheBootstrap.get().orElseThrow().ramCache().refreshStats();
       try (FSDataInputStream in = cfs.open(p, 1024)) {
         byte[] dst = new byte[1024];
         in.readFully(0, dst);
@@ -116,7 +116,7 @@ class CachedFileSystemTest {
           assertThat(dst[i]).isEqualTo(payload[i]);
         }
       }
-      var statsAfter = CacheBootstrap.get().ramCache().refreshStats();
+      var statsAfter = CacheBootstrap.get().orElseThrow().ramCache().refreshStats();
       // numHit grew on the second read; numNew did NOT (cache was already populated).
       assertThat(statsAfter.numHit()).isGreaterThan(statsBefore.numHit());
       assertThat(statsAfter.numNew()).isEqualTo(statsBefore.numNew());
@@ -138,7 +138,7 @@ class CachedFileSystemTest {
         assertThat(in.readAllBytes()).isEqualTo(payload);
       }
       // Bootstrap not installed when disabled.
-      assertThat(CacheBootstrap.get()).isNull();
+      assertThat(CacheBootstrap.get()).isEmpty();
     }
   }
 

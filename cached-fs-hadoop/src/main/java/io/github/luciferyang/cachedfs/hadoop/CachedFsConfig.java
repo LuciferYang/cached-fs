@@ -197,6 +197,6 @@ public final class CachedFsConfig {
         out.add(Paths.get(trimmed));
       }
     }
-    return out;
+    return List.copyOf(out);
   }
 }

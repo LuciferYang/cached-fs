@@ -27,8 +27,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.hadoop.fs.PositionedReadable;
 import org.apache.hadoop.fs.Seekable;
 
@@ -53,8 +55,14 @@ public final class CachingInputStream extends InputStream implements Seekable, P
   private final long fileSize;
   private final long fileNum;
 
-  private long position;
-  private boolean closed;
+  // volatile so a caller who holds a raw CachingInputStream reference (bypassing
+  // FSDataInputStream's own monitor) cannot observe a torn 64-bit read on JVMs where long writes
+  // are not atomic. Cost is one fence per access; the I/O dwarfs it.
+  private volatile long position;
+  // AtomicBoolean so close() is idempotent under accidental concurrent close — the cache pin
+  // must release exactly once even if a caller closes the FSDataInputStream from multiple
+  // threads (Hadoop's own FSDataInputStream serializes via its monitor, but defensive).
+  private final AtomicBoolean closed = new AtomicBoolean();
 
   CachingInputStream(
       CachedFactory.CachedPtr<String, FileHandle> handlePtr,
@@ -83,6 +91,10 @@ public final class CachingInputStream extends InputStream implements Seekable, P
 
   @Override
   public int read(byte[] b, int off, int len) throws IOException {
+    // InputStream contract: validate bounds and throw IndexOutOfBoundsException — Hadoop's
+    // contract tests expect the standard exception type, not a deep ArrayIndexOutOfBoundsException
+    // thrown later from a buffer copy.
+    Objects.checkFromIndexSize(off, len, b.length);
     ensureOpen();
     if (len == 0) return 0;
     if (position >= fileSize) return -1;
@@ -109,8 +121,9 @@ public final class CachingInputStream extends InputStream implements Seekable, P
 
   @Override
   public void close() throws IOException {
-    if (closed) return;
-    closed = true;
+    if (!closed.compareAndSet(false, true)) {
+      return;
+    }
     handlePtr.close();
   }
 
@@ -120,6 +133,10 @@ public final class CachingInputStream extends InputStream implements Seekable, P
   public void seek(long pos) throws IOException {
     ensureOpen();
     if (pos < 0) {
+      // Hadoop's AbstractContractSeekTest.testNegativeSeek prefers EOFException for negative
+      // positions (with plain IOException accepted only as a relaxed-compliance fallback). Use
+      // the preferred type so frameworks that catch EOFException as an out-of-range signal
+      // (HBase, some Parquet readers) work without specialized error handling.
       throw new java.io.EOFException("Cannot seek to negative offset: " + pos);
     }
     // Hadoop convention: seeking past EOF is allowed; subsequent reads return -1.
@@ -140,8 +157,12 @@ public final class CachingInputStream extends InputStream implements Seekable, P
 
   @Override
   public int read(long pos, byte[] buffer, int offset, int length) throws IOException {
+    Objects.checkFromIndexSize(offset, length, buffer.length);
     ensureOpen();
     if (length == 0) return 0;
+    if (pos < 0) {
+      throw new IllegalArgumentException("negative position: " + pos);
+    }
     if (pos >= fileSize) return -1;
     int n = (int) Math.min(length, fileSize - pos);
     readFullyFromCache(pos, buffer, offset, n);
@@ -150,9 +171,16 @@ public final class CachingInputStream extends InputStream implements Seekable, P
 
   @Override
   public void readFully(long pos, byte[] buffer, int offset, int length) throws IOException {
+    Objects.checkFromIndexSize(offset, length, buffer.length);
     ensureOpen();
     if (length == 0) return;
-    if (pos < 0 || (long) pos + length > fileSize) {
+    // PositionedReadable.readFully: EOFException means "end of stream reached"; a negative
+    // position is an argument error, not an EOF condition. Distinguish so callers that catch
+    // EOFException as a short-file signal do not misinterpret a programming bug.
+    if (pos < 0) {
+      throw new IllegalArgumentException("negative position: " + pos);
+    }
+    if ((long) pos + length > fileSize) {
       throw new java.io.EOFException(
           "readFully past EOF: pos=" + pos + " len=" + length + " size=" + fileSize);
     }
@@ -209,8 +237,23 @@ public final class CachingInputStream extends InputStream implements Seekable, P
           // We are the producer: fill the entry from the underlying file, then promote to shared
           // and copy out. exclusiveToShared atomically converts the pin so subsequent waiters see
           // the populated entry.
-          fillExclusive(exclusive.pin(), chunkStart, chunkSize);
-          try (CachePin shared = exclusive.pin().exclusiveToShared(/* ssdSavable= */ true)) {
+          CachePin exclusivePin = exclusive.pin();
+          fillExclusive(exclusivePin, chunkStart, chunkSize);
+          // exclusiveToShared transfers ownership on success; if it throws (e.g. CAS state
+          // assertion failed because the entry was racily mutated), we must close the exclusive
+          // pin ourselves — otherwise the entry stays EXCLUSIVE forever and deadlocks waiters.
+          CachePin shared;
+          try {
+            shared = exclusivePin.exclusiveToShared(/* ssdSavable= */ true);
+          } catch (RuntimeException | Error ex) {
+            try {
+              exclusivePin.close();
+            } catch (RuntimeException | Error suppressed) {
+              ex.addSuppressed(suppressed);
+            }
+            throw ex;
+          }
+          try (shared) {
             copyOutOfEntry(shared.entry(), withinChunk, copyLen, dst, dstCursor);
             return;
           }
@@ -229,11 +272,14 @@ public final class CachingInputStream extends InputStream implements Seekable, P
     List<ByteBuffer> ranges = entry.dataRanges(chunkSize);
     try {
       handle.readFile().preadv(chunkStart, ranges);
-    } catch (IOException | RuntimeException ex) {
+    } catch (IOException | RuntimeException | Error ex) {
       // Release the failed exclusive so waiters retry instead of deadlocking on the promise.
+      // Catching Error too: an OutOfMemoryError from preadv would otherwise leak the
+      // exclusive pin, leaving the cache slot in EXCLUSIVE state forever — every future
+      // findOrCreate for that key would block on the promise that no thread will complete.
       try {
         exclusivePin.close();
-      } catch (RuntimeException suppressed) {
+      } catch (RuntimeException | Error suppressed) {
         ex.addSuppressed(suppressed);
       }
       throw ex;
@@ -284,7 +330,7 @@ public final class CachingInputStream extends InputStream implements Seekable, P
   }
 
   private void ensureOpen() throws IOException {
-    if (closed) {
+    if (closed.get()) {
       throw new IOException("Stream is closed");
     }
   }

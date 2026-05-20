@@ -47,10 +47,14 @@ import org.apache.hadoop.util.ReflectionUtils;
  * {@code s3a://} and {@code hdfs://} in the same process) is deferred — Phase 4 will introduce a
  * scheme-keyed opener registry.
  */
-public class CachedFileSystem extends FilterFileSystem {
+public final class CachedFileSystem extends FilterFileSystem {
 
-  private boolean enabled;
-  private URI uri;
+  // volatile: Hadoop's FileSystem.CACHE publishes instances via a synchronized map which gives
+  // happens-before, but the test-only constructor below + tests that call initialize/open from
+  // different threads bypass that path. Volatile here is cheap and removes the publication
+  // assumption without measurable overhead.
+  private volatile boolean enabled;
+  private volatile URI uri;
 
   public CachedFileSystem() {}
 
@@ -75,24 +79,51 @@ public class CachedFileSystem extends FilterFileSystem {
     this.uri = name;
     setConf(conf);
     FileSystem inner = createInner(name, conf);
-    inner.initialize(name, conf);
-    this.fs = inner;
-    super.initialize(name, conf); // FilterFileSystem records statistics + sets working dir
-    this.enabled = CachedFsConfig.isEnabled(conf);
-    if (enabled) {
-      CacheBootstrap.installIfNeeded(conf, this::openHandleForKey);
+    // Hadoop's FileSystem.CACHE adds the instance to its map BEFORE calling initialize, and on
+    // initialize failure it discards the instance without calling close(). Anything that throws
+    // from here until the end of this method therefore leaks `inner` (sockets, threads, native
+    // resources) for the JVM lifetime. Cover inner.initialize() inside the guard too — a thrown
+    // initialize is the most likely failure point (bad config, missing credentials) and must
+    // not orphan the partially-constructed inner FS.
+    boolean initialized = false;
+    try {
+      inner.initialize(name, conf);
+      this.fs = inner;
+      super.initialize(name, conf); // FilterFileSystem records statistics + sets working dir
+      this.enabled = CachedFsConfig.isEnabled(conf);
+      if (enabled) {
+        CacheBootstrap.installIfNeeded(conf, this::openHandleForKey);
+      }
+      initialized = true;
+    } finally {
+      if (!initialized) {
+        try {
+          inner.close();
+        } catch (IOException ignored) {
+          // Best-effort cleanup; the primary exception is propagating.
+        }
+      }
     }
   }
 
+  /**
+   * {@inheritDoc}
+   *
+   * <p><b>Note on {@code bufferSize}:</b> when {@code fs.cached.enabled=true} the parameter is
+   * forwarded to the inner FS only when the cache is bypassed; the caching path uses {@code
+   * fs.cached.load-quantum-bytes} as the read granularity instead, so a Spark / MR job that
+   * tuned {@code bufferSize} sees that knob effectively ignored. Document this in any consumer
+   * tuning guide.
+   */
   @Override
   public FSDataInputStream open(Path f, int bufferSize) throws IOException {
     if (!enabled) {
       return fs.open(f, bufferSize);
     }
-    CacheBootstrap b = CacheBootstrap.get();
+    // Defensive: enabled was true at initialize but bootstrap got uninstalled (test path) —
+    // fall back to direct read rather than NPE.
+    CacheBootstrap b = CacheBootstrap.get().orElse(null);
     if (b == null) {
-      // Defensive: enabled was true at initialize but bootstrap got uninstalled (test path) —
-      // fall back to direct read rather than NPE.
       return fs.open(f, bufferSize);
     }
     Path qualified = fs.makeQualified(f);
@@ -105,8 +136,43 @@ public class CachedFileSystem extends FilterFileSystem {
       // Unwrap on the way back out so callers see the original cause.
       throw ex.getCause();
     }
-    CachingInputStream cis = new CachingInputStream(ptr, b.ramCache(), b.loadQuantumBytes());
-    return new FSDataInputStream(cis);
+    // Ownership of `ptr` transfers to `cis` once CachingInputStream's constructor succeeds (its
+    // close() releases the pin). Until then we own it ourselves, so any throw must release the
+    // pin AND unwrap UncheckedIOException so callers see the declared IOException type instead
+    // of a runtime exception.
+    CachingInputStream cis = null;
+    boolean ptrTransferred = false;
+    try {
+      cis = new CachingInputStream(ptr, b.ramCache(), b.loadQuantumBytes());
+      ptrTransferred = true;
+      return new FSDataInputStream(cis);
+    } catch (java.io.UncheckedIOException ex) {
+      releaseOnFailure(ptr, cis, ptrTransferred, ex);
+      throw ex.getCause();
+    } catch (RuntimeException | Error ex) {
+      releaseOnFailure(ptr, cis, ptrTransferred, ex);
+      throw ex;
+    }
+  }
+
+  private static void releaseOnFailure(
+      CachedFactory.CachedPtr<String, FileHandle> ptr,
+      CachingInputStream cis,
+      boolean ptrTransferred,
+      Throwable primary) {
+    if (ptrTransferred && cis != null) {
+      try {
+        cis.close();
+      } catch (IOException | RuntimeException | Error suppressed) {
+        primary.addSuppressed(suppressed);
+      }
+    } else {
+      try {
+        ptr.close();
+      } catch (RuntimeException | Error suppressed) {
+        primary.addSuppressed(suppressed);
+      }
+    }
   }
 
   /** Returns the wrapped inner FS — escape hatch for tests and tooling. */
@@ -144,10 +210,34 @@ public class CachedFileSystem extends FilterFileSystem {
     FileStatus status = fs.getFileStatus(p);
     long size = status.getLen();
     HadoopReadFile rf = new HadoopReadFile(fs, p, key, size);
-    StringIdMap ids = CacheBootstrap.get().stringIds();
-    StringIdLease uuid = new StringIdLease(ids, key);
-    StringIdLease groupId = parentLease(ids, p);
-    return new FileHandle(rf, uuid, groupId);
+    try {
+      StringIdMap ids =
+          CacheBootstrap.get()
+              .orElseThrow(() -> new IllegalStateException("CacheBootstrap missing"))
+              .stringIds();
+      // Mint uuid first, then groupId — if either lease constructor throws (StringIdMap
+      // exhausted, capacity error, IllegalStateException above) the outer catch closes rf.
+      StringIdLease uuid = new StringIdLease(ids, key);
+      try {
+        StringIdLease groupId = parentLease(ids, p);
+        try {
+          return new FileHandle(rf, uuid, groupId);
+        } catch (RuntimeException | Error ex) {
+          groupId.close();
+          throw ex;
+        }
+      } catch (RuntimeException | Error ex) {
+        uuid.close();
+        throw ex;
+      }
+    } catch (RuntimeException | Error ex) {
+      try {
+        rf.close();
+      } catch (IOException suppressed) {
+        ex.addSuppressed(suppressed);
+      }
+      throw ex;
+    }
   }
 
   private static StringIdLease parentLease(StringIdMap ids, Path p) {

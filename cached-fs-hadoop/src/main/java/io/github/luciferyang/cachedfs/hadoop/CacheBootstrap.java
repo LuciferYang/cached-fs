@@ -23,6 +23,7 @@ import io.github.luciferyang.cachedfs.core.id.StringIdLease;
 import io.github.luciferyang.cachedfs.core.id.StringIdMap;
 import io.github.luciferyang.cachedfs.core.ssd.SsdCache;
 import java.io.IOException;
+import java.util.Optional;
 import java.util.concurrent.locks.ReentrantLock;
 import org.apache.hadoop.conf.Configuration;
 
@@ -69,9 +70,9 @@ public final class CacheBootstrap {
     this.loadQuantumBytes = loadQuantumBytes;
   }
 
-  /** Returns the installed bootstrap, or {@code null} if {@link #installIfNeeded} has not run. */
-  public static CacheBootstrap get() {
-    return installed;
+  /** Returns the installed bootstrap, or empty if {@link #installIfNeeded} has not run. */
+  public static Optional<CacheBootstrap> get() {
+    return Optional.ofNullable(installed);
   }
 
   /**
@@ -91,25 +92,55 @@ public final class CacheBootstrap {
       if (installed != null) {
         return installed;
       }
+      // Defer global singleton publication until every sub-component has been constructed
+      // successfully. Otherwise, a throw mid-install (e.g. SsdCache failing to open a mount)
+      // would leave AsyncDataCache.setInstance pointing at an orphaned cache that a retry would
+      // overwrite, leaking the first instance for the JVM lifetime.
       AsyncDataCache ram = new AsyncDataCache(CachedFsConfig.ramOptions(conf));
-      AsyncDataCache.setInstance(ram);
-
-      StringIdMap ids = new StringIdMap();
-      FileIds.setInstance(ids);
-
       SsdCache ssd = null;
-      SsdCache.Config ssdCfg = CachedFsConfig.ssdConfig(conf);
-      if (ssdCfg != null) {
-        ssd = new SsdCache(ssdCfg, ids);
+      try {
+        StringIdMap ids = new StringIdMap();
+        SsdCache.Config ssdCfg = CachedFsConfig.ssdConfig(conf);
+        if (ssdCfg != null) {
+          ssd = new SsdCache(ssdCfg, ids);
+        }
+        int handleCap = CachedFsConfig.handleCacheCapacity(conf);
+        FileHandleFactory hf =
+            new FileHandleFactory(handleCap, key -> openHandle(opener, ids, key));
+        int quantum = CachedFsConfig.loadQuantumBytes(conf);
+        CacheBootstrap b = new CacheBootstrap(ram, ssd, ids, hf, quantum);
+        // All pieces ready — now publish singletons atomically (w.r.t. LOCK) and commit.
+        // Order matters because FileIds has no clearInstance API (test-only singleton):
+        // publish AsyncDataCache FIRST so that if FileIds.setInstance somehow throws (it can
+        // only throw on null today, which we don't pass) we can still call
+        // AsyncDataCache.clearInstance to roll back. Doing FileIds first would leave a
+        // permanently-orphaned StringIdMap singleton if AsyncDataCache.setInstance later threw.
+        AsyncDataCache.setInstance(ram);
+        try {
+          FileIds.setInstance(ids);
+        } catch (RuntimeException | Error setIdsEx) {
+          AsyncDataCache.clearInstance();
+          throw setIdsEx;
+        }
+        installed = b;
+        return b;
+      } catch (IOException | RuntimeException | Error ex) {
+        // Roll back partial construction; the JVM stays in the pre-install state so a retry
+        // gets a clean slate.
+        if (ssd != null) {
+          try {
+            ssd.close();
+          } catch (IOException suppressed) {
+            ex.addSuppressed(suppressed);
+          }
+        }
+        try {
+          ram.close();
+        } catch (RuntimeException suppressed) {
+          ex.addSuppressed(suppressed);
+        }
+        throw ex;
       }
-
-      int handleCap = CachedFsConfig.handleCacheCapacity(conf);
-      FileHandleFactory hf = new FileHandleFactory(handleCap, key -> openHandle(opener, ids, key));
-
-      int quantum = CachedFsConfig.loadQuantumBytes(conf);
-      CacheBootstrap b = new CacheBootstrap(ram, ssd, ids, hf, quantum);
-      installed = b;
-      return b;
     } finally {
       LOCK.unlock();
     }

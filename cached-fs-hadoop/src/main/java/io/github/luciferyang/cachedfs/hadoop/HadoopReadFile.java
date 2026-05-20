@@ -18,6 +18,7 @@ package io.github.luciferyang.cachedfs.hadoop;
 import io.github.luciferyang.cachedfs.core.io.ReadFile;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
 import java.util.List;
 import java.util.Objects;
 import org.apache.hadoop.fs.FSDataInputStream;
@@ -36,8 +37,22 @@ public final class HadoopReadFile implements ReadFile {
   private final String identity;
   private final long size;
 
-  private FSDataInputStream stream; // lazily opened on first read
+  /**
+   * Lazily opened on first read; {@code volatile} so the unlocked fast-path check in {@link
+   * #openIfNeeded()} sees publication writes from the slow path. Plain visibility is not enough —
+   * a reader observing a non-null reference could otherwise see a partially-constructed stream.
+   */
+  private volatile FSDataInputStream stream;
+
   private final Object streamLock = new Object();
+
+  /**
+   * Closed flag guarded by {@link #streamLock}. Once true, {@link #openIfNeeded()} refuses to
+   * reopen the stream — otherwise a concurrent {@code preadv} arriving after the owning {@link
+   * io.github.luciferyang.cachedfs.core.handle.FileHandle} eviction would resurrect a fresh {@link
+   * FSDataInputStream} with no remaining owner, leaking the underlying connection.
+   */
+  private boolean closed;
 
   /**
    * @param fs Hadoop filesystem to delegate to
@@ -105,6 +120,7 @@ public final class HadoopReadFile implements ReadFile {
   @Override
   public void close() throws IOException {
     synchronized (streamLock) {
+      closed = true;
       if (stream != null) {
         try {
           stream.close();
@@ -119,6 +135,12 @@ public final class HadoopReadFile implements ReadFile {
     FSDataInputStream s = stream;
     if (s != null) return s;
     synchronized (streamLock) {
+      if (closed) {
+        // A concurrent FileHandle eviction may have closed us between the caller picking up
+        // the ReadFile reference and reaching openIfNeeded. Refusing to reopen here is what
+        // prevents a leaked, never-closed FSDataInputStream from being created post-eviction.
+        throw new ClosedChannelException();
+      }
       if (stream == null) {
         stream = fs.open(path);
       }
