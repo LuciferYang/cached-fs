@@ -17,8 +17,10 @@ package io.github.luciferyang.cachedfs.core.ssd;
 
 import io.github.luciferyang.cachedfs.core.id.StringIdMap;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 
@@ -37,6 +39,13 @@ public final class SsdCache implements AutoCloseable {
   /**
    * SsdCache configuration.
    *
+   * <p><b>Multi-directory support:</b> {@code directories} is a non-empty list of mount points;
+   * shards are placed round-robin: shard {@code i} lives in {@code directories.get(i %
+   * directories.size())}. {@code numShards} is independent of {@code directories.size()} — an
+   * operator can have 8 shards across 2 disks (4/disk) or 1 shard per disk, etc. Typical
+   * deployments on AWS i3en / i4i (2–8 local NVMe SSDs) want one entry per disk; failing to
+   * configure all disks would silently waste capacity.
+   *
    * <p><b>Note on {@code checkpointIntervalBytes}:</b> this is the <em>cache-wide</em> budget; each
    * shard auto-checkpoints after roughly {@code checkpointIntervalBytes / numShards} bytes have
    * been written to it (matches velox SsdCache.cpp:70). If the value is less than {@code numShards}
@@ -45,7 +54,7 @@ public final class SsdCache implements AutoCloseable {
    * always runs regardless of this setting.
    */
   public record Config(
-      Path directory,
+      List<Path> directories,
       String shardPrefix,
       int numShards,
       int regionsPerShard,
@@ -54,8 +63,13 @@ public final class SsdCache implements AutoCloseable {
       boolean checksumEnabled,
       boolean checksumReadVerificationEnabled) {
     public Config {
-      Objects.requireNonNull(directory, "directory");
+      Objects.requireNonNull(directories, "directories");
       Objects.requireNonNull(shardPrefix, "shardPrefix");
+      // List.copyOf rejects nulls element-wise and gives us an immutable snapshot.
+      directories = List.copyOf(directories);
+      if (directories.isEmpty()) {
+        throw new IllegalArgumentException("directories must be non-empty");
+      }
       if (numShards <= 0) {
         throw new IllegalArgumentException("numShards must be > 0: " + numShards);
       }
@@ -68,6 +82,27 @@ public final class SsdCache implements AutoCloseable {
             "checksumReadVerificationEnabled requires checksumEnabled");
       }
     }
+
+    /** Convenience for the common single-directory case. */
+    public static Config single(
+        Path directory,
+        String shardPrefix,
+        int numShards,
+        int regionsPerShard,
+        int maxEntriesPerShard,
+        long checkpointIntervalBytes,
+        boolean checksumEnabled,
+        boolean checksumReadVerificationEnabled) {
+      return new Config(
+          List.of(directory),
+          shardPrefix,
+          numShards,
+          regionsPerShard,
+          maxEntriesPerShard,
+          checkpointIntervalBytes,
+          checksumEnabled,
+          checksumReadVerificationEnabled);
+    }
   }
 
   private final Config config;
@@ -77,21 +112,36 @@ public final class SsdCache implements AutoCloseable {
   public SsdCache(Config config, StringIdMap fileIds) throws IOException {
     this.config = config;
     this.shards = new SsdFile[config.numShards];
+    // Fail-fast: every configured directory must exist and be writable BEFORE any shard opens.
+    // Skip-and-continue was rejected by design — a silently-degraded multi-SSD setup would
+    // waste capacity on the missing disk and confuse operator capacity planning.
+    for (Path d : config.directories) {
+      if (!Files.isDirectory(d)) {
+        throw new IOException("SsdCache directory does not exist or is not a directory: " + d);
+      }
+      if (!Files.isWritable(d)) {
+        throw new IOException("SsdCache directory is not writable: " + d);
+      }
+    }
     boolean[] opened = new boolean[config.numShards];
     // Velox SsdCache.cpp:70 — caller's interval is the cache-wide target; each shard auto-
     // checkpoints after roughly 1/numShards of that many bytes have been written. Plain floor
     // division: if the interval is smaller than numShards, per-shard floors to 0 which
     // disables checkpointing for that shard (matches velox isCheckpointEnabled() semantics).
     long perShardInterval = config.checkpointIntervalBytes / config.numShards;
+    int numDirs = config.directories.size();
     try {
       for (int i = 0; i < config.numShards; i++) {
+        // Round-robin: shard i → directories[i % numDirs]. With numShards == numDirs every
+        // shard gets its own disk; with numShards > numDirs, shards are striped evenly.
+        Path dir = config.directories.get(i % numDirs);
         String name = config.shardPrefix + "-" + i;
         SsdFile.Config sc =
             new SsdFile.Config(
-                config.directory.resolve(name + ".data"),
-                config.directory.resolve(name + ".cpt"),
-                config.directory.resolve(name + ".log"),
-                config.directory.resolve(name + ".cpt.tmp"),
+                dir.resolve(name + ".data"),
+                dir.resolve(name + ".cpt"),
+                dir.resolve(name + ".log"),
+                dir.resolve(name + ".cpt.tmp"),
                 config.regionsPerShard,
                 config.maxEntriesPerShard,
                 perShardInterval,
@@ -108,7 +158,8 @@ public final class SsdCache implements AutoCloseable {
         if (opened[i] && shards[i] != null) {
           try {
             shards[i].close();
-          } catch (IOException ignored) {
+          } catch (IOException suppressed) {
+            ex.addSuppressed(suppressed);
           }
         }
       }

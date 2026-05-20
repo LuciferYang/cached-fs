@@ -24,6 +24,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Set;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -35,7 +36,7 @@ class SsdCacheTest {
   @DisplayName("shardFor routes by fileNum % numShards")
   void shardForRouting(@TempDir Path dir) throws IOException {
     StringIdMap ids = new StringIdMap();
-    var cfg = new SsdCache.Config(dir, "ssd", 4, 2, 0, 0L, false, false);
+    var cfg = SsdCache.Config.single(dir, "ssd", 4, 2, 0, 0L, false, false);
     try (SsdCache c = new SsdCache(cfg, ids)) {
       assertThat(c.shardFor(0L)).isSameAs(c.shard(0));
       assertThat(c.shardFor(1L)).isSameAs(c.shard(1));
@@ -49,7 +50,7 @@ class SsdCacheTest {
   @Test
   @DisplayName("checksumReadVerificationEnabled requires checksumEnabled")
   void verifyRequiresChecksum(@TempDir Path dir) {
-    assertThatThrownBy(() -> new SsdCache.Config(dir, "ssd", 1, 1, 0, 0L, false, true))
+    assertThatThrownBy(() -> SsdCache.Config.single(dir, "ssd", 1, 1, 0, 0L, false, true))
         .isInstanceOf(IllegalArgumentException.class);
   }
 
@@ -58,7 +59,7 @@ class SsdCacheTest {
   void shardIsolation(@TempDir Path dir) throws IOException {
     StringIdMap ids = new StringIdMap();
     long fn0 = ids.makeId("file://0");
-    var cfg = new SsdCache.Config(dir, "ssd", 2, 2, 0, 0L, false, false);
+    var cfg = SsdCache.Config.single(dir, "ssd", 2, 2, 0, 0L, false, false);
     try (SsdCache c = new SsdCache(cfg, ids)) {
       c.shardFor(fn0).write(new RawFileCacheKey(fn0, 0L), ByteBuffer.wrap(new byte[4096]));
       // Each shard is independent
@@ -79,7 +80,7 @@ class SsdCacheTest {
     if (collides) {
       fnC = ids.makeId("file://C");
     }
-    var cfg = new SsdCache.Config(dir, "ssd", 2, 2, 0, 0L, false, false);
+    var cfg = SsdCache.Config.single(dir, "ssd", 2, 2, 0, 0L, false, false);
     try (SsdCache c = new SsdCache(cfg, ids)) {
       long pair0 = fnA;
       long pair1 = collides ? fnC : fnB;
@@ -105,7 +106,7 @@ class SsdCacheTest {
   @DisplayName("shard(int) bounds-checks the index")
   void shardIndexBoundsCheck(@TempDir Path dir) throws IOException {
     StringIdMap ids = new StringIdMap();
-    var cfg = new SsdCache.Config(dir, "ssd", 2, 2, 0, 0L, false, false);
+    var cfg = SsdCache.Config.single(dir, "ssd", 2, 2, 0, 0L, false, false);
     try (SsdCache c = new SsdCache(cfg, ids)) {
       assertThatThrownBy(() -> c.shard(2)).isInstanceOf(IndexOutOfBoundsException.class);
       assertThatThrownBy(() -> c.shard(-1)).isInstanceOf(IndexOutOfBoundsException.class);
@@ -116,7 +117,7 @@ class SsdCacheTest {
   @DisplayName("removeFileEntries rejects null input")
   void removeFileEntriesNullThrows(@TempDir Path dir) throws IOException {
     StringIdMap ids = new StringIdMap();
-    var cfg = new SsdCache.Config(dir, "ssd", 1, 1, 0, 0L, false, false);
+    var cfg = SsdCache.Config.single(dir, "ssd", 1, 1, 0, 0L, false, false);
     try (SsdCache c = new SsdCache(cfg, ids)) {
       assertThatThrownBy(() -> c.removeFileEntries(null))
           .isInstanceOf(NullPointerException.class)
@@ -129,7 +130,7 @@ class SsdCacheTest {
   void closeAggregatesSuppressed(@TempDir Path dir) throws IOException {
     StringIdMap ids = new StringIdMap();
     long fn = ids.makeId("file://closesup");
-    var cfg = new SsdCache.Config(dir, "ssd", 2, 2, 0, 1L << 20, false, false);
+    var cfg = SsdCache.Config.single(dir, "ssd", 2, 2, 0, 1L << 20, false, false);
     SsdCache c = new SsdCache(cfg, ids);
     try {
       c.shard(0).write(new RawFileCacheKey(0L, 0L), ByteBuffer.wrap(new byte[1024]));
@@ -156,7 +157,7 @@ class SsdCacheTest {
     // shard should cross the per-shard threshold and create the .cpt file; the other shard
     // stays untouched and produces no checkpoint.
     long total = 4L << 20;
-    var cfg = new SsdCache.Config(dir, "ssd", 2, 2, 0, total, false, false);
+    var cfg = SsdCache.Config.single(dir, "ssd", 2, 2, 0, total, false, false);
     try (SsdCache c = new SsdCache(cfg, ids)) {
       SsdFile target = c.shardFor(fn);
       int targetIdx = (target == c.shard(0)) ? 0 : 1;
@@ -175,7 +176,7 @@ class SsdCacheTest {
   void checkpointAggregatesSuppressed(@TempDir Path dir) throws IOException {
     StringIdMap ids = new StringIdMap();
     long fn = ids.makeId("file://chk");
-    var cfg = new SsdCache.Config(dir, "ssd", 2, 2, 0, 1L << 20, false, false);
+    var cfg = SsdCache.Config.single(dir, "ssd", 2, 2, 0, 1L << 20, false, false);
     try (SsdCache c = new SsdCache(cfg, ids)) {
       // Stage a write into each shard so checkpointLocked has work to flush.
       c.shard(0).write(new RawFileCacheKey(0L, 0L), ByteBuffer.wrap(new byte[1024]));
@@ -202,7 +203,7 @@ class SsdCacheTest {
     // path closes shard-0 instead of leaking the channel.
     Files.createDirectories(dir.resolve("ssd-1.data"));
 
-    var cfg = new SsdCache.Config(dir, "ssd", 3, 2, 0, 0L, false, false);
+    var cfg = SsdCache.Config.single(dir, "ssd", 3, 2, 0, 0L, false, false);
     assertThatThrownBy(() -> new SsdCache(cfg, ids)).isInstanceOf(IOException.class);
 
     // shard-0's data file should exist but be closed — verify by reopening with a fresh cache
@@ -211,5 +212,117 @@ class SsdCacheTest {
     try (SsdCache c2 = new SsdCache(cfg, ids)) {
       assertThat(c2.numShards()).isEqualTo(3);
     }
+  }
+
+  // --- multi-directory tests -------------------------------------------------
+
+  @Test
+  @DisplayName("multi-directory: shards land round-robin across the configured paths")
+  void multiDirRoundRobinPlacement(@TempDir Path dirA, @TempDir Path dirB) throws IOException {
+    StringIdMap ids = new StringIdMap();
+    // 4 shards across 2 directories — expect shards 0,2 in dirA and shards 1,3 in dirB.
+    var cfg =
+        new SsdCache.Config(
+            List.of(dirA, dirB),
+            "ssd",
+            /* numShards= */ 4,
+            /* regionsPerShard= */ 2,
+            /* maxEntriesPerShard= */ 0,
+            /* checkpointIntervalBytes= */ 0L,
+            /* checksumEnabled= */ false,
+            /* checksumReadVerificationEnabled= */ false);
+    try (SsdCache c = new SsdCache(cfg, ids)) {
+      assertThat(Files.exists(dirA.resolve("ssd-0.data"))).isTrue();
+      assertThat(Files.exists(dirB.resolve("ssd-1.data"))).isTrue();
+      assertThat(Files.exists(dirA.resolve("ssd-2.data"))).isTrue();
+      assertThat(Files.exists(dirB.resolve("ssd-3.data"))).isTrue();
+      // Cross-mount false positives — a shard's files must NOT appear in the wrong directory.
+      assertThat(Files.exists(dirB.resolve("ssd-0.data"))).isFalse();
+      assertThat(Files.exists(dirA.resolve("ssd-1.data"))).isFalse();
+    }
+  }
+
+  @Test
+  @DisplayName("multi-directory: numShards independent of directory count (8 shards / 2 dirs)")
+  void multiDirShardsExceedDirs(@TempDir Path dirA, @TempDir Path dirB) throws IOException {
+    StringIdMap ids = new StringIdMap();
+    var cfg =
+        new SsdCache.Config(
+            List.of(dirA, dirB), "ssd", 8, 2, 0, 0L, false, false);
+    try (SsdCache c = new SsdCache(cfg, ids)) {
+      assertThat(c.numShards()).isEqualTo(8);
+      // Even shards in dirA, odd shards in dirB.
+      for (int i = 0; i < 8; i++) {
+        Path expected = (i % 2 == 0) ? dirA : dirB;
+        assertThat(Files.exists(expected.resolve("ssd-" + i + ".data"))).isTrue();
+      }
+    }
+  }
+
+  @Test
+  @DisplayName("multi-directory: per-disk failure isolation — one disk ENOSPC, others keep working")
+  void multiDirPerDiskFailureIsolation(@TempDir Path dirA, @TempDir Path dirB) throws IOException {
+    StringIdMap ids = new StringIdMap();
+    long fnA = ids.makeId("file://A");
+    long fnB = ids.makeId("file://B");
+    var cfg =
+        new SsdCache.Config(List.of(dirA, dirB), "ssd", 2, 2, 0, 0L, false, false);
+    try (SsdCache c = new SsdCache(cfg, ids)) {
+      // Force shard 0 (on dirA) into NO_SPACE; shard 1 (on dirB) stays ACTIVE and serves writes.
+      c.shard(0).testingForceState(SsdFile.State.NO_SPACE);
+      assertThat(c.shard(0).state()).isEqualTo(SsdFile.State.NO_SPACE);
+      assertThat(c.shard(1).state()).isEqualTo(SsdFile.State.ACTIVE);
+
+      // A write to shard 0 returns empty (NO_SPACE), shard 1 succeeds.
+      assertThat(c.shard(0).write(new RawFileCacheKey(0L, 0L), ByteBuffer.wrap(new byte[1024])))
+          .isEmpty();
+      assertThat(c.shard(1).write(new RawFileCacheKey(1L, 0L), ByteBuffer.wrap(new byte[1024])))
+          .isPresent();
+    } finally {
+      ids.release(fnA);
+      ids.release(fnB);
+    }
+  }
+
+  @Test
+  @DisplayName("multi-directory: fail-fast when a configured directory is missing")
+  void multiDirFailFastOnMissing(@TempDir Path dir) {
+    StringIdMap ids = new StringIdMap();
+    Path missing = dir.resolve("not-mounted");
+    var cfg =
+        new SsdCache.Config(List.of(dir, missing), "ssd", 2, 2, 0, 0L, false, false);
+    assertThatThrownBy(() -> new SsdCache(cfg, ids))
+        .isInstanceOf(IOException.class)
+        .hasMessageContaining("not-mounted");
+  }
+
+  @Test
+  @DisplayName("multi-directory: fail-fast when a configured directory points to a regular file")
+  void multiDirFailFastOnNonDirectory(@TempDir Path dirA, @TempDir Path dirB) throws IOException {
+    StringIdMap ids = new StringIdMap();
+    Path file = dirB.resolve("not-a-directory");
+    Files.writeString(file, "blocker");
+    var cfg =
+        new SsdCache.Config(List.of(dirA, file), "ssd", 2, 2, 0, 0L, false, false);
+    assertThatThrownBy(() -> new SsdCache(cfg, ids))
+        .isInstanceOf(IOException.class)
+        .hasMessageContaining("not-a-directory");
+  }
+
+  @Test
+  @DisplayName("multi-directory: empty directories list rejected at construction")
+  void multiDirEmptyListRejected() {
+    assertThatThrownBy(
+            () -> new SsdCache.Config(List.of(), "ssd", 1, 1, 0, 0L, false, false))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("directories");
+  }
+
+  @Test
+  @DisplayName("multi-directory: null directories list rejected at construction")
+  void multiDirNullListRejected() {
+    assertThatThrownBy(
+            () -> new SsdCache.Config(null, "ssd", 1, 1, 0, 0L, false, false))
+        .isInstanceOf(NullPointerException.class);
   }
 }
