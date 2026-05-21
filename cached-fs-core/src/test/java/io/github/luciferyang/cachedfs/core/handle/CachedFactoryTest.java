@@ -16,12 +16,15 @@
 package io.github.luciferyang.cachedfs.core.handle;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 class CachedFactoryTest {
@@ -84,6 +87,103 @@ class CachedFactoryTest {
       f.generate(i).close();
     }
     assertThat(f.size()).isLessThanOrEqualTo(2);
+  }
+
+  @Test
+  @DisplayName("drainMatching removes only entries whose key matches; non-matching entries stay")
+  void drainMatchingSelective() {
+    CachedFactory<String, String> f = new CachedFactory<>(16, key -> key + "!");
+    f.generate("alpha://a/x").close();
+    f.generate("alpha://a/y").close();
+    f.generate("beta://b/z").close();
+    assertThat(f.size()).isEqualTo(3);
+
+    List<String> drained = f.drainMatching(k -> k.startsWith("alpha://a/"));
+
+    assertThat(drained).containsExactlyInAnyOrder("alpha://a/x!", "alpha://a/y!");
+    assertThat(f.size()).isEqualTo(1);
+    // The non-matching entry must still be reachable via generate (cache hit, no extra call).
+    AtomicInteger newCalls = new AtomicInteger();
+    CachedFactory<String, String> hitOnly =
+        new CachedFactory<>(
+            16,
+            key -> {
+              newCalls.incrementAndGet();
+              return key + "!";
+            });
+    hitOnly.generate("beta://b/z").close();
+    hitOnly.drainMatching(k -> k.startsWith("alpha://a/"));
+    try (var p = hitOnly.generate("beta://b/z")) {
+      assertThat(p.value()).isEqualTo("beta://b/z!");
+    }
+    assertThat(newCalls.get()).isEqualTo(1); // entry survived the drain
+  }
+
+  @Test
+  @DisplayName("drainMatching rejects a null predicate")
+  void drainMatchingRejectsNullPredicate() {
+    CachedFactory<String, String> f = new CachedFactory<>(8, k -> k);
+    assertThatThrownBy(() -> f.drainMatching(null)).isInstanceOf(NullPointerException.class);
+  }
+
+  @Test
+  @DisplayName(
+      "drainMatching drains entries regardless of pin count — partial shutdown takes ownership")
+  void drainMatchingDrainsPinnedEntries() {
+    CachedFactory<String, String> f = new CachedFactory<>(8, k -> k + "!");
+    var p = f.generate("alpha://a/x"); // still pinned
+    try {
+      List<String> drained = f.drainMatching(k -> k.startsWith("alpha://a/"));
+      assertThat(drained).containsExactly("alpha://a/x!");
+      assertThat(f.size()).isZero();
+      // Closing the now-orphan CachedPtr is a safe no-op via release()'s index-miss branch.
+      p.close();
+    } finally {
+      if (p.isOpen()) p.close();
+    }
+  }
+
+  @Test
+  @DisplayName("drainMatching waits for an in-flight matching generator to settle before returning")
+  void drainMatchingWaitsForPending() throws Exception {
+    // Sequence: T1 enters generate() and parks inside the generator (key matches the predicate).
+    // T2 calls drainMatching with that predicate — it must NOT return immediately; it must wait
+    // until the generator settles. Otherwise the freshly generated entry leaks past the drain.
+    CountDownLatch generatorEntered = new CountDownLatch(1);
+    CountDownLatch generatorRelease = new CountDownLatch(1);
+    CachedFactory<String, String> f =
+        new CachedFactory<>(
+            8,
+            key -> {
+              generatorEntered.countDown();
+              try {
+                generatorRelease.await();
+              } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(ie);
+              }
+              return key + "!";
+            });
+
+    try (ExecutorService pool = Executors.newFixedThreadPool(2)) {
+      var first = pool.submit(() -> f.generate("alpha://a/x"));
+      assertThat(generatorEntered.await(2, TimeUnit.SECONDS)).isTrue();
+
+      var draining = pool.submit(() -> f.drainMatching(k -> k.startsWith("alpha://a/")));
+
+      // The drain must NOT have returned yet — give it a moment to (incorrectly) finish.
+      Thread.sleep(100);
+      assertThat(draining.isDone()).isFalse();
+
+      // Release the generator. Now drain should see the just-inserted entry and remove it.
+      generatorRelease.countDown();
+      try (var p = first.get(2, TimeUnit.SECONDS)) {
+        assertThat(p.value()).isEqualTo("alpha://a/x!");
+      }
+      List<String> drained = draining.get(2, TimeUnit.SECONDS);
+      assertThat(drained).containsExactly("alpha://a/x!");
+      assertThat(f.size()).isZero();
+    }
   }
 
   @Test

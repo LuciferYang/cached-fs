@@ -58,6 +58,15 @@ public final class CachedFileSystem extends FilterFileSystem {
   private volatile boolean enabled;
   private volatile URI uri;
 
+  // Per-decorator binding into the bootstrap's registry. `endpoint` is derived from the INNER FS's
+  // URI (which Hadoop may normalize — e.g. HDFS appending the default port), so that the same
+  // endpoint string is computed when keys flow through dispatchOpen at open() time. `ownOpener`
+  // holds the exact opener reference we installed so close() can use identity-aware removal and
+  // not blow away a peer decorator that re-registered the same endpoint between our open and our
+  // close.
+  private volatile String endpoint;
+  private volatile CacheBootstrap.HandleOpener ownOpener;
+
   public CachedFileSystem() {}
 
   /** Test-only constructor that pre-binds the inner FS. Production uses the no-arg form. */
@@ -92,11 +101,21 @@ public final class CachedFileSystem extends FilterFileSystem {
       inner.initialize(name, conf);
       this.fs = inner;
       super.initialize(name, conf); // FilterFileSystem records statistics + sets working dir
-      this.enabled = CachedFsConfig.isEnabled(conf);
-      if (enabled) {
+      // Read the toggle but do NOT publish enabled=true yet — a concurrent reader observing
+      // enabled via volatile would race ahead and hit dispatchOpen before installOpener has run.
+      // Install the opener first, then flip enabled.
+      boolean enableNow = CachedFsConfig.isEnabled(conf);
+      if (enableNow) {
         CacheBootstrap.installIfNeeded(conf);
-        CacheBootstrap.installOpener(CacheBootstrap.endpointKey(name), this::openHandleForKey);
+        // Derive endpoint from the INNER FS's URI, not the caller-provided `name`: Hadoop FS
+        // implementations may normalize their URI in initialize() (HDFS appends default port,
+        // S3A lowercases bucket, etc.) and the same normalization happens to handle keys via
+        // fs.makeQualified() in open(). Register and dispatch against the canonical form.
+        this.endpoint = CacheBootstrap.endpointKey(inner.getUri());
+        this.ownOpener = this::openHandleForKey;
+        CacheBootstrap.installOpener(endpoint, ownOpener);
       }
+      this.enabled = enableNow;
       initialized = true;
     } finally {
       if (!initialized) {
@@ -138,6 +157,12 @@ public final class CachedFileSystem extends FilterFileSystem {
       // The opener wraps IOException as UncheckedIOException so single-flight cleanup runs.
       // Unwrap on the way back out so callers see the original cause.
       throw ex.getCause();
+    } catch (IllegalStateException | IllegalArgumentException ex) {
+      // dispatchOpen surfaces these for "no opener registered for endpoint" (race against this
+      // decorator's close, or a configuration mismatch) and "malformed handle key". Hadoop / Spark
+      // retry harnesses key off IOException; surfacing a raw RuntimeException would skip retry and
+      // bubble up as an unhandled task failure.
+      throw new IOException(ex);
     }
     // Ownership of `ptr` transfers to `cis` once CachingInputStream's constructor succeeds (its
     // close() releases the pin). Until then we own it ourselves, so any throw must release the
@@ -180,22 +205,39 @@ public final class CachedFileSystem extends FilterFileSystem {
 
   @Override
   public void close() throws IOException {
-    // Drain ONLY the handles minted by this decorator — those whose URI key starts with our
-    // scheme://authority endpoint — so peer CachedFileSystem instances caching other schemes in
-    // the same JVM keep their entries. Run before super.close() so HadoopReadFile.close calls
-    // FSDataInputStream.close on a still-live inner FS; DFSClient otherwise throws
-    // "Filesystem closed" mid-drain.
+    // Flip enabled BEFORE touching the registry so any thread racing in open() either sees
+    // enabled=false (and falls through to fs.open) or has already acquired its CachedPtr — we
+    // don't want a thread to pass the !enabled gate, look up the bootstrap, and then find its
+    // opener has just been removed.
+    this.enabled = false;
     IOException primary = null;
-    String endpoint = uri != null ? CacheBootstrap.endpointKey(uri) : null;
+    String localEndpoint = this.endpoint;
+    CacheBootstrap.HandleOpener localOpener = this.ownOpener;
     CacheBootstrap b = CacheBootstrap.get().orElse(null);
-    if (b != null && endpoint != null) {
+    if (b != null && localEndpoint != null) {
       try {
-        String prefix = endpoint + "/";
-        b.handleFactory().closeMatching(k -> k.startsWith(prefix) || k.equals(endpoint));
+        // Match handles whose URI parses to the same endpoint (scheme + authority) as this
+        // decorator. A raw startsWith on the endpoint string fails for empty-authority URIs
+        // (file:// vs file:/path) and is fragile against schemes that allow `-` or `:` in
+        // authority. Parsing the key is one extra allocation per drained handle and is correct.
+        String captured = localEndpoint;
+        b.handleFactory()
+            .closeMatching(
+                k -> {
+                  try {
+                    return captured.equals(CacheBootstrap.endpointKey(new URI(k)));
+                  } catch (java.net.URISyntaxException ex) {
+                    return false;
+                  }
+                });
       } catch (IOException ex) {
         primary = ex;
       }
-      CacheBootstrap.removeOpener(endpoint);
+      if (localOpener != null) {
+        // Identity-aware removal so a peer decorator that re-registered the same endpoint
+        // between our open and our close keeps its registration intact.
+        CacheBootstrap.removeOpener(localEndpoint, localOpener);
+      }
     }
     try {
       super.close();

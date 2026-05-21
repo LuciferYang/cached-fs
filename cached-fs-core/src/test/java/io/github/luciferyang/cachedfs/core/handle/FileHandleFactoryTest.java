@@ -163,6 +163,110 @@ class FileHandleFactoryTest {
   }
 
   @Test
+  @DisplayName("closeMatching: closes only handles whose key matches the predicate")
+  void closeMatchingSelective() throws Exception {
+    StringIdMap map = new StringIdMap();
+    AtomicInteger closes = new AtomicInteger();
+    FileHandleFactory f =
+        new FileHandleFactory(
+            16,
+            key ->
+                new FileHandle(
+                    new NoopReadFile(key) {
+                      @Override
+                      public void close() throws IOException {
+                        closes.incrementAndGet();
+                      }
+                    },
+                    new StringIdLease(map, key),
+                    new StringIdLease(map, "/")));
+    f.open("alpha://a/x").close();
+    f.open("alpha://a/y").close();
+    f.open("beta://b/z").close();
+    assertThat(f.size()).isEqualTo(3);
+
+    f.closeMatching(k -> k.startsWith("alpha://a/"));
+
+    assertThat(closes.get()).isEqualTo(2);
+    assertThat(f.size()).isEqualTo(1);
+    // Surviving handle for beta is still reachable as a cache hit (no second open call).
+    AtomicInteger opens = new AtomicInteger();
+    FileHandleFactory g =
+        new FileHandleFactory(
+            16,
+            key -> {
+              opens.incrementAndGet();
+              return new FileHandle(
+                  new NoopReadFile(key), new StringIdLease(map, key), new StringIdLease(map, "/"));
+            });
+    g.open("beta://b/z").close();
+    g.closeMatching(k -> k.startsWith("alpha://a/"));
+    g.open("beta://b/z").close();
+    assertThat(opens.get()).isEqualTo(1); // hit, not regenerated
+  }
+
+  @Test
+  @DisplayName("closeMatching: no-op when no handles match")
+  void closeMatchingNoMatch() throws Exception {
+    StringIdMap map = new StringIdMap();
+    AtomicInteger closes = new AtomicInteger();
+    FileHandleFactory f =
+        new FileHandleFactory(
+            16,
+            key ->
+                new FileHandle(
+                    new NoopReadFile(key) {
+                      @Override
+                      public void close() {
+                        closes.incrementAndGet();
+                      }
+                    },
+                    new StringIdLease(map, key),
+                    new StringIdLease(map, "/")));
+    f.open("alpha://a/x").close();
+
+    f.closeMatching(k -> k.startsWith("beta://"));
+
+    assertThat(closes.get()).isZero();
+    assertThat(f.size()).isEqualTo(1);
+  }
+
+  @Test
+  @DisplayName(
+      "closeMatching: aggregates close failures via suppressed exceptions, still drains all"
+          + " matching handles")
+  void closeMatchingAggregatesFailures() {
+    StringIdMap map = new StringIdMap();
+    AtomicInteger closeAttempts = new AtomicInteger();
+    FileHandleFactory f =
+        new FileHandleFactory(
+            16,
+            key ->
+                new FileHandle(
+                    new NoopReadFile(key) {
+                      @Override
+                      public void close() throws IOException {
+                        closeAttempts.incrementAndGet();
+                        throw new IOException("boom-" + identity());
+                      }
+                    },
+                    new StringIdLease(map, key),
+                    new StringIdLease(map, "/")));
+    f.open("alpha://a/x").close();
+    f.open("alpha://a/y").close();
+    f.open("beta://b/z").close();
+
+    assertThatThrownBy(() -> f.closeMatching(k -> k.startsWith("alpha://a/")))
+        .isInstanceOf(IOException.class)
+        .matches(ex -> ex.getSuppressed().length >= 1);
+
+    // Both matching handles were attempted (even after the first throw).
+    assertThat(closeAttempts.get()).isEqualTo(2);
+    // The non-matching handle is untouched.
+    assertThat(f.size()).isEqualTo(1);
+  }
+
+  @Test
   @DisplayName("closeAll: aggregates close failures via suppressed exceptions")
   void closeAllAggregatesFailures() {
     StringIdMap map = new StringIdMap();

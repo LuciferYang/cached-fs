@@ -259,14 +259,21 @@ public final class CachedFactory<K, V> {
 
   /**
    * Drains only the entries whose key matches {@code predicate}, returning their values. Used by
-   * partial-shutdown callers (e.g. a single {@link io.github.luciferyang.cachedfs.hadoop} decorator
-   * closing while other decorators still need their own entries). Unlike {@link #drain}, this does
-   * not touch entries that don't match.
+   * partial-shutdown callers (one decorator closing while peers keep their entries). Waits for any
+   * in-flight {@link #generate} calls on matching keys to settle BEFORE draining — otherwise a
+   * generator that finishes after this call returns would re-insert a value the shutdown caller
+   * already believed was gone. Bounded wait: generators always exit {@code pending} (success or
+   * throw).
    */
   public List<V> drainMatching(Predicate<K> predicate) {
     Objects.requireNonNull(predicate, "predicate");
     lock.lock();
     try {
+      while (anyPendingMatches(predicate)) {
+        // Every generator completion (success or failure) calls signalAll on pendingCv, so we'll
+        // wake on each one and re-check whether any matching key is still in flight.
+        pendingCv.awaitUninterruptibly();
+      }
       List<V> drained = new ArrayList<>();
       Iterator<Map.Entry<K, Entry<V>>> it = lru.entrySet().iterator();
       while (it.hasNext()) {
@@ -281,5 +288,14 @@ public final class CachedFactory<K, V> {
     } finally {
       lock.unlock();
     }
+  }
+
+  private boolean anyPendingMatches(Predicate<K> predicate) {
+    for (K k : pending.keySet()) {
+      if (predicate.test(k)) {
+        return true;
+      }
+    }
+    return false;
   }
 }

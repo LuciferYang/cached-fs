@@ -25,6 +25,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.LocalFileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.RawLocalFileSystem;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -168,36 +169,89 @@ class CachedFileSystemTest {
 
   @Test
   @DisplayName(
-      "two decorators for different endpoints coexist; closing one preserves the other's opener")
+      "two decorators on different scheme+authority endpoints both serve cached reads; closing one"
+          + " preserves the other's opener and handles")
   void multipleEndpointsCoexist(@TempDir java.nio.file.Path dir) throws IOException {
-    // Two CachedFileSystem instances share the bootstrap but register independent openers under
-    // their own scheme://authority keys. Closing one must NOT unregister the other.
-    Files.write(dir.resolve("a.bin"), bytes(64));
+    // Two CachedFileSystem instances, each backed by its own inner FS that reports a distinct
+    // scheme+authority. They share the JVM-wide bootstrap (one RAM tier, one handle factory) but
+    // register independent openers in the registry. Closing one must drain ONLY its own handles
+    // and unregister ONLY its own endpoint; the peer must continue to serve reads.
+    byte[] payloadA = bytes(64);
+    byte[] payloadB = bytes(128);
+    java.nio.file.Path fileA = dir.resolve("a.bin");
+    java.nio.file.Path fileB = dir.resolve("b.bin");
+    Files.write(fileA, payloadA);
+    Files.write(fileB, payloadB);
 
-    Configuration confA = defaultConf();
-    Configuration confB = defaultConf();
+    Configuration conf = new Configuration(false);
+    conf.setBoolean(CachedFsConfig.ENABLED, true);
+    conf.set(CachedFsConfig.INNER_IMPL, TestSchemeFs.class.getName());
+
     CachedFileSystem alpha = new CachedFileSystem();
     CachedFileSystem beta = new CachedFileSystem();
     try {
-      alpha.initialize(URI.create("file:///"), confA);
-      // Manually register a second opener simulating a peer decorator on a different endpoint —
-      // this mirrors what a real BosFileSystem-backed CachedFileSystem would do at initialize().
-      CacheBootstrap.installOpener("bos://bucket.bj.bcebos.com", key -> null);
-      beta.initialize(URI.create("file:///"), confB); // no-op for endpoint (same as alpha)
+      alpha.initialize(URI.create("alpha://host-a/"), conf);
+      beta.initialize(URI.create("beta://host-b/"), conf);
       CacheBootstrap b = CacheBootstrap.get().orElseThrow();
-      assertThat(b.hasOpener("file://")).isTrue();
-      assertThat(b.hasOpener("bos://bucket.bj.bcebos.com")).isTrue();
+
+      assertThat(b.hasOpener("alpha://host-a")).isTrue();
+      assertThat(b.hasOpener("beta://host-b")).isTrue();
+
+      Path pathA = new Path("alpha://host-a" + fileA.toUri().getRawPath());
+      Path pathB = new Path("beta://host-b" + fileB.toUri().getRawPath());
+
+      try (FSDataInputStream in = alpha.open(pathA, 4096)) {
+        assertThat(in.readAllBytes()).isEqualTo(payloadA);
+      }
+      try (FSDataInputStream in = beta.open(pathB, 4096)) {
+        assertThat(in.readAllBytes()).isEqualTo(payloadB);
+      }
+      // One handle per endpoint sits in the shared factory.
+      assertThat(b.handleFactory().size()).isEqualTo(2);
 
       alpha.close();
-      // Closing alpha unregisters file:// (its own endpoint) but the bos endpoint must remain
-      // since no decorator owning it has closed.
-      assertThat(b.hasOpener("file://")).isFalse();
-      assertThat(b.hasOpener("bos://bucket.bj.bcebos.com")).isTrue();
+
+      // alpha's opener + handle are gone; beta's are untouched.
+      assertThat(b.hasOpener("alpha://host-a")).isFalse();
+      assertThat(b.hasOpener("beta://host-b")).isTrue();
+      assertThat(b.handleFactory().size()).isEqualTo(1);
+
+      // Beta still serves cached reads after alpha's close — proves the partial drain didn't
+      // also touch beta's handle and proves the opener registry is still live for beta.
+      try (FSDataInputStream in = beta.open(pathB, 4096)) {
+        assertThat(in.readAllBytes()).isEqualTo(payloadB);
+      }
     } finally {
-      beta.close();
-      // bos opener was registered without a real decorator owning it — clean it up so the
-      // @AfterEach uninstallForTesting() doesn't try to drain a fake handle key.
-      CacheBootstrap.removeOpener("bos://bucket.bj.bcebos.com");
+      try {
+        beta.close();
+      } catch (IOException ignored) {
+        // best-effort cleanup
+      }
+    }
+  }
+
+  /**
+   * Test-only Hadoop FS that pretends to be a custom scheme+authority while delegating actual I/O
+   * to {@link RawLocalFileSystem}. Lets tests exercise the multi-endpoint registry path without a
+   * real remote filesystem.
+   */
+  public static final class TestSchemeFs extends RawLocalFileSystem {
+    private URI customUri;
+
+    @Override
+    public void initialize(URI uri, Configuration conf) throws IOException {
+      this.customUri = uri;
+      super.initialize(uri, conf);
+    }
+
+    @Override
+    public URI getUri() {
+      return customUri != null ? customUri : super.getUri();
+    }
+
+    @Override
+    public String getScheme() {
+      return customUri != null ? customUri.getScheme() : super.getScheme();
     }
   }
 

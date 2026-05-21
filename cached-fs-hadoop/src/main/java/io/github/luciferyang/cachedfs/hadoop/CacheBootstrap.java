@@ -24,6 +24,7 @@ import io.github.luciferyang.cachedfs.core.id.StringIdMap;
 import io.github.luciferyang.cachedfs.core.ssd.SsdCache;
 import java.io.IOException;
 import java.net.URI;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -176,33 +177,64 @@ public final class CacheBootstrap {
   /**
    * Registers (or replaces) the {@link HandleOpener} that services keys whose URI matches {@code
    * endpoint} (a {@code scheme://authority} string). Throws if the bootstrap has not been installed
-   * yet — callers must always run {@link #installIfNeeded} first.
+   * yet — callers must always run {@link #installIfNeeded} first. Lock-synchronized vs. {@link
+   * #uninstallForTesting} so a teardown racing with this call cannot strand the entry on an
+   * orphaned bootstrap.
    */
   public static void installOpener(String endpoint, HandleOpener opener) {
-    if (endpoint == null) {
-      throw new NullPointerException("endpoint");
+    Objects.requireNonNull(endpoint, "endpoint");
+    Objects.requireNonNull(opener, "opener");
+    LOCK.lock();
+    try {
+      CacheBootstrap b = installed;
+      if (b == null) {
+        throw new IllegalStateException(
+            "CacheBootstrap is not installed; call installIfNeeded() before installOpener()");
+      }
+      b.openersByEndpoint.put(endpoint, opener);
+    } finally {
+      LOCK.unlock();
     }
-    if (opener == null) {
-      throw new NullPointerException("opener");
-    }
-    CacheBootstrap b = installed;
-    if (b == null) {
-      throw new IllegalStateException(
-          "CacheBootstrap is not installed; call installIfNeeded() before installOpener()");
-    }
-    b.openersByEndpoint.put(endpoint, opener);
   }
 
   /**
-   * Removes the opener for {@code endpoint}. No-op if the bootstrap is uninstalled or the endpoint
-   * was never registered. Returns true if an entry was removed.
+   * Removes the opener for {@code endpoint} only if its current value is {@code expected} (identity
+   * compare). Lets a decorator close-and-remove its own registration without nuking a sibling
+   * decorator that re-registered the same endpoint between the two events. Returns true if the
+   * entry was removed.
+   */
+  public static boolean removeOpener(String endpoint, HandleOpener expected) {
+    Objects.requireNonNull(endpoint, "endpoint");
+    Objects.requireNonNull(expected, "expected");
+    LOCK.lock();
+    try {
+      CacheBootstrap b = installed;
+      if (b == null) {
+        return false;
+      }
+      return b.openersByEndpoint.remove(endpoint, expected);
+    } finally {
+      LOCK.unlock();
+    }
+  }
+
+  /**
+   * Force-removes the opener for {@code endpoint} regardless of which instance is registered.
+   * Intended for tests and shutdown paths that don't track their original opener reference. Returns
+   * true if an entry was removed.
    */
   public static boolean removeOpener(String endpoint) {
-    CacheBootstrap b = installed;
-    if (b == null) {
-      return false;
+    Objects.requireNonNull(endpoint, "endpoint");
+    LOCK.lock();
+    try {
+      CacheBootstrap b = installed;
+      if (b == null) {
+        return false;
+      }
+      return b.openersByEndpoint.remove(endpoint) != null;
+    } finally {
+      LOCK.unlock();
     }
-    return b.openersByEndpoint.remove(endpoint) != null;
   }
 
   /**
