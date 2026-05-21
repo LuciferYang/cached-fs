@@ -157,11 +157,12 @@ public final class CachedFileSystem extends FilterFileSystem {
       // The opener wraps IOException as UncheckedIOException so single-flight cleanup runs.
       // Unwrap on the way back out so callers see the original cause.
       throw ex.getCause();
-    } catch (IllegalStateException | IllegalArgumentException ex) {
-      // dispatchOpen surfaces these for "no opener registered for endpoint" (race against this
-      // decorator's close, or a configuration mismatch) and "malformed handle key". Hadoop / Spark
-      // retry harnesses key off IOException; surfacing a raw RuntimeException would skip retry and
-      // bubble up as an unhandled task failure.
+    } catch (RuntimeException ex) {
+      // Anything else that escapes the generator — dispatchOpen's "no opener" /
+      // "malformed key" IllegalStateException / IllegalArgumentException, an NPE from a
+      // misbehaving inner FS client, etc. — gets wrapped as IOException so Hadoop / Spark retry
+      // harnesses (which key off IOException) can see and react. A raw RuntimeException
+      // would bubble up as an unhandled task failure and skip retry entirely.
       throw new IOException(ex);
     }
     // Ownership of `ptr` transfers to `cis` once CachingInputStream's constructor succeeds (its
@@ -205,38 +206,49 @@ public final class CachedFileSystem extends FilterFileSystem {
 
   @Override
   public void close() throws IOException {
-    // Flip enabled BEFORE touching the registry so any thread racing in open() either sees
-    // enabled=false (and falls through to fs.open) or has already acquired its CachedPtr — we
-    // don't want a thread to pass the !enabled gate, look up the bootstrap, and then find its
-    // opener has just been removed.
+    // Order is load-bearing:
+    //   1. enabled = false       — racing readers either see false (bypass) or have already
+    //                              captured the bootstrap reference.
+    //   2. removeOpener          — fail-fast for any reader that DID capture the bootstrap and
+    //                              tries to dispatch a fresh open; dispatchOpen throws
+    //                              IllegalStateException, which open() wraps as IOException.
+    //   3. closeMatching         — drain whatever in-flight `pending` generators (which already
+    //                              captured the opener BEFORE step 2) had time to settle.
+    //   4. super.close()         — close the inner FS last, AFTER every handle that referenced
+    //                              it has been drained and closed.
+    // Reversing 2/3 would leave a window where a thread mid-dispatch installs a fresh handle
+    // into the LRU after drain returned and before the opener is removed; super.close() then
+    // invalidates that handle's stream and the entry leaks.
     this.enabled = false;
     IOException primary = null;
     String localEndpoint = this.endpoint;
     CacheBootstrap.HandleOpener localOpener = this.ownOpener;
     CacheBootstrap b = CacheBootstrap.get().orElse(null);
     if (b != null && localEndpoint != null) {
+      if (localOpener != null) {
+        // Identity-aware removal so a peer decorator that re-registered the same endpoint
+        // between our open and our close keeps its registration intact.
+        CacheBootstrap.removeOpener(localEndpoint, localOpener);
+      }
       try {
         // Match handles whose URI parses to the same endpoint (scheme + authority) as this
-        // decorator. A raw startsWith on the endpoint string fails for empty-authority URIs
-        // (file:// vs file:/path) and is fragile against schemes that allow `-` or `:` in
-        // authority. Parsing the key is one extra allocation per drained handle and is correct.
+        // decorator. Parsing the key handles edge cases that raw startsWith can't (empty
+        // authority — file:// endpoint vs file:/path keys; authorities with `:` or `-`).
+        // Catch Exception, not just URISyntaxException, because endpointKey throws
+        // IllegalArgumentException for a schemeless URI — an IAE escaping mid-iteration would
+        // half-drain the LRU and skip super.close() entirely.
         String captured = localEndpoint;
         b.handleFactory()
             .closeMatching(
                 k -> {
                   try {
                     return captured.equals(CacheBootstrap.endpointKey(new URI(k)));
-                  } catch (java.net.URISyntaxException ex) {
+                  } catch (Exception ex) {
                     return false;
                   }
                 });
       } catch (IOException ex) {
         primary = ex;
-      }
-      if (localOpener != null) {
-        // Identity-aware removal so a peer decorator that re-registered the same endpoint
-        // between our open and our close keeps its registration intact.
-        CacheBootstrap.removeOpener(localEndpoint, localOpener);
       }
     }
     try {

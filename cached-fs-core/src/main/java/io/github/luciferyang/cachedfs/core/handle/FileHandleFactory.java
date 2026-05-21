@@ -70,8 +70,12 @@ public final class FileHandleFactory {
    * Drains and closes only the handles whose key matches {@code predicate}. Used by a single
    * decorator (e.g. one of several {@code CachedFileSystem} instances in a multi-scheme JVM) to
    * release just its own handles without disturbing peers' entries.
+   *
+   * <p>May block briefly while in-flight openers for matching keys settle — see {@link
+   * CachedFactory#drainMatching}.
    */
   public void closeMatching(Predicate<String> predicate) throws IOException {
+    Objects.requireNonNull(predicate, "predicate");
     closeDrained(delegate.drainMatching(predicate));
   }
 

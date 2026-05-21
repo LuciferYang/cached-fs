@@ -258,7 +258,8 @@ class FileHandleFactoryTest {
 
     assertThatThrownBy(() -> f.closeMatching(k -> k.startsWith("alpha://a/")))
         .isInstanceOf(IOException.class)
-        .matches(ex -> ex.getSuppressed().length >= 1);
+        // Exactly two matching handles; one becomes primary, the other is suppressed.
+        .matches(ex -> ex.getSuppressed().length == 1);
 
     // Both matching handles were attempted (even after the first throw).
     assertThat(closeAttempts.get()).isEqualTo(2);

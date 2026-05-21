@@ -175,9 +175,12 @@ public final class CacheBootstrap {
   }
 
   /**
-   * Registers (or replaces) the {@link HandleOpener} that services keys whose URI matches {@code
-   * endpoint} (a {@code scheme://authority} string). Throws if the bootstrap has not been installed
-   * yet — callers must always run {@link #installIfNeeded} first. Lock-synchronized vs. {@link
+   * Registers the {@link HandleOpener} that services keys whose URI matches {@code endpoint} (a
+   * {@code scheme://authority} string). Throws if the bootstrap has not been installed yet ({@link
+   * #installIfNeeded} must run first) or if {@code endpoint} is already registered — the registry
+   * enforces one live decorator per endpoint, matching the comment on the openers field. Silently
+   * overwriting would let a peer's closeMatching drain handles owned by the new decorator (the
+   * close predicate matches by endpoint, not by opener identity). Lock-synchronized vs. {@link
    * #uninstallForTesting} so a teardown racing with this call cannot strand the entry on an
    * orphaned bootstrap.
    */
@@ -191,7 +194,13 @@ public final class CacheBootstrap {
         throw new IllegalStateException(
             "CacheBootstrap is not installed; call installIfNeeded() before installOpener()");
       }
-      b.openersByEndpoint.put(endpoint, opener);
+      HandleOpener prior = b.openersByEndpoint.putIfAbsent(endpoint, opener);
+      if (prior != null && prior != opener) {
+        throw new IllegalStateException(
+            "Opener already registered for endpoint "
+                + endpoint
+                + "; close the prior CachedFileSystem before registering another");
+      }
     } finally {
       LOCK.unlock();
     }

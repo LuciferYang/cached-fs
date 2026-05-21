@@ -132,15 +132,12 @@ class CachedFactoryTest {
   void drainMatchingDrainsPinnedEntries() {
     CachedFactory<String, String> f = new CachedFactory<>(8, k -> k + "!");
     var p = f.generate("alpha://a/x"); // still pinned
-    try {
-      List<String> drained = f.drainMatching(k -> k.startsWith("alpha://a/"));
-      assertThat(drained).containsExactly("alpha://a/x!");
-      assertThat(f.size()).isZero();
-      // Closing the now-orphan CachedPtr is a safe no-op via release()'s index-miss branch.
-      p.close();
-    } finally {
-      if (p.isOpen()) p.close();
-    }
+
+    List<String> drained = f.drainMatching(k -> k.startsWith("alpha://a/"));
+    assertThat(drained).containsExactly("alpha://a/x!");
+    assertThat(f.size()).isZero();
+    // Closing the now-orphan CachedPtr is a safe no-op via release()'s index-miss branch.
+    p.close();
   }
 
   @Test

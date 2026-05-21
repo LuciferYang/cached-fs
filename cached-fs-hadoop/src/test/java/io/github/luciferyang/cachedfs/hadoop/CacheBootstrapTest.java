@@ -79,19 +79,41 @@ class CacheBootstrapTest {
   }
 
   @Test
-  @DisplayName("re-registering an endpoint replaces the previous opener")
-  void reregistrationReplaces() throws IOException {
+  @DisplayName("installOpener refuses to overwrite an existing registration for the same endpoint")
+  void installOpenerRefusesOverwrite() throws IOException {
     CacheBootstrap.installIfNeeded(minimalConf());
     CacheBootstrap b = CacheBootstrap.get().orElseThrow();
 
     CacheBootstrap.HandleOpener first = key -> null;
     CacheBootstrap.HandleOpener second = key -> null;
     CacheBootstrap.installOpener("s3a://bucket-x", first);
+    // Two decorators sharing scheme://authority would silently nuke each other's handles via the
+    // shared close predicate. The registry enforces "one live decorator per endpoint" — the
+    // second install throws with a clear remediation message.
+    assertThatThrownBy(() -> CacheBootstrap.installOpener("s3a://bucket-x", second))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("already registered")
+        .hasMessageContaining("s3a://bucket-x");
+    // First registration is intact; second must close the prior decorator before re-registering.
+    assertThat(b.hasOpener("s3a://bucket-x")).isTrue();
+    assertThat(CacheBootstrap.removeOpener("s3a://bucket-x", first)).isTrue();
+    assertThat(b.hasOpener("s3a://bucket-x")).isFalse();
+    // After clean removal a fresh decorator can register again.
     CacheBootstrap.installOpener("s3a://bucket-x", second);
     assertThat(b.hasOpener("s3a://bucket-x")).isTrue();
-    // Single removeOpener clears the slot — proves there is at most one entry per endpoint.
-    assertThat(CacheBootstrap.removeOpener("s3a://bucket-x")).isTrue();
-    assertThat(b.hasOpener("s3a://bucket-x")).isFalse();
+  }
+
+  @Test
+  @DisplayName("installOpener is idempotent when called with the exact same opener reference")
+  void installOpenerIdempotentSameReference() throws IOException {
+    CacheBootstrap.installIfNeeded(minimalConf());
+    CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+    CacheBootstrap.HandleOpener opener = key -> null;
+    CacheBootstrap.installOpener("hdfs://nn-a", opener);
+    // Re-installing the SAME opener instance (e.g. a defensive retry in initialize) must be safe;
+    // only a DIFFERENT opener for an already-claimed endpoint is rejected.
+    CacheBootstrap.installOpener("hdfs://nn-a", opener);
+    assertThat(b.hasOpener("hdfs://nn-a")).isTrue();
   }
 
   @Test
