@@ -15,6 +15,7 @@
  */
 package io.github.luciferyang.cachedfs.core.handle;
 
+import java.io.IOException;
 import java.util.Objects;
 import java.util.function.Function;
 
@@ -52,5 +53,30 @@ public final class FileHandleFactory {
   /** Returns the number of currently cached handles. */
   public int size() {
     return delegate.size();
+  }
+
+  /**
+   * Drains every cached handle and closes it. Called by the owning FileSystem decorator on shutdown
+   * (and by test cleanup) so input streams pinned inside FileHandles are released while their inner
+   * FS is still alive. Throws an aggregated {@link IOException} if any handle close throws, but
+   * always attempts every close.
+   */
+  public void closeAll() throws IOException {
+    IOException primary = null;
+    for (FileHandle h : delegate.drain()) {
+      try {
+        h.close();
+      } catch (IOException ex) {
+        if (primary == null) primary = ex;
+        else primary.addSuppressed(ex);
+      } catch (RuntimeException ex) {
+        IOException wrapped = new IOException(ex);
+        if (primary == null) primary = wrapped;
+        else primary.addSuppressed(wrapped);
+      }
+    }
+    if (primary != null) {
+      throw primary;
+    }
   }
 }

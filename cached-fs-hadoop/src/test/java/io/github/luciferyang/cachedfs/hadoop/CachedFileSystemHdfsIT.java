@@ -115,6 +115,11 @@ class CachedFileSystemHdfsIT {
         byte[] got = in.readAllBytes();
         assertThat(got).isEqualTo(payload);
       }
+      // Prove the cache fill path was driven — without this, a silent bypass (e.g. bootstrap not
+      // installed, falling through to fs.open in CachedFileSystem.open) would still return the
+      // correct bytes from the direct DFS read, masking a dead cache layer.
+      var stats = CacheBootstrap.get().orElseThrow().ramCache().refreshStats();
+      assertThat(stats.numNew()).isGreaterThanOrEqualTo(3);
     }
   }
 

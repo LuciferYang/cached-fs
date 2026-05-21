@@ -15,8 +15,10 @@
  */
 package io.github.luciferyang.cachedfs.core.handle;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.locks.Condition;
@@ -227,6 +229,27 @@ public final class CachedFactory<K, V> {
     lock.lock();
     try {
       return lru.size();
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /**
+   * Drains every entry (pinned or not) and returns the values so the caller can close them. Used
+   * when the owning component is shutting down and must release every cached resource regardless of
+   * pin state. In normal operation, pinned entries are released via {@link CachedPtr#close} and the
+   * eviction policy retires cold entries.
+   */
+  public List<V> drain() {
+    lock.lock();
+    try {
+      List<V> drained = new ArrayList<>(lru.size());
+      for (Entry<V> e : lru.values()) {
+        drained.add(e.value);
+      }
+      lru.clear();
+      index.clear();
+      return drained;
     } finally {
       lock.unlock();
     }

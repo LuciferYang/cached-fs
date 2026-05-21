@@ -156,11 +156,20 @@ public final class CacheBootstrap {
         return;
       }
       IOException primary = null;
+      // Drain handle factory FIRST — each FileHandle owns a lazily-opened inner-FS input stream
+      // that the LRU would otherwise leak when the bootstrap reference is dropped. Run before tier
+      // shutdown so handle close-paths still see a live RAM/SSD cache if they touch it.
+      try {
+        b.handleFactory.closeAll();
+      } catch (IOException ex) {
+        primary = ex;
+      }
       if (b.ssdCache != null) {
         try {
           b.ssdCache.close();
         } catch (IOException ex) {
-          primary = ex;
+          if (primary == null) primary = ex;
+          else primary.addSuppressed(ex);
         }
       }
       try {

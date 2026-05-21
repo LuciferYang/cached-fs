@@ -54,6 +54,7 @@
     <spotless.version>2.43.0</spotless.version>
     <surefire.version>3.5.2</surefire.version>
     <jacoco.version>0.8.12</jacoco.version>
+    <maven-compiler-plugin.version>3.13.0</maven-compiler-plugin.version>
   </properties>
 
   <dependencyManagement>
@@ -142,6 +143,14 @@
   <build>
     <pluginManagement>
       <plugins>
+        <plugin>
+          <!-- Pinned for reproducibility: the release=21 compile flag relies on a recent compiler
+               plugin; without a pin the version resolves from the active Maven distribution's
+               super-POM, which drifts across Maven 3.8/3.9/4.x. -->
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-compiler-plugin</artifactId>
+          <version>${maven-compiler-plugin.version}</version>
+        </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-surefire-plugin</artifactId>

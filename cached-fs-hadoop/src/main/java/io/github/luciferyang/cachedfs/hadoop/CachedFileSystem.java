@@ -176,6 +176,32 @@ public final class CachedFileSystem extends FilterFileSystem {
     }
   }
 
+  @Override
+  public void close() throws IOException {
+    // Per the Phase 3b limitation noted above, this decorator owns the bootstrap's open handles —
+    // each FileHandle captured `fs` at openHandleForKey time. Draining BEFORE super.close() closes
+    // the handles' input streams while the inner FS is still live; otherwise HadoopReadFile.close
+    // would invoke FSDataInputStream.close on a dead DFSClient and throw "Filesystem closed".
+    IOException primary = null;
+    CacheBootstrap b = CacheBootstrap.get().orElse(null);
+    if (b != null) {
+      try {
+        b.handleFactory().closeAll();
+      } catch (IOException ex) {
+        primary = ex;
+      }
+    }
+    try {
+      super.close();
+    } catch (IOException ex) {
+      if (primary == null) primary = ex;
+      else primary.addSuppressed(ex);
+    }
+    if (primary != null) {
+      throw primary;
+    }
+  }
+
   /** Returns the wrapped inner FS — escape hatch for tests and tooling. */
   public FileSystem innerFileSystem() {
     return fs;

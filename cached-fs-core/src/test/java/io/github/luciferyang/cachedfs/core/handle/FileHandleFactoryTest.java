@@ -16,10 +16,12 @@
 package io.github.luciferyang.cachedfs.core.handle;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.luciferyang.cachedfs.core.id.StringIdLease;
 import io.github.luciferyang.cachedfs.core.id.StringIdMap;
 import io.github.luciferyang.cachedfs.core.io.ReadFile;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -28,7 +30,7 @@ import org.junit.jupiter.api.Test;
 
 class FileHandleFactoryTest {
 
-  static final class NoopReadFile implements ReadFile {
+  static class NoopReadFile implements ReadFile {
     final String id;
 
     NoopReadFile(String id) {
@@ -57,7 +59,7 @@ class FileHandleFactoryTest {
     public void preadv(long offset, List<ByteBuffer> buffers) {}
 
     @Override
-    public void close() {}
+    public void close() throws IOException {}
   }
 
   @Test
@@ -78,5 +80,59 @@ class FileHandleFactoryTest {
       assertThat(p1.value()).isSameAs(p2.value());
     }
     assertThat(opens.get()).isEqualTo(1);
+  }
+
+  @Test
+  @DisplayName("closeAll: drains every cached handle and closes each ReadFile")
+  void closeAllDrainsAndCloses() throws Exception {
+    StringIdMap map = new StringIdMap();
+    AtomicInteger closes = new AtomicInteger();
+    FileHandleFactory f =
+        new FileHandleFactory(
+            16,
+            key ->
+                new FileHandle(
+                    new NoopReadFile(key) {
+                      @Override
+                      public void close() throws IOException {
+                        closes.incrementAndGet();
+                      }
+                    },
+                    new StringIdLease(map, key),
+                    new StringIdLease(map, "/")));
+    f.open("file://a").close();
+    f.open("file://b").close();
+    assertThat(f.size()).isEqualTo(2);
+
+    f.closeAll();
+
+    assertThat(f.size()).isZero();
+    assertThat(closes.get()).isEqualTo(2);
+  }
+
+  @Test
+  @DisplayName("closeAll: aggregates close failures via suppressed exceptions")
+  void closeAllAggregatesFailures() {
+    StringIdMap map = new StringIdMap();
+    FileHandleFactory f =
+        new FileHandleFactory(
+            16,
+            key ->
+                new FileHandle(
+                    new NoopReadFile(key) {
+                      @Override
+                      public void close() throws IOException {
+                        throw new IOException("boom-" + identity());
+                      }
+                    },
+                    new StringIdLease(map, key),
+                    new StringIdLease(map, "/")));
+    f.open("file://a").close();
+    f.open("file://b").close();
+
+    assertThatThrownBy(f::closeAll)
+        .isInstanceOf(IOException.class)
+        .matches(ex -> ex.getSuppressed().length >= 1);
+    assertThat(f.size()).isZero();
   }
 }
