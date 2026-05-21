@@ -115,8 +115,7 @@ class CachedFileSystemHdfsIT {
       try (FSDataInputStream in = cfs.open(file, 1024)) {
         in.readFully(0, new byte[1024]);
       }
-      var statsBefore =
-          CacheBootstrap.get().orElseThrow().ramCache().refreshStats();
+      var statsBefore = CacheBootstrap.get().orElseThrow().ramCache().refreshStats();
       try (FSDataInputStream in = cfs.open(file, 1024)) {
         byte[] dst = new byte[1024];
         in.readFully(0, dst);
