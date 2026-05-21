@@ -264,6 +264,14 @@ public final class CachedFactory<K, V> {
    * generator that finishes after this call returns would re-insert a value the shutdown caller
    * already believed was gone. Bounded wait: generators always exit {@code pending} (success or
    * throw).
+   *
+   * <p><b>Pin semantics:</b> matches the {@link #drain} contract — pinned entries are drained too
+   * (this is a shutdown primitive, not eviction). If a generator completes during the wait window,
+   * its caller will receive a {@link CachedPtr} whose value is then yanked and closed by the
+   * drainer; subsequent reads through that pointer fail at the underlying resource level (e.g.
+   * IOException("Stream closed"), the same symptom Hadoop produces for any close-during-read race).
+   * Callers performing a partial drain must understand that close-while-reading is fundamentally
+   * racy at the inner-FS layer; the only guarantee here is no resource leak across the drain.
    */
   public List<V> drainMatching(Predicate<K> predicate) {
     Objects.requireNonNull(predicate, "predicate");

@@ -249,6 +249,12 @@ public final class CachedFileSystem extends FilterFileSystem {
                 });
       } catch (IOException ex) {
         primary = ex;
+      } catch (RuntimeException ex) {
+        // closeMatching contract is IOException, but a bug in the predicate or in a future
+        // CachedFactory refactor could still leak a RuntimeException. Wrap so super.close() runs
+        // and the inner FS is released — otherwise a defensive-coding regression here would
+        // silently leak the inner FS for the JVM lifetime.
+        primary = new IOException(ex);
       }
     }
     try {

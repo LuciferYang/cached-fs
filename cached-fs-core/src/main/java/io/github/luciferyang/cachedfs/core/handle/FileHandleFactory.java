@@ -73,6 +73,11 @@ public final class FileHandleFactory {
    *
    * <p>May block briefly while in-flight openers for matching keys settle — see {@link
    * CachedFactory#drainMatching}.
+   *
+   * <p><b>Pinned handles are drained too</b> — same contract as {@link #closeAll}. A caller still
+   * mid-read on a pinned handle will see an {@code IOException} on its next read once the handle is
+   * closed under it; close-while-reading is a fundamental Hadoop FS race and this method makes no
+   * attempt to wait out active readers.
    */
   public void closeMatching(Predicate<String> predicate) throws IOException {
     Objects.requireNonNull(predicate, "predicate");
