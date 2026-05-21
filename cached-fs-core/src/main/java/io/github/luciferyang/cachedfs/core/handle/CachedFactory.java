@@ -17,6 +17,7 @@ package io.github.luciferyang.cachedfs.core.handle;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -24,6 +25,7 @@ import java.util.Objects;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 /**
  * Single-flight value factory backed by a count-based LRU cache. Mirrors velox {@code CachedFactory
@@ -249,6 +251,32 @@ public final class CachedFactory<K, V> {
       }
       lru.clear();
       index.clear();
+      return drained;
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /**
+   * Drains only the entries whose key matches {@code predicate}, returning their values. Used by
+   * partial-shutdown callers (e.g. a single {@link io.github.luciferyang.cachedfs.hadoop} decorator
+   * closing while other decorators still need their own entries). Unlike {@link #drain}, this does
+   * not touch entries that don't match.
+   */
+  public List<V> drainMatching(Predicate<K> predicate) {
+    Objects.requireNonNull(predicate, "predicate");
+    lock.lock();
+    try {
+      List<V> drained = new ArrayList<>();
+      Iterator<Map.Entry<K, Entry<V>>> it = lru.entrySet().iterator();
+      while (it.hasNext()) {
+        Map.Entry<K, Entry<V>> e = it.next();
+        if (predicate.test(e.getKey())) {
+          drained.add(e.getValue().value);
+          it.remove();
+          index.remove(e.getKey());
+        }
+      }
       return drained;
     } finally {
       lock.unlock();

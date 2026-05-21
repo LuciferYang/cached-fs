@@ -166,6 +166,41 @@ class CachedFileSystemTest {
     }
   }
 
+  @Test
+  @DisplayName(
+      "two decorators for different endpoints coexist; closing one preserves the other's opener")
+  void multipleEndpointsCoexist(@TempDir java.nio.file.Path dir) throws IOException {
+    // Two CachedFileSystem instances share the bootstrap but register independent openers under
+    // their own scheme://authority keys. Closing one must NOT unregister the other.
+    Files.write(dir.resolve("a.bin"), bytes(64));
+
+    Configuration confA = defaultConf();
+    Configuration confB = defaultConf();
+    CachedFileSystem alpha = new CachedFileSystem();
+    CachedFileSystem beta = new CachedFileSystem();
+    try {
+      alpha.initialize(URI.create("file:///"), confA);
+      // Manually register a second opener simulating a peer decorator on a different endpoint —
+      // this mirrors what a real BosFileSystem-backed CachedFileSystem would do at initialize().
+      CacheBootstrap.installOpener("bos://bucket.bj.bcebos.com", key -> null);
+      beta.initialize(URI.create("file:///"), confB); // no-op for endpoint (same as alpha)
+      CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+      assertThat(b.hasOpener("file://")).isTrue();
+      assertThat(b.hasOpener("bos://bucket.bj.bcebos.com")).isTrue();
+
+      alpha.close();
+      // Closing alpha unregisters file:// (its own endpoint) but the bos endpoint must remain
+      // since no decorator owning it has closed.
+      assertThat(b.hasOpener("file://")).isFalse();
+      assertThat(b.hasOpener("bos://bucket.bj.bcebos.com")).isTrue();
+    } finally {
+      beta.close();
+      // bos opener was registered without a real decorator owning it — clean it up so the
+      // @AfterEach uninstallForTesting() doesn't try to drain a fake handle key.
+      CacheBootstrap.removeOpener("bos://bucket.bj.bcebos.com");
+    }
+  }
+
   // --- helpers -------------------------------------------------------------
 
   private static CachedFileSystem newCfs(URI fileUri, Configuration conf) throws IOException {

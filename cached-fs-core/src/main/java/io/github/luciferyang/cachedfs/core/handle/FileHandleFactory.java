@@ -18,6 +18,7 @@ package io.github.luciferyang.cachedfs.core.handle;
 import java.io.IOException;
 import java.util.Objects;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 /**
  * Open-handle LRU keyed by a stable string identifier (typically a fully-qualified file URI). Built
@@ -62,8 +63,21 @@ public final class FileHandleFactory {
    * always attempts every close.
    */
   public void closeAll() throws IOException {
+    closeDrained(delegate.drain());
+  }
+
+  /**
+   * Drains and closes only the handles whose key matches {@code predicate}. Used by a single
+   * decorator (e.g. one of several {@code CachedFileSystem} instances in a multi-scheme JVM) to
+   * release just its own handles without disturbing peers' entries.
+   */
+  public void closeMatching(Predicate<String> predicate) throws IOException {
+    closeDrained(delegate.drainMatching(predicate));
+  }
+
+  private void closeDrained(java.util.List<FileHandle> handles) throws IOException {
     IOException primary = null;
-    for (FileHandle h : delegate.drain()) {
+    for (FileHandle h : handles) {
       try {
         h.close();
       } catch (IOException ex) {

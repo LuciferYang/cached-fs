@@ -23,7 +23,10 @@ import io.github.luciferyang.cachedfs.core.id.StringIdLease;
 import io.github.luciferyang.cachedfs.core.id.StringIdMap;
 import io.github.luciferyang.cachedfs.core.ssd.SsdCache;
 import java.io.IOException;
+import java.net.URI;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.locks.ReentrantLock;
 import org.apache.hadoop.conf.Configuration;
 
@@ -41,10 +44,15 @@ import org.apache.hadoop.conf.Configuration;
  *   <li>{@link SsdCache} held here (no global setter in core; the {@link
  *       io.github.luciferyang.cachedfs.hadoop.CachedFileSystem} reads from {@link #ssdCache()})
  *   <li>{@link FileHandleFactory} sized by {@link CachedFsConfig#HANDLE_CACHE_CAPACITY}
+ *   <li>Per-endpoint {@link HandleOpener} registry keyed by {@code scheme://authority} (one entry
+ *       per live {@link CachedFileSystem} instance), so a single JVM can cache reads from {@code
+ *       hdfs://nn-a}, {@code s3a://bucket-x}, and {@code bos://bucket-y} side by side
  * </ul>
  *
  * <p>The first {@link #installIfNeeded} call wins; subsequent calls are no-ops regardless of the
  * Configuration they see. Operators that need to change cache settings must restart the JVM.
+ * Openers are registered via {@link #installOpener} after the tiers are up and removed via {@link
+ * #removeOpener} when the owning decorator closes.
  */
 public final class CacheBootstrap {
 
@@ -57,17 +65,39 @@ public final class CacheBootstrap {
   private final FileHandleFactory handleFactory;
   private final int loadQuantumBytes;
 
+  /**
+   * Live opener registry, keyed by {@code scheme://authority}. Each {@link CachedFileSystem}
+   * instance owns exactly one entry for the lifetime of its initialize/close pair. The {@link
+   * FileHandleFactory}'s generator dispatches into this map at handle-open time.
+   */
+  private final ConcurrentMap<String, HandleOpener> openersByEndpoint = new ConcurrentHashMap<>();
+
   private CacheBootstrap(
       AsyncDataCache ramCache,
       SsdCache ssdCache,
       StringIdMap stringIds,
-      FileHandleFactory handleFactory,
-      int loadQuantumBytes) {
+      int loadQuantumBytes,
+      int handleCapacity) {
     this.ramCache = ramCache;
     this.ssdCache = ssdCache;
     this.stringIds = stringIds;
-    this.handleFactory = handleFactory;
     this.loadQuantumBytes = loadQuantumBytes;
+    // FileHandleFactory's generator captures `this` so it can route each key through the registry.
+    this.handleFactory = new FileHandleFactory(handleCapacity, this::dispatchOpen);
+  }
+
+  /**
+   * Builds the {@code scheme://authority} endpoint key used by the opener registry. Returns just
+   * the scheme (with trailing {@code ://}) when no authority is present — matches Hadoop's
+   * convention for schemes that don't use one (e.g. {@code file:///}).
+   */
+  static String endpointKey(URI uri) {
+    String scheme = uri.getScheme();
+    if (scheme == null) {
+      throw new IllegalArgumentException("URI has no scheme: " + uri);
+    }
+    String authority = uri.getAuthority();
+    return scheme + "://" + (authority == null ? "" : authority);
   }
 
   /** Returns the installed bootstrap, or empty if {@link #installIfNeeded} has not run. */
@@ -77,12 +107,11 @@ public final class CacheBootstrap {
 
   /**
    * Installs the cache singletons if no installation exists yet. Idempotent: a second concurrent
-   * call observes the existing installation and returns it unchanged. The {@code openerFactory} is
-   * used to manufacture {@link FileHandle} instances for new URIs; in production this is wired to
-   * the inner Hadoop {@link org.apache.hadoop.fs.FileSystem}.
+   * call observes the existing installation and returns it unchanged. Tiers (RAM, SSD, ID map,
+   * handle factory) are created here; per-scheme {@link HandleOpener} instances are NOT — those are
+   * registered separately via {@link #installOpener} after each decorator's inner FS is built.
    */
-  public static CacheBootstrap installIfNeeded(Configuration conf, HandleOpener opener)
-      throws IOException {
+  public static CacheBootstrap installIfNeeded(Configuration conf) throws IOException {
     CacheBootstrap snapshot = installed;
     if (snapshot != null) {
       return snapshot;
@@ -105,10 +134,8 @@ public final class CacheBootstrap {
           ssd = new SsdCache(ssdCfg, ids);
         }
         int handleCap = CachedFsConfig.handleCacheCapacity(conf);
-        FileHandleFactory hf =
-            new FileHandleFactory(handleCap, key -> openHandle(opener, ids, key));
         int quantum = CachedFsConfig.loadQuantumBytes(conf);
-        CacheBootstrap b = new CacheBootstrap(ram, ssd, ids, hf, quantum);
+        CacheBootstrap b = new CacheBootstrap(ram, ssd, ids, quantum, handleCap);
         // All pieces ready — now publish singletons atomically (w.r.t. LOCK) and commit.
         // Order matters because FileIds has no clearInstance API (test-only singleton):
         // publish AsyncDataCache FIRST so that if FileIds.setInstance somehow throws (it can
@@ -146,6 +173,65 @@ public final class CacheBootstrap {
     }
   }
 
+  /**
+   * Registers (or replaces) the {@link HandleOpener} that services keys whose URI matches {@code
+   * endpoint} (a {@code scheme://authority} string). Throws if the bootstrap has not been installed
+   * yet — callers must always run {@link #installIfNeeded} first.
+   */
+  public static void installOpener(String endpoint, HandleOpener opener) {
+    if (endpoint == null) {
+      throw new NullPointerException("endpoint");
+    }
+    if (opener == null) {
+      throw new NullPointerException("opener");
+    }
+    CacheBootstrap b = installed;
+    if (b == null) {
+      throw new IllegalStateException(
+          "CacheBootstrap is not installed; call installIfNeeded() before installOpener()");
+    }
+    b.openersByEndpoint.put(endpoint, opener);
+  }
+
+  /**
+   * Removes the opener for {@code endpoint}. No-op if the bootstrap is uninstalled or the endpoint
+   * was never registered. Returns true if an entry was removed.
+   */
+  public static boolean removeOpener(String endpoint) {
+    CacheBootstrap b = installed;
+    if (b == null) {
+      return false;
+    }
+    return b.openersByEndpoint.remove(endpoint) != null;
+  }
+
+  /**
+   * Returns true if an opener is currently registered for {@code endpoint}. Visible to tests so
+   * they can assert that close() actually unregistered the decorator.
+   */
+  public boolean hasOpener(String endpoint) {
+    return openersByEndpoint.containsKey(endpoint);
+  }
+
+  /** Dispatches a key (full file URI string) to the opener whose endpoint matches. */
+  private FileHandle dispatchOpen(String key) {
+    URI uri;
+    try {
+      uri = new URI(key);
+    } catch (java.net.URISyntaxException ex) {
+      throw new IllegalArgumentException("Invalid handle key: " + key, ex);
+    }
+    String endpoint = endpointKey(uri);
+    HandleOpener opener = openersByEndpoint.get(endpoint);
+    if (opener == null) {
+      throw new IllegalStateException(
+          "No opener registered for endpoint "
+              + endpoint
+              + "; did the owning CachedFileSystem initialize() succeed?");
+    }
+    return openHandle(opener, stringIds, key);
+  }
+
   /** Tears down the installed bootstrap. Test-only — production JVMs install once and keep. */
   public static void uninstallForTesting() throws IOException {
     LOCK.lock();
@@ -164,6 +250,10 @@ public final class CacheBootstrap {
       } catch (IOException ex) {
         primary = ex;
       }
+      // Drop any remaining endpoint registrations (production decorators close via removeOpener,
+      // but a test that forgot to close its CachedFileSystem would otherwise leak stale openers
+      // into the next test's installIfNeeded — only relevant when the same JVM is reused).
+      b.openersByEndpoint.clear();
       if (b.ssdCache != null) {
         try {
           b.ssdCache.close();

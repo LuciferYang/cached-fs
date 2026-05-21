@@ -43,10 +43,11 @@ import org.apache.hadoop.util.ReflectionUtils;
  * <p><b>Toggle:</b> {@code fs.cached.enabled=false} makes {@link #open} delegate straight to the
  * inner without consulting the cache — useful for A/B benchmarking without redeploying.
  *
- * <p><b>Single-decorator limitation:</b> the JVM-wide {@link CacheBootstrap} captures the FIRST
- * decorator instance's inner FS as the source of newly-opened files. Multi-scheme caching (e.g.
- * caching both {@code s3a://} and {@code hdfs://} in the same process) is deferred — a future
- * scheme-keyed opener registry will lift it.
+ * <p><b>Multi-scheme:</b> each decorator instance registers a {@link CacheBootstrap.HandleOpener}
+ * keyed by {@code scheme://authority}, so a single JVM can transparently cache reads from {@code
+ * hdfs://nn-a}, {@code s3a://bucket-x}, {@code bos://bucket-y}, and any other Hadoop {@link
+ * FileSystem} side by side. Closing one decorator unregisters its endpoint and drains only its own
+ * handles; sibling decorators keep their entries.
  */
 public final class CachedFileSystem extends FilterFileSystem {
 
@@ -93,7 +94,8 @@ public final class CachedFileSystem extends FilterFileSystem {
       super.initialize(name, conf); // FilterFileSystem records statistics + sets working dir
       this.enabled = CachedFsConfig.isEnabled(conf);
       if (enabled) {
-        CacheBootstrap.installIfNeeded(conf, this::openHandleForKey);
+        CacheBootstrap.installIfNeeded(conf);
+        CacheBootstrap.installOpener(CacheBootstrap.endpointKey(name), this::openHandleForKey);
       }
       initialized = true;
     } finally {
@@ -178,19 +180,22 @@ public final class CachedFileSystem extends FilterFileSystem {
 
   @Override
   public void close() throws IOException {
-    // Per the single-decorator limitation noted above, this decorator owns the bootstrap's open
-    // handles — each FileHandle captured `fs` at openHandleForKey time. Draining BEFORE
-    // super.close() closes the handles' input streams while the inner FS is still live; otherwise
-    // HadoopReadFile.close would invoke FSDataInputStream.close on a dead DFSClient and throw
-    // "Filesystem closed".
+    // Drain ONLY the handles minted by this decorator — those whose URI key starts with our
+    // scheme://authority endpoint — so peer CachedFileSystem instances caching other schemes in
+    // the same JVM keep their entries. Run before super.close() so HadoopReadFile.close calls
+    // FSDataInputStream.close on a still-live inner FS; DFSClient otherwise throws
+    // "Filesystem closed" mid-drain.
     IOException primary = null;
+    String endpoint = uri != null ? CacheBootstrap.endpointKey(uri) : null;
     CacheBootstrap b = CacheBootstrap.get().orElse(null);
-    if (b != null) {
+    if (b != null && endpoint != null) {
       try {
-        b.handleFactory().closeAll();
+        String prefix = endpoint + "/";
+        b.handleFactory().closeMatching(k -> k.startsWith(prefix) || k.equals(endpoint));
       } catch (IOException ex) {
         primary = ex;
       }
+      CacheBootstrap.removeOpener(endpoint);
     }
     try {
       super.close();
