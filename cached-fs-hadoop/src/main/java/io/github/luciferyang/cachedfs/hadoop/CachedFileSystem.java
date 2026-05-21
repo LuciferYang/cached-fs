@@ -43,10 +43,10 @@ import org.apache.hadoop.util.ReflectionUtils;
  * <p><b>Toggle:</b> {@code fs.cached.enabled=false} makes {@link #open} delegate straight to the
  * inner without consulting the cache — useful for A/B benchmarking without redeploying.
  *
- * <p><b>Phase 3b limitation:</b> the JVM-wide {@link CacheBootstrap} captures the FIRST decorator
- * instance's inner FS as the source of newly-opened files. Multi-scheme caching (e.g. caching both
- * {@code s3a://} and {@code hdfs://} in the same process) is deferred — Phase 4 will introduce a
- * scheme-keyed opener registry.
+ * <p><b>Single-decorator limitation:</b> the JVM-wide {@link CacheBootstrap} captures the FIRST
+ * decorator instance's inner FS as the source of newly-opened files. Multi-scheme caching (e.g.
+ * caching both {@code s3a://} and {@code hdfs://} in the same process) is deferred — a future
+ * scheme-keyed opener registry will lift it.
  */
 public final class CachedFileSystem extends FilterFileSystem {
 
@@ -178,10 +178,11 @@ public final class CachedFileSystem extends FilterFileSystem {
 
   @Override
   public void close() throws IOException {
-    // Per the Phase 3b limitation noted above, this decorator owns the bootstrap's open handles —
-    // each FileHandle captured `fs` at openHandleForKey time. Draining BEFORE super.close() closes
-    // the handles' input streams while the inner FS is still live; otherwise HadoopReadFile.close
-    // would invoke FSDataInputStream.close on a dead DFSClient and throw "Filesystem closed".
+    // Per the single-decorator limitation noted above, this decorator owns the bootstrap's open
+    // handles — each FileHandle captured `fs` at openHandleForKey time. Draining BEFORE
+    // super.close() closes the handles' input streams while the inner FS is still live; otherwise
+    // HadoopReadFile.close would invoke FSDataInputStream.close on a dead DFSClient and throw
+    // "Filesystem closed".
     IOException primary = null;
     CacheBootstrap b = CacheBootstrap.get().orElse(null);
     if (b != null) {
