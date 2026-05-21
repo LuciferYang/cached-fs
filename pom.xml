@@ -45,6 +45,12 @@
     <micrometer.version>1.14.1</micrometer.version>
     <picocli.version>4.7.6</picocli.version>
 
+    <s3mock.version>4.11.0</s3mock.version>
+    <!-- s3mock pulls in jackson 2.19.x; hadoop pulls in 2.12.x. The combination NoClassDefs on
+         JacksonFeature unless we align. Pinning to 2.19.4 works because Jackson 2 is wire- and
+         API-compatible across the 2.10–2.19 minor releases that Hadoop touches. -->
+    <jackson.version>2.19.4</jackson.version>
+
     <spotless.version>2.43.0</spotless.version>
     <surefire.version>3.5.2</surefire.version>
     <jacoco.version>0.8.12</jacoco.version>
@@ -52,6 +58,13 @@
 
   <dependencyManagement>
     <dependencies>
+      <dependency>
+        <groupId>com.fasterxml.jackson</groupId>
+        <artifactId>jackson-bom</artifactId>
+        <version>${jackson.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
       <dependency>
         <groupId>io.github.luciferyang</groupId>
         <artifactId>cached-fs-core</artifactId>
@@ -111,6 +124,18 @@
         <version>${hadoop.version}</version>
         <scope>test</scope>
       </dependency>
+      <dependency>
+        <groupId>org.apache.hadoop</groupId>
+        <artifactId>hadoop-aws</artifactId>
+        <version>${hadoop.version}</version>
+        <scope>test</scope>
+      </dependency>
+      <dependency>
+        <groupId>com.adobe.testing</groupId>
+        <artifactId>s3mock-junit5</artifactId>
+        <version>${s3mock.version}</version>
+        <scope>test</scope>
+      </dependency>
     </dependencies>
   </dependencyManagement>
 
@@ -125,6 +150,23 @@
             <!-- @{argLine} expands JaCoCo's late-bound property so coverage works alongside our flags. -->
             <argLine>@{argLine} --enable-native-access=ALL-UNNAMED</argLine>
           </configuration>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-failsafe-plugin</artifactId>
+          <version>${surefire.version}</version>
+          <configuration>
+            <!-- @{argLine} expands JaCoCo's late-bound property so coverage works alongside our flags. -->
+            <argLine>@{argLine} --enable-native-access=ALL-UNNAMED</argLine>
+          </configuration>
+          <executions>
+            <execution>
+              <goals>
+                <goal>integration-test</goal>
+                <goal>verify</goal>
+              </goals>
+            </execution>
+          </executions>
         </plugin>
         <plugin>
           <groupId>com.diffplug.spotless</groupId>
@@ -166,6 +208,10 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-failsafe-plugin</artifactId>
       </plugin>
       <plugin>
         <groupId>org.jacoco</groupId>

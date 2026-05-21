@@ -45,5 +45,30 @@
       <groupId>org.apache.hadoop</groupId>
       <artifactId>hadoop-minicluster</artifactId>
     </dependency>
+    <dependency>
+      <!-- hadoop-minicluster pulls hadoop-hdfs:tests which references Mockito on the test
+           classpath at MiniDFSCluster.startup time. The dependency tree declares it as
+           "provided" so we have to add it explicitly in test scope. -->
+      <groupId>org.mockito</groupId>
+      <artifactId>mockito-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-aws</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.adobe.testing</groupId>
+      <artifactId>s3mock-junit5</artifactId>
+    </dependency>
+    <dependency>
+      <!-- s3mock's embedded Tomcat (via Spring Boot) needs jakarta.annotation.PostConstruct on
+           the classpath. Hadoop 3.4.x brings it transitively via avro-1.11; Hadoop 3.5.x drops
+           that transitive, so we declare it explicitly so the test classpath is consistent. -->
+      <groupId>jakarta.annotation</groupId>
+      <artifactId>jakarta.annotation-api</artifactId>
+      <version>2.1.1</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 </project>
