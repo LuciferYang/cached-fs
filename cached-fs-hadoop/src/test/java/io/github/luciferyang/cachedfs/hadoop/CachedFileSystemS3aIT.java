@@ -88,6 +88,12 @@ class CachedFileSystemS3aIT {
         byte[] got = in.readAllBytes();
         assertThat(got).isEqualTo(payload);
       }
+      // Anchor the claim to the cache path — without this, a silent bypass via
+      // CachedFileSystem.open's fallthrough branches (enabled=false, or bootstrap missing) would
+      // serve correct bytes directly from S3A and the equality assertion would still pass,
+      // contradicting the "loadQuantum boundary" claim which only exists on the cache path.
+      var stats = CacheBootstrap.get().orElseThrow().ramCache().refreshStats();
+      assertThat(stats.numNew()).isGreaterThanOrEqualTo(3);
     }
   }
 
