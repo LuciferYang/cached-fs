@@ -30,6 +30,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.api.io.TempDir;
 
 /**
  * Integration test: {@link CachedFileSystem} wrapping {@link S3AFileSystem} against an in-process
@@ -47,6 +48,10 @@ class CachedFileSystemS3aIT {
   @RegisterExtension
   static final S3MockExtension S3_MOCK =
       S3MockExtension.builder().silent().withInitialBuckets(BUCKET).build();
+
+  // S3A stages uploads under hadoop.tmp.dir; @TempDir scopes the staging area to this test class
+  // so it tears down with the test instead of accumulating across re-runs on a reused GHA runner.
+  @TempDir static java.nio.file.Path tmpDir;
 
   @AfterEach
   void uninstallBootstrap() throws IOException {
@@ -138,7 +143,7 @@ class CachedFileSystemS3aIT {
   private Configuration cachedConf() {
     Configuration conf = new Configuration(false);
     // S3A stages uploads under hadoop.tmp.dir; without it create() blows up with NPE.
-    conf.set("hadoop.tmp.dir", System.getProperty("java.io.tmpdir") + "/cached-fs-s3a-it");
+    conf.set("hadoop.tmp.dir", tmpDir.toAbsolutePath().toString());
     // Decorator wiring.
     conf.setBoolean(CachedFsConfig.ENABLED, true);
     conf.set(CachedFsConfig.INNER_IMPL, S3AFileSystem.class.getName());

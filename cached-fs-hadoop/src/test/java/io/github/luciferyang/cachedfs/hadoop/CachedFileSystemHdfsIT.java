@@ -51,8 +51,24 @@ class CachedFileSystemHdfsIT {
     baseConf = new Configuration();
     // Pin the cluster's storage under the JUnit temp dir so it tears down with the test.
     baseConf.set(MiniDFSCluster.HDFS_MINIDFS_BASEDIR, baseDir.toAbsolutePath().toString());
-    cluster = new MiniDFSCluster.Builder(baseConf).numDataNodes(1).build();
-    cluster.waitClusterUp();
+    // MiniDFSCluster.Builder.build() can throw partway through (port bind failure, disk error)
+    // leaving NameNode/DataNode threads and bound ports alive. Catch, shut down whatever the
+    // Builder partially constructed, then rethrow so @AfterAll doesn't observe a null cluster.
+    MiniDFSCluster partial = null;
+    try {
+      partial = new MiniDFSCluster.Builder(baseConf).numDataNodes(1).build();
+      partial.waitClusterUp();
+      cluster = partial;
+    } catch (IOException | RuntimeException ex) {
+      if (partial != null) {
+        try {
+          partial.shutdown(true);
+        } catch (RuntimeException suppressed) {
+          ex.addSuppressed(suppressed);
+        }
+      }
+      throw ex;
+    }
   }
 
   @AfterAll

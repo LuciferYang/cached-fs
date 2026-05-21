@@ -199,6 +199,17 @@
               <phase>verify</phase>
               <goals><goal>report</goal></goals>
             </execution>
+            <!-- Failsafe runs in a separate forked JVM from Surefire; without a dedicated
+                 prepare-agent-integration execution, IT coverage is silently dropped. -->
+            <execution>
+              <id>prepare-agent-integration</id>
+              <goals><goal>prepare-agent-integration</goal></goals>
+            </execution>
+            <execution>
+              <id>report-integration</id>
+              <phase>verify</phase>
+              <goals><goal>report-integration</goal></goals>
+            </execution>
           </executions>
         </plugin>
       </plugins>
