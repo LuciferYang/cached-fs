@@ -30,6 +30,23 @@ fs.cached.enabled=true
 
 For multi-scheme caching in the same JVM, give each `FileSystem.get(uri, conf)` call its own `Configuration` whose `fs.cached.inner.impl` names the inner class for that scheme — the bootstrap's RAM/SSD tiers are shared while each decorator registers its own `scheme://authority` opener.
 
+## TTL (cache aging)
+
+The cache tracks the open-time of every file it's been asked to serve and exposes an externally-driven aging knob via `CacheTTLController`. No background thread runs inside cached-fs — the embedding application invokes `applyTTL(seconds)` on its own schedule (compliance age-out, invalidation of files known to have been replaced upstream, etc.).
+
+```java
+import io.github.luciferyang.cachedfs.hadoop.CacheBootstrap;
+import io.github.luciferyang.cachedfs.core.ttl.CacheTTLController;
+
+CacheTTLController ttl = CacheBootstrap.get().orElseThrow().ttlController();
+
+// Drop every cache entry whose owning file was first opened more than 1 hour ago.
+// Returns the count of files dropped from at least one tier on this cycle.
+int dropped = ttl.applyTTL(3600);
+```
+
+Two-tier removal runs RAM first then SSD; pinned entries (a reader still holding the handle) are reported back and retried on the next cycle. `numAgedOut` in `AsyncDataCache.refreshStats()` is the cumulative counter for entries dropped by TTL.
+
 ## Modules
 
 | Module | Purpose |

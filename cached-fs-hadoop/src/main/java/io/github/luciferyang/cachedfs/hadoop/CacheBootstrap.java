@@ -22,8 +22,10 @@ import io.github.luciferyang.cachedfs.core.id.FileIds;
 import io.github.luciferyang.cachedfs.core.id.StringIdLease;
 import io.github.luciferyang.cachedfs.core.id.StringIdMap;
 import io.github.luciferyang.cachedfs.core.ssd.SsdCache;
+import io.github.luciferyang.cachedfs.core.ttl.CacheTTLController;
 import java.io.IOException;
 import java.net.URI;
+import java.time.Clock;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
@@ -65,6 +67,7 @@ public final class CacheBootstrap {
   private final StringIdMap stringIds;
   private final FileHandleFactory handleFactory;
   private final int loadQuantumBytes;
+  private final CacheTTLController ttlController;
 
   /**
    * Live opener registry, keyed by {@code scheme://authority}. Each {@link CachedFileSystem}
@@ -85,6 +88,9 @@ public final class CacheBootstrap {
     this.loadQuantumBytes = loadQuantumBytes;
     // FileHandleFactory's generator captures `this` so it can route each key through the registry.
     this.handleFactory = new FileHandleFactory(handleCapacity, this::dispatchOpen);
+    // TTL controller is always constructed; embedders opt in by calling applyTTL externally.
+    // Cheap to construct (empty map) and harmless when no applyTTL caller exists.
+    this.ttlController = new CacheTTLController(ramCache, ssdCache, Clock.systemUTC());
   }
 
   /**
@@ -338,6 +344,16 @@ public final class CacheBootstrap {
 
   public int loadQuantumBytes() {
     return loadQuantumBytes;
+  }
+
+  /**
+   * Returns the per-JVM TTL controller. Operators / schedulers call {@link
+   * CacheTTLController#applyTTL} on this instance to drive aging. The controller is always
+   * constructed; if no caller ever invokes {@code applyTTL}, the only overhead is a per-file
+   * tracking map entry.
+   */
+  public CacheTTLController ttlController() {
+    return ttlController;
   }
 
   /**

@@ -130,6 +130,22 @@ public final class AsyncDataCache implements AutoCloseable {
     }
   }
 
+  /**
+   * Removes all unpinned entries whose {@code fileNum} is in {@code filesToRemove}, fanning out to
+   * every shard. Returns the union of retained file ids — entries still pinned at the moment of the
+   * call. Mirrors velox {@code AsyncDataCache::removeFileEntries}; the TTL controller is the
+   * primary caller.
+   */
+  public java.util.Set<Long> removeFileEntries(java.util.Set<Long> filesToRemove) {
+    java.util.Objects.requireNonNull(filesToRemove, "filesToRemove");
+    java.util.Set<Long> targets = java.util.Set.copyOf(filesToRemove);
+    java.util.Set<Long> retained = new java.util.HashSet<>();
+    for (CacheShard s : shards) {
+      retained.addAll(s.removeFileEntries(targets));
+    }
+    return retained;
+  }
+
   /** Aggregates per-shard counters into a {@link CacheStats} snapshot. */
   public CacheStats refreshStats() {
     CacheShard.StatsAccumulator acc = new CacheShard.StatsAccumulator();
@@ -158,7 +174,7 @@ public final class AsyncDataCache implements AutoCloseable {
         acc.numSavableEvict,
         acc.numEvictChecks,
         acc.numWaitExclusive,
-        0L, // numAgedOut (Phase 2 — TTL controller)
+        acc.numAgedOut,
         acc.numStales,
         0L, // allocClocks (Phase 2)
         acc.sumEvictScore,

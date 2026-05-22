@@ -77,6 +77,7 @@ public final class CacheShard {
   private long numEvictChecks;
   private long numWaitExclusive;
   private long numStales;
+  private long numAgedOut;
   private long sumEvictScore;
 
   CacheShard(AsyncDataCache cache) {
@@ -158,6 +159,51 @@ public final class CacheShard {
     } finally {
       mutex.unlock();
     }
+  }
+
+  /**
+   * Removes all unpinned entries whose {@link RawFileCacheKey#fileNum()} is in {@code
+   * filesToRemove}. Returns the set of file ids whose entries were still pinned (shared or
+   * exclusive) and could not be removed — the caller (typically the TTL controller) should retry
+   * them on the next cycle. Mirrors velox {@code CacheShard::removeFileEntries}.
+   */
+  public java.util.Set<Long> removeFileEntries(java.util.Set<Long> filesToRemove) {
+    java.util.Objects.requireNonNull(filesToRemove, "filesToRemove");
+    java.util.Set<Long> retained = new java.util.HashSet<>();
+    mutex.lock();
+    try {
+      var it = entryMap.entrySet().iterator();
+      while (it.hasNext()) {
+        var mapEntry = it.next();
+        long fn = mapEntry.getKey().fileNum();
+        if (!filesToRemove.contains(fn)) {
+          continue;
+        }
+        CacheEntry e = mapEntry.getValue();
+        if (e.numPins() != 0) {
+          // Shared- or exclusive-pinned. We cannot drop without yanking the holder's storage;
+          // surface as retained so the caller retries next cycle.
+          retained.add(fn);
+          continue;
+        }
+        // Unpinned: drop directly. Mirrors removeEntryLocked but uses the iterator to avoid
+        // ConcurrentModificationException since we are mid-traversal of entryMap.
+        it.remove();
+        int idx = findSlotIndexLocked(e);
+        if (idx >= 0) {
+          entries.set(idx, null);
+          emptySlots.addLast(idx);
+        }
+        e.resetForReuse();
+        if (freeEntries.size() < CacheEntry.MAX_FREE_ENTRIES) {
+          freeEntries.addLast(e);
+        }
+        numAgedOut++;
+      }
+    } finally {
+      mutex.unlock();
+    }
+    return retained;
   }
 
   /** lookupLocked. Caller must hold {@link #mutex}. */
@@ -425,6 +471,7 @@ public final class CacheShard {
       acc.numEvictChecks += numEvictChecks;
       acc.numWaitExclusive += numWaitExclusive;
       acc.numStales += numStales;
+      acc.numAgedOut += numAgedOut;
       acc.sumEvictScore += sumEvictScore;
       // Mirror velox: null slots and key-less entries both count as "empty"; exclusive entries
       // are accounted only into exclusivePinnedBytes/numExclusive (their size may still be in
@@ -490,6 +537,6 @@ public final class CacheShard {
     int numShared, numExclusive, numPrefetch;
     long sharedPinnedBytes, exclusivePinnedBytes, prefetchBytes;
     long numHit, hitBytes, numNew, numEvict, numSavableEvict, numEvictChecks;
-    long numWaitExclusive, numStales, sumEvictScore;
+    long numWaitExclusive, numStales, numAgedOut, sumEvictScore;
   }
 }
