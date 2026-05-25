@@ -16,8 +16,10 @@
 package io.github.luciferyang.cachedfs.core;
 
 import io.github.luciferyang.cachedfs.core.stats.CacheStats;
+import java.util.HashSet;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -135,13 +137,25 @@ public final class AsyncDataCache implements AutoCloseable {
    * every shard. Returns the union of retained file ids — entries still pinned at the moment of the
    * call. Mirrors velox {@code AsyncDataCache::removeFileEntries}; the TTL controller is the
    * primary caller.
+   *
+   * <p>Per-shard exceptions are caught and the target set is added to the retained result so the
+   * caller retries those files next cycle. The remaining shards continue. Matches velox's per-shard
+   * try/catch + {@code success &= false} fail-soft behavior so one flaky shard does not abort the
+   * whole tier pass.
    */
-  public java.util.Set<Long> removeFileEntries(java.util.Set<Long> filesToRemove) {
-    java.util.Objects.requireNonNull(filesToRemove, "filesToRemove");
-    java.util.Set<Long> targets = java.util.Set.copyOf(filesToRemove);
-    java.util.Set<Long> retained = new java.util.HashSet<>();
+  public Set<Long> removeFileEntries(Set<Long> filesToRemove) {
+    Objects.requireNonNull(filesToRemove, "filesToRemove");
+    Set<Long> targets = Set.copyOf(filesToRemove);
+    Set<Long> retained = new HashSet<>();
     for (CacheShard s : shards) {
-      retained.addAll(s.removeFileEntries(targets));
+      try {
+        retained.addAll(s.removeFileEntries(targets));
+      } catch (RuntimeException ex) {
+        // Per-shard fail-soft: the shard failed to clean its entries, so all targets are
+        // conservatively reported as retained for THIS shard. The TTL controller's cleanUp will
+        // keep them marked → next cycle retries. Other shards continue.
+        retained.addAll(targets);
+      }
     }
     return retained;
   }

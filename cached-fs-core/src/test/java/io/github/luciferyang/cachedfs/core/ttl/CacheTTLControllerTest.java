@@ -447,17 +447,18 @@ class CacheTTLControllerTest {
   }
 
   @Test
-  @DisplayName("applyTTL increments appliedCycles even when the RAM tier throws")
+  @DisplayName(
+      "applyTTL on tier exception: appliedCycles still bumps, reset clears the mark, openTime preserved")
   void appliedCyclesIncrementsOnTierException() {
     FakeClock clock = new FakeClock(1_000_000L);
-    // AsyncDataCache is final; use Mockito (mockito-inline default in 5.x) to mock the one
-    // method applyTTL calls. The mock returns defaults for everything else, including close().
+    // AsyncDataCache is final; use Mockito (mockito-inline default in 5.x) to mock the one method
+    // applyTTL calls. The mock returns defaults for everything else, including close().
     AsyncDataCache throwingRam = org.mockito.Mockito.mock(AsyncDataCache.class);
     org.mockito.Mockito.when(throwingRam.removeFileEntries(org.mockito.ArgumentMatchers.anySet()))
         .thenThrow(new RuntimeException("simulated tier failure"));
     CacheTTLController ttl = new CacheTTLController(throwingRam, null, clock);
-    ttl.recordOpen(7L);
-    clock.advance(1000);
+    ttl.recordOpen(7L); // openTime = 1_000_000
+    clock.advance(1000); // now = 1_001_000
 
     long cyclesBefore = ttl.appliedCycles();
     org.assertj.core.api.Assertions.assertThatThrownBy(() -> ttl.applyTTL(60))
@@ -467,9 +468,51 @@ class CacheTTLControllerTest {
     assertThat(ttl.appliedCycles())
         .as("finally block must run; appliedCycles is an accurate health signal even on failure")
         .isEqualTo(cyclesBefore + 1);
+    // Velox-parity reset: marked flag cleared, openTime preserved so the next cycle re-evaluates
+    // against the ORIGINAL openTime (not refreshed). A regression that dropped reset() would leave
+    // the flag set, and a subsequent recordOpen would refresh the openTime and silently extend the
+    // file's lifetime past the TTL window.
     assertThat(ttl.isMarkedForTesting(7L))
-        .as("tracking entry remains marked so the next cycle replays")
-        .isTrue();
+        .as("reset() must clear the removeInProgress flag on tier-exception failure")
+        .isFalse();
+    assertThat(ttl.oldestOpenTimeSeconds())
+        .as("original openTime preserved across the failed cycle")
+        .hasValue(1_000_000L);
     // ram is null so the @AfterEach close() is skipped.
+  }
+
+  @Test
+  @DisplayName("OpenInfo MUST NOT be a record — structural equals would break cleanUp CAS")
+  void openInfoIsNotARecord() {
+    // Direct regression guard: if a future contributor converts the OpenInfo inner class to a
+    // record (an attractive "modernize value type" refactor flagged by the project's Java
+    // coding-style rule preferring records), structural equals would silently break the
+    // cleanUp() compare-and-remove protocol. Lock it in via reflection so the invariant fails
+    // visibly at test time.
+    Class<?>[] innerClasses = CacheTTLController.class.getDeclaredClasses();
+    Class<?> openInfo = null;
+    for (Class<?> inner : innerClasses) {
+      if (inner.getSimpleName().equals("OpenInfo")) {
+        openInfo = inner;
+        break;
+      }
+    }
+    assertThat(openInfo).as("OpenInfo inner class must exist").isNotNull();
+    assertThat(openInfo.isRecord())
+        .as("OpenInfo MUST NOT be a record; identity equals is load-bearing for cleanUp CAS")
+        .isFalse();
+  }
+
+  @Test
+  @DisplayName("applyTTL rejects ttlSeconds larger than current epoch — would underflow the cutoff")
+  void rejectsTtlLargerThanEpoch() {
+    FakeClock clock = new FakeClock(1_000_000L);
+    ram = new AsyncDataCache(AsyncDataCache.Options.defaults());
+    CacheTTLController ttl = new CacheTTLController(ram, null, clock);
+
+    assertThatThrownBy(() -> ttl.applyTTL(Long.MAX_VALUE))
+        .as("Long.MAX_VALUE would underflow cutoff; must throw not silently drop everything")
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("underflows");
   }
 }

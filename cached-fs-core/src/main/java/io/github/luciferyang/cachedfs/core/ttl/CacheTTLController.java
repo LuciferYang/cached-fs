@@ -19,6 +19,7 @@ import io.github.luciferyang.cachedfs.core.AsyncDataCache;
 import io.github.luciferyang.cachedfs.core.ssd.SsdCache;
 import java.time.Clock;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
 import java.util.OptionalLong;
@@ -103,6 +104,7 @@ public final class CacheTTLController {
    * @param ramCache RAM tier to drive (required)
    * @param ssdCache SSD tier to drive (optional — pass {@code null} when SSD is not configured)
    * @param clock time source; {@link Clock#systemUTC()} in production, an injectable fake in tests
+   * @throws NullPointerException if {@code ramCache} or {@code clock} is null
    */
   public CacheTTLController(AsyncDataCache ramCache, SsdCache ssdCache, Clock clock) {
     this.ramCache = Objects.requireNonNull(ramCache, "ramCache");
@@ -118,8 +120,15 @@ public final class CacheTTLController {
    * file tracked for the freshly-loaded cache entries the caller is about to populate. Otherwise,
    * no-op and return {@code false} so the first-observed open-time wins.
    *
+   * @param fileNum the {@link io.github.luciferyang.cachedfs.core.id.StringIdMap} id of the file
+   *     the cache has just been asked to serve. Must be a real id; passing {@code 0} or any value
+   *     from a different id namespace is undefined behavior.
    * @return {@code true} when this call installed or refreshed the tracking entry; {@code false}
    *     when an existing not-in-progress entry was preserved.
+   * @apiNote The return type was widened from {@code void} to {@code boolean} in 0.1 to expose the
+   *     install-vs-preserve signal for observability / metrics. The Hadoop decorator ({@code
+   *     CachedFileSystem.open}) ignores the value today; downstream embedders MAY use it to drive a
+   *     churn-rate metric.
    */
   public boolean recordOpen(long fileNum) {
     long now = clock.instant().getEpochSecond();
@@ -185,30 +194,43 @@ public final class CacheTTLController {
    * </ol>
    *
    * <p>The cycle counter is incremented in a {@code finally} block so {@link #appliedCycles}
-   * remains an accurate health signal even when a tier's {@code removeFileEntries} throws
-   * unexpectedly. On exception, RAM-side drops that already succeeded are kept; tracking entries
-   * stay marked as remove-in-progress so a subsequent recordOpen can recover their fresh state and
-   * the next applyTTL cycle replays the remaining work.
+   * remains an accurate health signal even when a tier's {@code removeFileEntries} throws. On
+   * exception (cycle did NOT reach cleanUp): the snapshot's marked entries are reset by clearing
+   * the {@code removeInProgress} flag while preserving the original open-time — mirroring velox
+   * {@code CacheTTLController::reset()}. This keeps recovery semantics aligned with velox: a
+   * subsequent {@link #recordOpen} on the now-unmarked entry returns {@code false} (preserves the
+   * original open-time) so the next {@code applyTTL} cycle re-evaluates the file against its
+   * original openTime. RAM-side entries already dropped in the failed cycle stay dropped.
    *
    * @param ttlSeconds aging threshold in seconds; files whose first-observed open-time is strictly
    *     older than {@code now - ttlSeconds} are eligible for removal. {@code ttlSeconds = 0} means
-   *     "drop every file opened in any earlier second".
+   *     "drop every file opened in any earlier second". Values larger than the current epoch are
+   *     rejected (the subtraction would underflow and silently drop everything — see {@link
+   *     IllegalArgumentException} below).
    * @return the number of files for which neither tier retained any pin on this cycle. A file that
    *     is pinned in EITHER tier counts as retained and is NOT included in the return value. Files
    *     with no entries in either tier still count as "dropped" — the controller cannot distinguish
-   *     that case from a successful eviction.
-   * @throws IllegalArgumentException if {@code ttlSeconds} is negative.
+   *     that case from a successful eviction. Reliable as a per-cycle metric only when {@code
+   *     applyTTL} is invoked from a single thread; see class-level javadoc for the concurrent-
+   *     caller caveat.
+   * @throws IllegalArgumentException if {@code ttlSeconds} is negative OR larger than the current
+   *     epoch second (the cutoff arithmetic would underflow).
    */
   public int applyTTL(long ttlSeconds) {
     if (ttlSeconds < 0) {
       throw new IllegalArgumentException("ttlSeconds must be >= 0: " + ttlSeconds);
     }
-    long cutoff = clock.instant().getEpochSecond() - ttlSeconds;
+    long now = clock.instant().getEpochSecond();
+    if (ttlSeconds > now) {
+      throw new IllegalArgumentException(
+          "ttlSeconds (" + ttlSeconds + ") exceeds current epoch (" + now + "); cutoff underflows");
+    }
+    long cutoff = now - ttlSeconds;
     // Snapshot AND mark: replace each candidate with a marked OpenInfo so a concurrent recordOpen
     // can CAS-replace with a fresh entry and survive cleanUp. Velox's getAndMarkAgedOutFiles does
     // the same thing under a write lock; ConcurrentHashMap.replace gives us per-key atomicity
-    // without a global lock.
-    Map<Long, OpenInfo> snapshot = new HashMap<>();
+    // without a global lock. Size-hint the snapshot to avoid rehashing on large tracking maps.
+    Map<Long, OpenInfo> snapshot = new HashMap<>(Math.min(openTimes.size(), 1024));
     for (var entry : openTimes.entrySet()) {
       OpenInfo info = entry.getValue();
       // Velox semantic: strict less-than. Already-marked entries (a previous cycle's retried
@@ -226,8 +248,10 @@ public final class CacheTTLController {
         // not-in-progress one — it's no longer aged out, skip.
       }
     }
+    boolean cleanedUp = false;
     try {
       if (snapshot.isEmpty()) {
+        cleanedUp = true;
         return 0;
       }
       Set<Long> filesToRemove = snapshot.keySet();
@@ -239,12 +263,34 @@ public final class CacheTTLController {
         // pin does not imply the SSD copy is in use.
         ssdRetained = ssdCache.removeFileEntries(filesToRemove);
       }
-      java.util.HashSet<Long> stillRetained = new java.util.HashSet<>(ramRetained);
+      HashSet<Long> stillRetained = new HashSet<>(ramRetained);
       stillRetained.addAll(ssdRetained);
       cleanUp(snapshot, stillRetained);
+      cleanedUp = true;
       return filesToRemove.size() - stillRetained.size();
     } finally {
+      if (!cleanedUp) {
+        // Velox-parity reset: clear removeInProgress on every entry the failed cycle marked,
+        // preserving the original open-time. Without this, a recordOpen between the failure and
+        // the next applyTTL cycle would CAS-replace the marked entry with a fresh open-time and
+        // reset the aging clock — diverging from velox's compliance-safe behavior.
+        reset(snapshot);
+      }
       numAppliedCycles.incrementAndGet();
+    }
+  }
+
+  /**
+   * Velox-parity reset: clears the {@code removeInProgress} flag on each marked entry from the
+   * failed cycle's snapshot, preserving the original open-time. CAS-based so a concurrent {@link
+   * #recordOpen} that already replaced the entry is left alone.
+   */
+  private void reset(Map<Long, OpenInfo> snapshot) {
+    for (var entry : snapshot.entrySet()) {
+      OpenInfo marked = entry.getValue();
+      if (marked.removeInProgress) {
+        openTimes.replace(entry.getKey(), marked, new OpenInfo(marked.openTimeSeconds, false));
+      }
     }
   }
 
@@ -259,7 +305,11 @@ public final class CacheTTLController {
    *
    * <p>Reads {@code openTimes} without a lock; ConcurrentHashMap weak-consistency means a fully
    * concurrent {@link #applyTTL} that empties the map mid-iteration produces {@code empty}, never
-   * {@code Long.MAX_VALUE}. O(n) in the tracking map size.
+   * {@code Long.MAX_VALUE}. Marked (in-progress-of-removal) entries are included in the search
+   * because they still have a well-defined original open-time. O(n) in the tracking map size.
+   *
+   * @return the oldest tracked open-time in epoch seconds, or {@link OptionalLong#empty()} if the
+   *     tracking map is empty (or was emptied during iteration).
    */
   public OptionalLong oldestOpenTimeSeconds() {
     long oldest = Long.MAX_VALUE;
