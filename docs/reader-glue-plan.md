@@ -1,6 +1,6 @@
 # Reader Glue Port Plan — velox §5
 
-> **Status:** draft v6, 2026-05-25 (HEAD = d3a2abc). Plan-only; no code changes yet. Round-5 review surfaced three criticals: (1) `submit()` wraps the Runnable in a `FutureTask`, defeating the `r instanceof PrefetchTask` downcast in the rejection handler — v6 switches to `executor.execute(prefetchTask)`. (2) `TrackingId.of(node, …)` validates `node < 2^26` and throws — v6 masks via `& ((1<<26)-1)`. (3) `PENDING_VH` was declared `private` but referenced from sibling classes — v6 makes it package-private and uses a co-located helper `void clearPendingPrefetchIf(future)` on `CachingInputStream`. Also: PrefetchTask finally re-ordered (complete-future first, decrement after) to avoid stranding the consumer if decrement throws; explicit no-arg constructors on `IoStatistics(false)` / `ScanTracker(scanId, loadQuantum, false)` so existing call sites keep working; backoff after queue-full rejection to prevent hot resubmit loops; inner-tracker TrackingData entry cap added to open follow-ups.
+> **Status:** draft v7, 2026-05-25 (HEAD = f4554f3). Plan-only; no code changes yet. Round-6 review fixes: PrefetchTask `finally` body actually reordered to complete-future-first (banner v6 promised it but the code still cleared first); `lastRejectionNanos` field now explicitly declared on `CachingInputStream`; rejection-handler synchronous-on-submit-thread JDK contract documented as a load-bearing invariant; Caffeine reference dropped from the inner-tracker eviction follow-up (Caffeine is not in the cached-fs tree — recommends `LinkedHashMap.removeEldestEntry` or a hand-rolled LRU); ScanTracker 3-arg constructor visibility (`private`) restated next to `DISABLED`; aggregate-collision impact at large file counts elevated from follow-up to in-scope (streamKind shrink 5→2 happens in Phase 5a-prework rather than as a follow-up).
 
 ## Goal
 
@@ -56,16 +56,18 @@ Port velox's `CachedBufferedInput` + `ScanTracker` reader-side wiring (velox-fil
 3. **Prefetch executor scope.** Single shared executor on `CacheBootstrap`. **Rejection policy: `DiscardPolicy` + an explicit `IoStatistics.incPrefetchSkipped(reason)` counter.** Phase 5c originally proposed `CallerRunsPolicy`, but that would run the prefetch task synchronously on the consumer thread under saturation — strictly worse than no prefetch. Discard-and-count lets the consumer's normal per-chunk path proceed and surfaces saturation via metrics.
 4. **IoStatistics exposure.** `CachingInputStream implements IOStatisticsSource`. Bridge via `IoStatisticsAdapter` using the verified name table above.
 5. **First-stripe prefetch gate.** Phase 5c admission gates on **`readPct() >= prefetchPctThreshold`**, not `adjustedReadPct()`. Rationale: `adjustedReadPct` returns 0 on the first reference batch (denominator collapses), which would dead-zone `readFully(0, fullFile)` consumers. `readPct` is cumulative-since-scan-start, so it never returns 0 once any byte is read; the trade-off is that a stream which transitions from sequential to random after warm-up keeps showing high `readPct`. Mitigations: (a) the per-(scanId, fileNumHash) tracker key (see §Decisions §6) limits this contamination to one file, (b) per-chunk consumer cost is cheap (one cache miss) when the speculation turns out wrong, (c) the new acceptance test `staleDensityAfterSeekAwayDoesNotExplodePrefetch` (in §5c) caps the wasted prefetch ratio at `<= 1.5×` the sequential baseline. Long-term, an EWMA-windowed `readPct` over the last K reference batches is on the open-follow-ups list.
-6. **TrackingId scoping.** Phase 5a wires `TrackingId.of(fileNumNode, 0)` where:
+6. **TrackingId scoping.** Phase 5a-prework shrinks `TrackingId`'s streamKind from 5 bits to 2 bits (only one streamKind value is used at the Hadoop layer), gaining 3 bits → **29-bit node space** (~536M buckets). This is the v7 change relative to v6's documented 26-bit node. Plan wires `TrackingId.of(fileNumNode, 0)` where:
    ```java
    long h = fileNum ^ (fileNum >>> 32);
-   int fileNumNode = (int)(h & ((1L << 26) - 1));   // mask to 26 bits to satisfy TrackingId.of's range check
+   int fileNumNode = (int)(h & ((1L << 29) - 1));   // mask to 29 bits to satisfy TrackingId.of's range check
    ```
-   `TrackingId.of(int node, int streamKind)` validates `0 <= node < (1 << 26)` (`TrackingId.java`) — passing the raw 32-bit fold without masking throws `IllegalArgumentException`. The mask is mandatory.
+   `TrackingId.of(int node, int streamKind)` after the bit-width change validates `0 <= node < (1 << 29)` — the mask is mandatory.
 
-   The packed id has **26-bit node** + 5-bit streamKind + 1 sign bit reserved. With 2^26 (~67M) buckets, ~9.5k distinct file IDs hit a 1% birthday-paradox collision rate. **For Spark partitioned-table scans that routinely produce 50k–500k files**, the collision rate rises to ~10–30%; documented as a known scaling limit. Long-term mitigation in open follow-ups: shrink the streamKind nibble from 5→2 bits (only one streamKind value is used at the Hadoop layer), gaining 8× collision headroom.
+   With 2^29 (~536M) buckets, the 1% birthday-paradox threshold is at ~75k distinct files — well above typical Spark scans (median 10k–50k files). At 500k files (extreme partitioned-table scan) the collision rate is ~4%; on collision, two files share a `TrackingData` entry, mixing density signals (acceptable; same effect as v4's all-files-share-TrackingId.of(0,0), but localized to a few thousand pairs rather than the entire scan).
 
-   On collision, two files share a TrackingData entry — same density-mixing as v4's "all files share TrackingId.of(0,0)", but limited to the colliding pair rather than all files.
+   **Aggregate impact at large scale.** At 100k files with 4% collision, ~2k pairs share entries → ~4k files (4%) see mixed-density prefetch signals. The `staleDensityAfterSeekAwayDoesNotExplodePrefetch` acceptance test caps wasted prefetch at 1.5× the random baseline; this collision-induced mixing is bounded by the same test (a colliding-pair density is effectively a "mixed" stream and behaves similarly under the gate).
+
+   **Backward compatibility note.** Bit-width change to `TrackingId` is binary-incompatible if any future code persists `TrackingId.id` (e.g., to an SSD scoring snapshot). Today no such persistence exists; document the requirement: any future serialized state including `TrackingId` must carry a version byte to allow re-interpretation.
 
 ## Phase 5a — ScanTracker + IoStatistics wiring (small, foundation)
 
@@ -80,7 +82,13 @@ Refactor `ScanTracker` storage:
 - `recordReference(id, bytes)`: if `id.isEmpty()` return; else `refFor(id).updateAndGet(prev -> new TrackingData(prev.referencedBytes() + bytes, bytes, prev.readBytes()))`.
 - `recordRead(id, bytes)`: analogous, only `readBytes` changes.
 - `data(id)`: `var ref = data.get(id); return ref == null ? TrackingData.EMPTY : ref.get();` — single volatile read, coherent across all three fields.
-- **Off-switch primitive.** Add a `static final ScanTracker DISABLED = new ScanTracker("__disabled__", 0, true)` where the constructor's `boolean disabled` flag short-circuits `recordReference`/`recordRead` to no-ops. (`ScanTracker` remains `final`.)
+- **Off-switch primitive.** Add a `static final ScanTracker DISABLED = new ScanTracker("__disabled__", 0, true)` where the constructor's `boolean disabled` flag short-circuits `recordReference`/`recordRead` to no-ops. ScanTracker stays `final`. New constructors:
+  ```java
+  public ScanTracker(String scanId, int loadQuantum) { this(scanId, loadQuantum, /*disabled=*/false); }
+  private ScanTracker(String scanId, int loadQuantum, boolean disabled) { ... }
+  ```
+  Existing call sites at `ScanTrackerTest:29/39/49/63/88` keep working unchanged.
+- **TrackingId bit-width change** (v7). Shrink streamKind from 5 to 2 bits in the packed representation; expand node range from 26-bit to 29-bit. `TrackingId.of(int node, int streamKind)` validation tightens to `streamKind < 4` and `node < (1<<29)`. Existing call sites all use `streamKind == 0`, so the change is non-breaking for the cached-fs tree. Adds a 1-line ScanTracker pre-work acceptance test asserting `TrackingId.of((1<<29)-1, 0).id() == ((1<<29)-1) << 2`. Also adds `ScanTracker.size()` gauge for the open-follow-up trigger documented below.
 
 Allocation overhead: at ~100k reads/sec → 200k 40-byte `TrackingData` allocations/sec → ~8 MB/s, comfortably within young-gen tolerance. Under CAS-retry contention this can double; document in the prework's microbenchmark.
 
@@ -177,7 +185,15 @@ Today `CachedFileSystem.openHandleForKey` creates `new HadoopReadFile(fs, p, key
 - New `@FunctionalInterface ReadFileFactory` in `cached-fs-core`: `ReadFile create(FileSystem fs, Path p, String key, long size)`.
 - `CacheBootstrap` adds `private volatile ReadFileFactory readFileFactory = HadoopReadFile::new` and `ReadFileFactory readFileFactory()` accessor.
 - `CachedFileSystem.openHandleForKey` (line 346) changes from `new HadoopReadFile(fs, p, key, size)` to `b.readFileFactory().create(fs, p, key, size)`. The `b` reference is already in scope at line 348-351 where `b.stringIds()` is called for `StringIdMap`; no extra lookup needed.
-- Test-only mutator: `CacheBootstrap.setReadFileFactoryForTesting(ReadFileFactory factory)` — **package-private** (the codebase has no `@VisibleForTesting` annotation; tests in `cached-fs-hadoop/src/test/java/io/github/luciferyang/cachedfs/hadoop` are in the same package as `CacheBootstrap`, so package-private access works). The mutator returns an `AutoCloseable` that restores the previous factory on close, used as `try (var ignored = bootstrap.setReadFileFactoryForTesting(testFactory)) { ... }` so a test crash never leaves the JVM with a stale factory.
+- Test-only mutator: `CacheBootstrap.setReadFileFactoryForTesting(ReadFileFactory factory)` — **package-private** (the codebase has no `@VisibleForTesting` annotation; tests in `cached-fs-hadoop/src/test/java/io/github/luciferyang/cachedfs/hadoop` are in the same package as `CacheBootstrap`, so package-private access works). Canonical implementation:
+  ```java
+  AutoCloseable setReadFileFactoryForTesting(ReadFileFactory factory) {
+    ReadFileFactory prior = this.readFileFactory;
+    this.readFileFactory = factory;
+    return () -> this.readFileFactory = prior;
+  }
+  ```
+  Used as `try (var ignored = bootstrap.setReadFileFactoryForTesting(testFactory)) { ... }` so a test crash inside the try-block restores the prior factory via try-with-resources. The contract requires single-threaded test execution against any one `CacheBootstrap` instance (Surefire's default fork-per-class behavior already enforces this).
 - `CountingReadFile` lives in `cached-fs-hadoop/src/test/`, implements `ReadFile`, delegates everything, increments an `AtomicLong preadvCalls` on `preadv`.
 
 ### Acceptance tests
@@ -220,6 +236,8 @@ Acceptance for 5c.0:
    **`PrefetchTask` is a named class** (NOT a lambda) so the rejection handler can downcast and recover state. Fields: `(CachingInputStream owner, IoStatistics ioStats, AsyncDataCache cache, long chunkSize, RawFileCacheKey nextKey, long nextOffset, CompletableFuture<RawFileCacheKey> future)`. `PrefetchTask.run()` is the body shown in step 4 below. PrefetchTask owns the future; on every exit path (success, exception, discard) the future is completed exactly once.
 
    **Submission via `execute()`, not `submit()`.** `ExecutorService.submit(Runnable)` wraps the runnable in a `java.util.concurrent.FutureTask` before enqueueing, so the rejection handler sees a `FutureTask` (not our `PrefetchTask`) and the `r instanceof PrefetchTask` downcast fails silently. Phase 5c uses `prefetchExecutor.execute(prefetchTask)` so the raw `PrefetchTask` reaches the handler.
+
+   **Synchronous-on-submit-thread invariant (load-bearing).** Per `ThreadPoolExecutor` JDK contract, `RejectedExecutionHandler.rejectedExecution(...)` is invoked synchronously on the calling thread of `execute()`. Phase 5c relies on this: the handler writes `task.owner.lastRejectionNanos` and calls `task.owner.clearPendingPrefetchIf(...)` on what is also the consumer thread (since submission only happens on the consumer thread per §step 4). Same-thread writer + reader means no cross-thread visibility concerns. A future change that wraps `execute()` in another executor (e.g., a queue aggregator) would invalidate this invariant; document near the field declaration.
 
    **`DiscardAndCountHandler implements RejectedExecutionHandler`**: on `rejectedExecution(Runnable r, ThreadPoolExecutor executor)`:
    - If `r instanceof PrefetchTask task`: increment `task.ioStats.incPrefetchSkipped("queue_full")`; complete the future exceptionally so the consumer doesn't deadlock: `task.future.completeExceptionally(new RejectedExecutionException("prefetch queue full"))`; reset the owner's `pendingPrefetch` slot via the co-located helper `task.owner.clearPendingPrefetchIf(task.future)` — a new package-private method on `CachingInputStream` that does `PENDING_VH.compareAndSet(this, expected, null)` internally. This keeps `PENDING_VH` package-private to `CachingInputStream` (avoids cross-class private access).
@@ -267,14 +285,18 @@ Acceptance for 5c.0:
    } catch (Throwable t) {
      failure = t;
    } finally {
-     // Complete the future FIRST so a throw in the decrement path can't strand
-     // the consumer's await. Reset the owner's CAS slot via the co-located
-     // helper. Decrement last — LongAdder.add does not throw in practice but
-     // ordering matters for defense-in-depth.
-     owner.clearPendingPrefetchIf(future);
+     // Complete the future FIRST so a throw in either subsequent step cannot
+     // strand the consumer's await. CompletableFuture.complete is documented
+     // no-throw. Then clear the CAS slot; finally decrement the counter.
+     // The two later steps wrap each other in try/finally so the decrement
+     // runs even on the (theoretical) clearPendingPrefetchIf throw.
      if (failure != null) future.completeExceptionally(failure);
      else future.complete(nextKey);
-     cache.decrementPendingPrefetch(chunkSize);
+     try {
+       owner.clearPendingPrefetchIf(future);
+     } finally {
+       cache.decrementPendingPrefetch(chunkSize);
+     }
    }
    ```
    Properties:
@@ -374,9 +396,8 @@ A "commit" ≈ one bullet in the Changes list. TTL convergence took 19 commits o
 ## Open follow-ups
 
 - Replace `loadQuantumBytes × threads × 4` admission denominator with a measured value once a workload microbenchmark exists.
-- Cap `bootstrap.scanTrackers` when metrics show `size() > 10_000` in any 24h window (Caffeine-bounded cache).
-- Cap per-`ScanTracker` inner `TrackingData` map when any tracker's `data` map exceeds 10k entries (per-tracker LRU eviction). Especially important for partitioned-table scans where one scanId touches 50k+ files; un-evicted entries accumulate `~40 bytes` each → 100 scans × 10k files = ~40 MB resident; 1k scans × 100k files = ~4 GB. Defer until production metrics confirm the growth pattern.
-- Shrink `TrackingId` streamKind from 5 bits to 2 bits (only one streamKind value is used at the Hadoop layer); reclaim 3 bits for node space, expanding `fileNumNode` to 29 bits and shrinking collision rate at large scale by 8×.
+- Cap `bootstrap.scanTrackers` when metrics show `size() > 10_000` in any 24h window. Caffeine is **not** in the cached-fs dependency tree; use a `LinkedHashMap` wrapped with `synchronizedMap` and `removeEldestEntry` override, or a hand-rolled LRU. Adding Caffeine is a separate decision.
+- Cap per-`ScanTracker` inner `TrackingData` map when any tracker's `data` map exceeds 10k entries. Plan adds a `ScanTracker.size()` gauge in Phase 5a (exposed via `bootstrap.aggregateIoStats` as `cachedfs_scan_tracker_entries`) so operators can detect the condition that triggers this follow-up. Partitioned-table scans touching 50k+ files accumulate `~40 bytes` per entry: 100 scans × 10k files ≈ 40 MB resident; 1k scans × 100k files ≈ 4 GB.
 - `IoStatistics` ring-buffer of recent N streams for debugging.
 - Per-`(scanId, fileNum)` tracker keying once Spark integration produces real workloads.
 
