@@ -276,30 +276,18 @@ public final class SsdCache implements AutoCloseable {
   }
 
   /**
-   * Persists state and closes every shard. Best-effort — collects exceptions as suppressed.
+   * Closes every shard. Best-effort — collects exceptions as suppressed.
    *
-   * <p>Each shard is asked to flush a final checkpoint before its file handle is closed (matches
-   * velox {@code SsdCache::shutdown} which calls {@code file->checkpoint(true)} per shard). A
-   * checkpoint failure on any shard does not abort the close path — the exception is recorded as
-   * primary/suppressed and the remaining shards still get their {@code close()} call. Without this
-   * final flush, entries written since the last auto-checkpoint would be lost on the next startup's
-   * recovery.
+   * <p>Each {@link SsdFile#close()} internally runs a final {@code checkpointLocked()} when
+   * checkpointing is enabled and the shard is {@code ACTIVE} (matches velox {@code
+   * SsdCache::shutdown} for the auto-checkpoint-enabled case). When the user explicitly disables
+   * checkpointing via {@code checkpointIntervalBytes=0}, close() honors that choice and does NOT
+   * force a final checkpoint.
    */
   @Override
   public void close() throws IOException {
     IOException primary = null;
     for (SsdFile s : shards) {
-      // Unconditional final checkpoint: SsdFile.close()'s internal checkpoint only runs when
-      // checkpointEnabled() (i.e. checkpointIntervalBytes > 0). For caches where auto-
-      // checkpointing is disabled (interval=0), this explicit s.checkpoint() is what makes
-      // close() durable. When auto-checkpointing IS enabled the call is mostly redundant but
-      // still cheap (one no-op force() on an empty log).
-      try {
-        s.checkpoint();
-      } catch (IOException ex) {
-        if (primary == null) primary = ex;
-        else primary.addSuppressed(ex);
-      }
       try {
         s.close();
       } catch (IOException ex) {
