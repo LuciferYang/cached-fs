@@ -18,12 +18,15 @@ package io.github.luciferyang.cachedfs.core.ttl;
 import io.github.luciferyang.cachedfs.core.AsyncDataCache;
 import io.github.luciferyang.cachedfs.core.ssd.SsdCache;
 import java.time.Clock;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Objects;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Time-based controller for per-file cache aging. Mirrors velox {@code CacheTTLController}.
@@ -54,9 +57,14 @@ public final class CacheTTLController {
   private final Clock clock;
 
   private final ConcurrentMap<Long, OpenInfo> openTimes = new ConcurrentHashMap<>();
-  private volatile long numAppliedCycles;
+  private final AtomicLong numAppliedCycles = new AtomicLong();
 
-  /** Per-file tracking record. */
+  /**
+   * Per-file tracking record. Instance identity matters: {@link #cleanUp} uses {@link
+   * ConcurrentMap#remove(Object, Object)} to compare-and-remove against the {@code OpenInfo}
+   * captured at the start of the cycle, so a concurrent {@link #recordOpen} that re-inserts a fresh
+   * {@code OpenInfo} during the cycle is preserved (its identity is different).
+   */
   private static final class OpenInfo {
     final long openTimeSeconds;
 
@@ -102,45 +110,62 @@ public final class CacheTTLController {
    * applyTTL} cycle can retry them; non-retained file ids whose entries are now gone are pruned
    * from the map.
    *
-   * @return the number of files that were dropped from at least one tier on this cycle. Files that
-   *     came back fully retained (couldn't be dropped from either tier) are not counted.
+   * <p>The cycle counter is incremented in a {@code finally} block so {@link #appliedCycles}
+   * remains an accurate health signal even when a tier's {@code removeFileEntries} throws
+   * unexpectedly. On exception, RAM-side drops that already succeeded are kept; {@code openTimes}
+   * is left as it was so the next cycle replays the remaining work.
+   *
+   * @param ttlSeconds aging threshold in seconds; files whose first-observed open-time is {@code
+   *     now - ttlSeconds} or older are eligible for removal.
+   * @return the number of files dropped from at least one tier on this cycle. Files that came back
+   *     fully retained (pinned in RAM or SSD) are not counted.
+   * @throws IllegalArgumentException if {@code ttlSeconds} is negative.
    */
   public int applyTTL(long ttlSeconds) {
     if (ttlSeconds < 0) {
       throw new IllegalArgumentException("ttlSeconds must be >= 0: " + ttlSeconds);
     }
     long cutoff = clock.instant().getEpochSecond() - ttlSeconds;
-    Set<Long> filesToRemove = new HashSet<>();
+    // Capture the OpenInfo reference along with the fileNum so cleanUp can compare-and-remove
+    // against the exact snapshot. A concurrent recordOpen that re-inserts a different OpenInfo
+    // during the cycle keeps its tracking entry — see ConcurrentMap.remove(key, value) contract.
+    Map<Long, OpenInfo> snapshot = new HashMap<>();
+    // ConcurrentHashMap.entrySet() is weakly-consistent: no CME, may miss newly-inserted entries
+    // (which are young and not aged-out anyway), may report just-removed entries (whose
+    // removeFileEntries call becomes a no-op). Both are acceptable.
     for (var entry : openTimes.entrySet()) {
-      if (entry.getValue().openTimeSeconds <= cutoff) {
-        filesToRemove.add(entry.getKey());
+      OpenInfo info = entry.getValue();
+      if (info.openTimeSeconds <= cutoff) {
+        snapshot.put(entry.getKey(), info);
       }
     }
-    if (filesToRemove.isEmpty()) {
-      numAppliedCycles++;
-      return 0;
-    }
-    // RAM tier first — matches velox AsyncDataCache.cpp:1107-1126 order.
-    Set<Long> ramRetained = ramCache.removeFileEntries(filesToRemove);
-    // SSD tier next — only for files that RAM was willing to drop (no point removing SSD-side if
-    // the RAM-side handle is still being read). velox: cache_.removeFileEntries() fans out RAM
-    // then SSD internally; here the two tiers are separately owned so we sequence ourselves.
-    Set<Long> ssdRetained = Set.of();
-    if (ssdCache != null) {
-      Set<Long> ssdTargets = new HashSet<>(filesToRemove);
-      ssdTargets.removeAll(ramRetained);
-      if (!ssdTargets.isEmpty()) {
-        ssdRetained = ssdCache.removeFileEntries(ssdTargets);
+    try {
+      if (snapshot.isEmpty()) {
+        return 0;
       }
+      Set<Long> filesToRemove = snapshot.keySet();
+      // RAM tier first — matches velox AsyncDataCache.cpp:1107-1126 order.
+      Set<Long> ramRetained = ramCache.removeFileEntries(filesToRemove);
+      // SSD tier next, but only for files that RAM was willing to drop (no point removing SSD-side
+      // if the RAM-side handle is still being read — velox semantics).
+      Set<Long> ssdRetained = Set.of();
+      if (ssdCache != null) {
+        Set<Long> ssdTargets = new HashSet<>(filesToRemove);
+        ssdTargets.removeAll(ramRetained);
+        if (!ssdTargets.isEmpty()) {
+          ssdRetained = ssdCache.removeFileEntries(ssdTargets);
+        }
+      }
+      // Either tier retaining a file keeps it tracked, so the NEXT cycle can retry the side whose
+      // entries are still pinned. Dropping an SSD-only-retained file from openTimes would orphan
+      // its SSD entries (the next cycle wouldn't see the file in openTimes and would skip SSD).
+      Set<Long> stillRetained = new HashSet<>(ramRetained);
+      stillRetained.addAll(ssdRetained);
+      cleanUp(snapshot, stillRetained);
+      return filesToRemove.size() - stillRetained.size();
+    } finally {
+      numAppliedCycles.incrementAndGet();
     }
-    // A file is fully retained only if RAM kept it pinned; once it cleared RAM, we'd already have
-    // dropped it from the controller's map even if SSD kept it (SSD pins are short-lived and the
-    // file won't be re-tracked unless another open() arrives).
-    Set<Long> stillRetained = new HashSet<>(ramRetained);
-    stillRetained.addAll(ssdRetained);
-    cleanUp(filesToRemove, stillRetained);
-    numAppliedCycles++;
-    return filesToRemove.size() - stillRetained.size();
   }
 
   /** Returns the number of files currently tracked. Visible for tests and operational tooling. */
@@ -151,32 +176,37 @@ public final class CacheTTLController {
   /**
    * Returns the open-time of the oldest tracked file (epoch seconds), or empty if no files are
    * tracked. Useful as an observability signal for "how far behind is the TTL cycle running?".
+   *
+   * <p>Reads {@code openTimes} without a lock; ConcurrentHashMap weak-consistency means a fully
+   * concurrent {@code applyTTL} that empties the map mid-iteration produces {@code empty}, never
+   * {@code Long.MAX_VALUE}. O(n) in the tracking map size.
    */
   public OptionalLong oldestOpenTimeSeconds() {
     long oldest = Long.MAX_VALUE;
-    boolean any = false;
     for (OpenInfo info : openTimes.values()) {
       if (info.openTimeSeconds < oldest) {
         oldest = info.openTimeSeconds;
       }
-      any = true;
     }
-    return any ? OptionalLong.of(oldest) : OptionalLong.empty();
+    return oldest == Long.MAX_VALUE ? OptionalLong.empty() : OptionalLong.of(oldest);
   }
 
   /** Number of completed {@link #applyTTL} cycles. Visible for tests. */
   public long appliedCycles() {
-    return numAppliedCycles;
+    return numAppliedCycles.get();
   }
 
   /**
-   * Prunes the tracking map: any file in {@code attempted} that does NOT appear in {@code
-   * stillRetained} is removed. Retained files stay so the next cycle can retry them.
+   * Prunes the tracking map: for each file in {@code attempted} whose recorded {@link OpenInfo}
+   * snapshot has NOT been replaced and that does not appear in {@code stillRetained}, remove the
+   * entry. {@link ConcurrentMap#remove(Object, Object)} compares by value identity so a concurrent
+   * {@link #recordOpen} that re-inserted a fresh {@code OpenInfo} during the cycle is preserved.
    */
-  private void cleanUp(Set<Long> attempted, Set<Long> stillRetained) {
-    for (Long fn : attempted) {
+  private void cleanUp(Map<Long, OpenInfo> attempted, Set<Long> stillRetained) {
+    for (var entry : attempted.entrySet()) {
+      Long fn = entry.getKey();
       if (!stillRetained.contains(fn)) {
-        openTimes.remove(fn);
+        openTimes.remove(fn, entry.getValue());
       }
     }
   }
