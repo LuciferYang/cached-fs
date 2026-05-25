@@ -23,6 +23,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Multi-shard SSD tier. Mirrors velox {@code SsdCache}.
@@ -35,6 +37,8 @@ import java.util.Set;
  * serialize within a shard; cross-shard operations have no global ordering.
  */
 public final class SsdCache implements AutoCloseable {
+
+  private static final Logger LOG = LoggerFactory.getLogger(SsdCache.class);
 
   /**
    * SsdCache configuration.
@@ -195,14 +199,26 @@ public final class SsdCache implements AutoCloseable {
     return shards[i];
   }
 
-  /** Removes all entries belonging to {@code filesToRemove} from every shard. */
+  /**
+   * Removes all entries belonging to {@code filesToRemove} from every shard. Per-shard exceptions
+   * are caught and the target set is added to the retained result so the caller retries those files
+   * next cycle; remaining shards continue. Matches {@link
+   * io.github.luciferyang.cachedfs.core.AsyncDataCache#removeFileEntries} and velox's per-shard
+   * fail-soft. Exceptions are logged but otherwise swallowed — operators should monitor logs for
+   * shard-level removal failures.
+   */
   public Set<Long> removeFileEntries(Set<Long> filesToRemove) {
     Objects.requireNonNull(filesToRemove, "filesToRemove");
-    // Defensive copy at the public boundary — shards iterate this set under their own lock.
     Set<Long> targets = Set.copyOf(filesToRemove);
     Set<Long> retained = new HashSet<>();
-    for (SsdFile s : shards) {
-      retained.addAll(s.removeFileEntries(targets));
+    for (int i = 0; i < shards.length; i++) {
+      SsdFile s = shards[i];
+      try {
+        retained.addAll(s.removeFileEntries(targets));
+      } catch (RuntimeException ex) {
+        LOG.warn("SSD shard {} removeFileEntries failed; reporting all targets as retained", i, ex);
+        retained.addAll(targets);
+      }
     }
     return Set.copyOf(retained);
   }

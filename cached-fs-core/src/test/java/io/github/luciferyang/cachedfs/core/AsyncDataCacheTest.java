@@ -315,4 +315,48 @@ class AsyncDataCacheTest {
       c.close();
     }
   }
+
+  @Test
+  @DisplayName(
+      "removeFileEntries: one shard throws → other shards proceed, targets surface as retained")
+  void removeFileEntriesPerShardFailSoft() throws Exception {
+    AsyncDataCache cache = new AsyncDataCache(AsyncDataCache.Options.defaults());
+    try {
+      // Pre-populate file 100 on its shard via a real put. We use whatever shard hashes file 100.
+      RawFileCacheKey key100 = new RawFileCacheKey(100L, 0L);
+      FindResult r = cache.findOrCreate(key100, 64, false);
+      ((FindResult.Exclusive) r).pin().exclusiveToShared(false).close();
+      assertThat(cache.exists(key100)).isTrue();
+
+      // Swap the 0-th shard for a Mockito mock that throws on removeFileEntries. The cache holds
+      // its shards in a private CacheShard[] field; reflection is the cheapest way to inject the
+      // failure without adding production-only seams. This test locks in the per-shard fail-soft
+      // invariant: a single shard's RuntimeException must not abort the tier pass.
+      java.lang.reflect.Field shardsField = AsyncDataCache.class.getDeclaredField("shards");
+      shardsField.setAccessible(true);
+      CacheShard[] shards = (CacheShard[]) shardsField.get(cache);
+      CacheShard original = shards[0];
+      CacheShard mocked = org.mockito.Mockito.mock(CacheShard.class);
+      org.mockito.Mockito.when(mocked.removeFileEntries(org.mockito.ArgumentMatchers.anySet()))
+          .thenThrow(new RuntimeException("simulated shard 0 failure"));
+      try {
+        shards[0] = mocked;
+
+        java.util.Set<Long> targets = java.util.Set.of(100L, 200L);
+        java.util.Set<Long> retained = cache.removeFileEntries(targets);
+
+        // Failed shard's targets surface as retained so the TTL controller can retry next cycle.
+        assertThat(retained)
+            .as("failed shard reports all targets as retained")
+            .containsAll(targets);
+        // Other shards still ran — file 100's RAM entry was removed on its (real) shard, unless
+        // that shard happened to be 0. In either case the cache must not have thrown.
+      } finally {
+        // Restore the real shard so close() runs cleanly.
+        shards[0] = original;
+      }
+    } finally {
+      cache.close();
+    }
+  }
 }

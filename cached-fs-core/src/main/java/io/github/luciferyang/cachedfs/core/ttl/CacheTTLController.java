@@ -168,6 +168,9 @@ public final class CacheTTLController {
    * because the file is, by the caller's contract, never going to be read again.
    *
    * <p>This is a Java-port extension and has no velox equivalent.
+   *
+   * @param fileNum the {@link io.github.luciferyang.cachedfs.core.id.StringIdMap} id of the file to
+   *     stop tracking; untracked ids are silently ignored.
    */
   public void forget(long fileNum) {
     openTimes.remove(fileNum);
@@ -197,10 +200,13 @@ public final class CacheTTLController {
    * remains an accurate health signal even when a tier's {@code removeFileEntries} throws. On
    * exception (cycle did NOT reach cleanUp): the snapshot's marked entries are reset by clearing
    * the {@code removeInProgress} flag while preserving the original open-time — mirroring velox
-   * {@code CacheTTLController::reset()}. This keeps recovery semantics aligned with velox: a
-   * subsequent {@link #recordOpen} on the now-unmarked entry returns {@code false} (preserves the
-   * original open-time) so the next {@code applyTTL} cycle re-evaluates the file against its
-   * original openTime. RAM-side entries already dropped in the failed cycle stay dropped.
+   * {@code CacheTTLController::reset()}. This is <b>best-effort velox parity</b>: velox holds a
+   * write-lock across mark-and-reset so {@link #recordOpen} cannot interleave; the Java port's
+   * lock-free CAS protocol leaves a residual window from mark through tier-call through reset
+   * during which a racing {@code recordOpen} may CAS-replace the marked entry with a fresh
+   * open-time. Within that window the aging clock can be refreshed. After {@code reset} returns,
+   * subsequent {@link #recordOpen} calls preserve the original open-time as in velox. RAM-side
+   * entries already dropped in the failed cycle stay dropped.
    *
    * @param ttlSeconds aging threshold in seconds; files whose first-observed open-time is strictly
    *     older than {@code now - ttlSeconds} are eligible for removal. {@code ttlSeconds = 0} means

@@ -22,6 +22,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Process-wide RAM cache. Mirrors velox {@code AsyncDataCache} for the RAM tier; the SSD tier ships
@@ -34,6 +36,8 @@ import java.util.concurrent.atomic.AtomicReference;
  * <p><b>Thread safety:</b> all public methods are safe for concurrent calls.
  */
 public final class AsyncDataCache implements AutoCloseable {
+
+  private static final Logger LOG = LoggerFactory.getLogger(AsyncDataCache.class);
 
   /** Velox: {@code kDefaultNumShards = 4}. */
   public static final int DEFAULT_NUM_SHARDS = 4;
@@ -147,13 +151,16 @@ public final class AsyncDataCache implements AutoCloseable {
     Objects.requireNonNull(filesToRemove, "filesToRemove");
     Set<Long> targets = Set.copyOf(filesToRemove);
     Set<Long> retained = new HashSet<>();
-    for (CacheShard s : shards) {
+    for (int i = 0; i < shards.length; i++) {
+      CacheShard s = shards[i];
       try {
         retained.addAll(s.removeFileEntries(targets));
       } catch (RuntimeException ex) {
         // Per-shard fail-soft: the shard failed to clean its entries, so all targets are
         // conservatively reported as retained for THIS shard. The TTL controller's cleanUp will
-        // keep them marked → next cycle retries. Other shards continue.
+        // keep them marked → next cycle retries. Other shards continue. Error (OOM, SOE) is NOT
+        // caught here — those are unrecoverable and propagating is the right call.
+        LOG.warn("RAM shard {} removeFileEntries failed; reporting all targets as retained", i, ex);
         retained.addAll(targets);
       }
     }
