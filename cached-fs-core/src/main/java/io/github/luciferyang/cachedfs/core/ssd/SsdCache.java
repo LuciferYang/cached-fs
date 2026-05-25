@@ -27,14 +27,31 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Multi-shard SSD tier. Mirrors velox {@code SsdCache}.
+ * Multi-shard SSD tier. Mirrors velox {@code SsdCache} with explicit design simplifications for the
+ * Java port's reactive driver model (no executor pool, no async save-back).
  *
- * <p>Each {@link SsdFile} shard owns a single regular file. Routing: {@code files[fileNum %
- * numShards]} — all of one file's pages live in a single SSD shard, which is what makes coalesced
+ * <p>Each {@link SsdFile} shard owns a single regular file. Routing: {@code Math.floorMod(fileNum,
+ * numShards)} — all of one file's pages live in a single SSD shard, which is what makes coalesced
  * reads from one file efficient (velox §4.1).
  *
  * <p><b>Thread safety:</b> all public methods are safe for concurrent calls. Per-shard mutexes
  * serialize within a shard; cross-shard operations have no global ordering.
+ *
+ * <p><b>Velox-parity divergences:</b>
+ *
+ * <ul>
+ *   <li>{@link #removeFileEntries} has no equivalent of velox's {@code startWrite()} cache-level
+ *       write-lock. Velox serializes save-back writes against TTL-driven removal; the Java port
+ *       relies solely on per-shard {@link SsdFile} mutexes. A TTL pass can interleave with a
+ *       save-back batch at the cache level (but not within a single shard).
+ *   <li>{@link #checkpoint()} runs synchronously and has no {@code writesInProgress} precondition.
+ *       Velox's checkpoint requires the caller hold every shard's write-token and schedules
+ *       per-shard work onto an executor as fire-and-forget. The Java caller blocks until every
+ *       shard fsyncs.
+ *   <li>{@link #removeFileEntries} per-shard fail-soft: if a shard throws, its targets surface as
+ *       retained and remaining shards continue. Matches the symmetric behavior on the RAM tier; see
+ *       {@link io.github.luciferyang.cachedfs.core.AsyncDataCache#removeFileEntries}.
+ * </ul>
  */
 public final class SsdCache implements AutoCloseable {
 

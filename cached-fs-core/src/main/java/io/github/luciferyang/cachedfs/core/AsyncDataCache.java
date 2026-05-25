@@ -268,7 +268,7 @@ public final class AsyncDataCache implements AutoCloseable {
         retained.addAll(targets);
       }
     }
-    return retained;
+    return Set.copyOf(retained);
   }
 
   /** Aggregates per-shard counters into a {@link CacheStats} snapshot. */

@@ -69,6 +69,28 @@ import java.util.concurrent.atomic.AtomicLong;
  * without ever invoking {@code applyTTL} will accumulate a tracking-map entry per file for the
  * process lifetime. Production embedders MUST either schedule {@code applyTTL} on a cadence that
  * matches their open() throughput or call {@code forget} at known end-of-life points.
+ *
+ * <p><b>Velox-parity divergences:</b>
+ *
+ * <ul>
+ *   <li>{@link #forget} is a Java-port-only extension; velox has no equivalent. Documented inline.
+ *   <li>{@link #applyTTL} returns the count of fully-dropped files (Java extension over velox's
+ *       {@code void}); reliable as a per-cycle metric only under serial invocation.
+ *   <li>{@link #applyTTL} rejects {@code ttlSeconds > now} with IllegalArgumentException. Velox
+ *       silently retains everything in that overflow case.
+ *   <li>{@code reset()} on tier failure is snapshot-bounded, not whole-map (the lock-free CAS
+ *       cannot atomically snapshot a moving map). Single-thread callers see velox-equivalent
+ *       behavior because applyTTL's snapshot loop picks up every marked entry via the carryover
+ *       branch.
+ *   <li>The {@code applyTTL} cleanUp-vs-reset branch is exception-driven only: a swallowed
+ *       per-shard {@link AsyncDataCache#removeFileEntries} failure does NOT trigger reset (velox
+ *       would, via its success bool). Files whose shards failed surface as retained → next cycle
+ *       retries. Files whose shards succeeded stay dropped.
+ *   <li>{@link #oldestOpenTimeSeconds} returns raw epoch seconds; velox {@code getCacheAgeStats()}
+ *       returns {@code maxAgeSecs = max(0, now - oldest)}. Compute the age at the call site.
+ *   <li>{@link #trackedFileCount}, {@link #appliedCycles}, {@link #markForTesting}, and {@link
+ *       #isMarkedForTesting} are Java-port observability and test-only extensions.
+ * </ul>
  */
 public final class CacheTTLController {
 
