@@ -51,8 +51,10 @@ import org.slf4j.LoggerFactory;
  *   <li>{@link #removeFileEntries} per-shard fail-soft: if a shard throws, its targets surface as
  *       retained and remaining shards continue. Matches the symmetric behavior on the RAM tier; see
  *       {@link io.github.luciferyang.cachedfs.core.AsyncDataCache#removeFileEntries}.
- *   <li>{@link #close} flushes a final checkpoint per shard before closing (velox parity for
- *       durability). Checkpoint failures are recorded as suppressed; close still proceeds.
+ *   <li>{@link #close} delegates to each {@link SsdFile#close()} which internally runs a final
+ *       checkpoint when checkpointing is enabled (matches velox shutdown). When {@code
+ *       checkpointIntervalBytes=0} explicitly disables checkpointing, close() does NOT force a
+ *       final checkpoint — the user opted out of durability for that interval.
  *   <li>No {@code clear()} or {@code waitForWriteToFinish()}. Velox exposes both for test rigs and
  *       Prestissimo worker ops. Java-port embedders that need an SSD-tier reset call {@link #close}
  *       and reconstruct, or open shards directly for surgical operations.
@@ -287,6 +289,11 @@ public final class SsdCache implements AutoCloseable {
   public void close() throws IOException {
     IOException primary = null;
     for (SsdFile s : shards) {
+      // Unconditional final checkpoint: SsdFile.close()'s internal checkpoint only runs when
+      // checkpointEnabled() (i.e. checkpointIntervalBytes > 0). For caches where auto-
+      // checkpointing is disabled (interval=0), this explicit s.checkpoint() is what makes
+      // close() durable. When auto-checkpointing IS enabled the call is mostly redundant but
+      // still cheap (one no-op force() on an empty log).
       try {
         s.checkpoint();
       } catch (IOException ex) {

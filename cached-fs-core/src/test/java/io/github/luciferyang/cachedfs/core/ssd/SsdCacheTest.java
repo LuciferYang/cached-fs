@@ -321,6 +321,43 @@ class SsdCacheTest {
 
   @Test
   @DisplayName(
+      "close() with auto-checkpointing enabled flushes final state — entries recover on reopen")
+  void closeWithAutoCheckpointEnabledRecovers(@TempDir Path dir) throws IOException {
+    StringIdMap ids = new StringIdMap();
+    long fn = ids.makeId("file://durable");
+    RawFileCacheKey key = new RawFileCacheKey(fn, 0L);
+    byte[] payload = new byte[1024];
+    for (int i = 0; i < payload.length; i++) payload[i] = (byte) (i & 0xff);
+
+    // checkpointIntervalBytes = 1 MiB enables checkpointing; SsdFile.close() runs a final
+    // checkpoint via checkpointLocked() (velox parity). Without that internal checkpoint, the
+    // entry written below would not survive close → reopen → recover.
+    var cfg = SsdCache.Config.single(dir, "ssd", 1, 2, 0, 1L << 20, false, false);
+    SsdCache c1 = new SsdCache(cfg, ids);
+    try {
+      c1.shardFor(fn).write(key, ByteBuffer.wrap(payload));
+    } finally {
+      c1.close();
+    }
+
+    StringIdMap ids2 = new StringIdMap();
+    long fn2 = ids2.makeId("file://durable");
+    SsdCache c2 = new SsdCache(cfg, ids2);
+    try {
+      try (SsdPin probe = c2.shardFor(fn2).find(fn2, 0L)) {
+        assertThat(probe.isEmpty())
+            .as("entry recovered from the checkpoint written by SsdFile.close()")
+            .isFalse();
+      }
+    } finally {
+      c2.close();
+      ids2.release(fn2);
+      ids.release(fn);
+    }
+  }
+
+  @Test
+  @DisplayName(
       "removeFileEntries: one SSD shard throws → other shards proceed, targets surface as retained")
   void removeFileEntriesPerShardFailSoft(@TempDir Path dir) throws Exception {
     StringIdMap ids = new StringIdMap();
