@@ -55,6 +55,10 @@ import org.slf4j.LoggerFactory;
  *       wiring — see the {@link #refreshStats()} body for the current set.
  *   <li>{@link #close} is idempotent (see {@link AtomicBoolean} guard); velox's {@code shutdown} is
  *       not.
+ *   <li>{@code numNew} is rolled back when {@link CacheShard#releaseFailedExclusive} unwinds an
+ *       entry whose load failed (initialize() throw or unpromoted exclusive pin close). Velox's
+ *       {@code numNew_} is monotonic and never rolled back; the Java port counts only entries that
+ *       became usable so the stats reflect "successful new entries", not "attempted".
  * </ul>
  */
 public final class AsyncDataCache implements AutoCloseable {

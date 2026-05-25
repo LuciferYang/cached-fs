@@ -114,7 +114,7 @@ public final class SsdCache implements AutoCloseable {
       // placement assumes distinct mounts). Match Path semantics — toAbsolutePath().normalize()
       // catches "/data" vs "/data/" vs "./data" trivially. We do NOT follow symlinks: an operator
       // who symlinks two paths to the same target is intentionally aliasing.
-      java.util.Set<Path> normalized = new java.util.HashSet<>();
+      Set<Path> normalized = new HashSet<>();
       for (Path d : directories) {
         Path n = d.toAbsolutePath().normalize();
         if (!normalized.add(n)) {

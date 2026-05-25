@@ -36,7 +36,8 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * <p>Slot-reuse model (mirrors velox): {@code entries} holds {@code null} for evicted slots, and
  * {@code emptySlots} tracks indices available for reuse. This keeps {@code clockHand} indices
- * stable across removal and makes removal {@code O(1)}.
+ * stable across removal. Slot lookup on removal is O(entries.size()) via {@link
+ * #findSlotIndexLocked} — see that method's javadoc for the perf trade-off.
  *
  * <p><b>Thread safety:</b> all public methods are safe for concurrent calls. Internal methods
  * suffixed with {@code Locked} require the caller to already hold {@link #mutex}.
@@ -169,7 +170,7 @@ public final class CacheShard {
    */
   public java.util.Set<Long> removeFileEntries(java.util.Set<Long> filesToRemove) {
     java.util.Objects.requireNonNull(filesToRemove, "filesToRemove");
-    java.util.Set<Long> retained = new java.util.HashSet<>();
+    java.util.HashSet<Long> retained = new java.util.HashSet<>();
     mutex.lock();
     try {
       var it = entryMap.entrySet().iterator();
@@ -275,10 +276,10 @@ public final class CacheShard {
     mutex.lock();
     try {
       removeEntryLocked(entry);
-      // The placeholder was counted in numNew the moment we reserved the slot; back it out so
-      // the stats reflect successful entries only (velox parity — its numNew is incremented
-      // post-initialize, but we increment under the shard mutex to keep allocation atomic with
-      // the entryMap insert, and balance via this rollback on failure).
+      // Java-port divergence: back out the numNew increment so the stats reflect entries that
+      // actually became usable. Velox's CacheShard::numNew_ is also bumped pre-initialize but
+      // is monotonic (no rollback on failure). The Java port trades velox parity for stats
+      // fidelity here — see the AsyncDataCache class-level divergence list.
       if (numNew > 0) numNew--;
       promise = entry.movePromiseLocked();
     } finally {
@@ -308,7 +309,15 @@ public final class CacheShard {
     }
   }
 
-  /** O(n) but only used during failed-exclusive unwind. Hot-path eviction uses the slot index. */
+  /**
+   * O(n) scan of {@link #entries} to find {@code entry}'s slot. Called from {@link
+   * #releaseFailedExclusive} (rare) and from {@link #removeFileEntries} once per dropped entry (a
+   * TTL hot path). The shard mutex serializes the scan with reads/writes, so the per-call cost is
+   * paid under contention. Acceptable today because per-shard entry counts stay in the low
+   * thousands at typical configurations; if profiling shows it dominating, store the slot index on
+   * {@link CacheEntry} so removal becomes O(1) — see the {@code AsyncDataCache} class-level
+   * divergence list.
+   */
   private int findSlotIndexLocked(CacheEntry entry) {
     for (int i = 0; i < entries.size(); i++) {
       if (entries.get(i) == entry) {
