@@ -242,9 +242,16 @@ public final class AsyncDataCache implements AutoCloseable {
 
   /**
    * Removes all unpinned entries whose {@code fileNum} is in {@code filesToRemove}, fanning out to
-   * every shard. Returns the union of retained file ids — entries still pinned at the moment of the
-   * call. Mirrors velox {@code AsyncDataCache::removeFileEntries}; the TTL controller is the
-   * primary caller.
+   * every RAM shard. Returns the union of retained file ids — entries still pinned at the moment of
+   * the call. The returned set is immutable; the TTL controller is the primary caller.
+   *
+   * <p><b>RAM-only:</b> unlike velox's {@code AsyncDataCache::removeFileEntries}, this method does
+   * NOT fan out to the SSD tier. The two-tier orchestration lives in {@link
+   * io.github.luciferyang.cachedfs.core.ttl.CacheTTLController#applyTTL}, which calls RAM here and
+   * SSD via {@link
+   * io.github.luciferyang.cachedfs.core.ssd.SsdCache#removeFileEntries(java.util.Set)}. Direct
+   * callers other than the TTL controller MUST invoke the SSD tier themselves if they want two-tier
+   * removal.
    *
    * <p>Per-shard exceptions are caught and the target set is added to the retained result so the
    * caller retries those files next cycle. The remaining shards continue. Matches velox's per-shard

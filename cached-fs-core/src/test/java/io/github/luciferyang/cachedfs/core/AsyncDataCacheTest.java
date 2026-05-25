@@ -349,23 +349,28 @@ class AsyncDataCacheTest {
 
   @Test
   @DisplayName(
-      "removeFileEntries: one shard throws → other shards proceed, targets surface as retained")
+      "removeFileEntries: one shard throws → other shards proceed, retained surfaces failed targets")
   void removeFileEntriesPerShardFailSoft() throws Exception {
     AsyncDataCache cache = new AsyncDataCache(AsyncDataCache.Options.defaults());
     try {
-      // Pre-populate file 100 on its shard via a real put. We use whatever shard hashes file 100.
-      RawFileCacheKey key100 = new RawFileCacheKey(100L, 0L);
-      FindResult r = cache.findOrCreate(key100, 64, false);
-      ((FindResult.Exclusive) r).pin().exclusiveToShared(false).close();
-      assertThat(cache.exists(key100)).isTrue();
-
-      // Swap the 0-th shard for a Mockito mock that throws on removeFileEntries. The cache holds
-      // its shards in a private CacheShard[] field; reflection is the cheapest way to inject the
-      // failure without adding production-only seams. This test locks in the per-shard fail-soft
-      // invariant: a single shard's RuntimeException must not abort the tier pass.
+      // Place a pre-populated entry on a NON-zero shard so a regression that early-aborts the
+      // loop on shard 0 (instead of fail-soft + continue) leaves this entry alive and trips the
+      // exists() assertion. Pick the first fileNum > 0 whose shardFor() is not shard 0.
       java.lang.reflect.Field shardsField = AsyncDataCache.class.getDeclaredField("shards");
       shardsField.setAccessible(true);
       CacheShard[] shards = (CacheShard[]) shardsField.get(cache);
+      long victimFileNum = -1L;
+      for (long fn = 1; fn < 1024 && victimFileNum < 0; fn++) {
+        if (cache.shardFor(new RawFileCacheKey(fn, 0L)) != shards[0]) {
+          victimFileNum = fn;
+        }
+      }
+      assertThat(victimFileNum).as("found a fileNum that hashes off shard 0").isPositive();
+      RawFileCacheKey victim = new RawFileCacheKey(victimFileNum, 0L);
+      FindResult r = cache.findOrCreate(victim, 64, false);
+      ((FindResult.Exclusive) r).pin().exclusiveToShared(false).close();
+      assertThat(cache.exists(victim)).isTrue();
+
       CacheShard original = shards[0];
       CacheShard mocked = org.mockito.Mockito.mock(CacheShard.class);
       org.mockito.Mockito.when(mocked.removeFileEntries(org.mockito.ArgumentMatchers.anySet()))
@@ -373,17 +378,25 @@ class AsyncDataCacheTest {
       try {
         shards[0] = mocked;
 
-        java.util.Set<Long> targets = java.util.Set.of(100L, 200L);
+        java.util.Set<Long> targets = java.util.Set.of(victimFileNum, 9999L);
         java.util.Set<Long> retained = cache.removeFileEntries(targets);
 
-        // Failed shard's targets surface as retained so the TTL controller can retry next cycle.
         assertThat(retained)
             .as("failed shard reports all targets as retained")
             .containsAll(targets);
-        // Other shards still ran — file 100's RAM entry was removed on its (real) shard, unless
-        // that shard happened to be 0. In either case the cache must not have thrown.
+        // Returned set is the documented immutable contract — both tiers must agree.
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> retained.add(123L))
+            .as("retained set must be immutable for symmetry with SsdCache")
+            .isInstanceOf(UnsupportedOperationException.class);
+        // Surviving shards actually executed: the non-zero shard's real removeFileEntries
+        // dropped victim's entry. Regression: if catch was changed to early-abort, victim would
+        // still exist.
+        assertThat(cache.exists(victim))
+            .as("non-failing shard must have processed its targets and removed the entry")
+            .isFalse();
+        // Confirm the mock was invoked (catch path actually triggered, not bypassed).
+        org.mockito.Mockito.verify(mocked).removeFileEntries(org.mockito.ArgumentMatchers.anySet());
       } finally {
-        // Restore the real shard so close() runs cleanly.
         shards[0] = original;
       }
     } finally {

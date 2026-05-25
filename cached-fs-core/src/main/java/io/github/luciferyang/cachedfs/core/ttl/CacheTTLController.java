@@ -90,6 +90,15 @@ import java.util.concurrent.atomic.AtomicLong;
  *       returns {@code maxAgeSecs = max(0, now - oldest)}. Compute the age at the call site.
  *   <li>{@link #trackedFileCount}, {@link #appliedCycles}, {@link #markForTesting}, and {@link
  *       #isMarkedForTesting} are Java-port observability and test-only extensions.
+ *   <li>Not a process-wide singleton. Velox exposes {@code CacheTTLController::create()} / {@code
+ *       getInstance()} statics. The Java port has only a public constructor; the Hadoop {@code
+ *       CacheBootstrap} creates and holds one instance per JVM, exposed via {@link
+ *       io.github.luciferyang.cachedfs.hadoop.CacheBootstrap#ttlController()}. Pure-Java embedders
+ *       MUST avoid constructing more than one controller against the same caches — multiple
+ *       controllers would race on the {@code removeInProgress} flag.
+ *   <li>Constructor takes RAM and SSD references separately (vs velox's single {@code
+ *       AsyncDataCache&} that internally fans to SSD). Phase-2 split — see {@link AsyncDataCache#
+ *       removeFileEntries} javadoc.
  * </ul>
  */
 public final class CacheTTLController {

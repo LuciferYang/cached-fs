@@ -51,6 +51,11 @@ import org.slf4j.LoggerFactory;
  *   <li>{@link #removeFileEntries} per-shard fail-soft: if a shard throws, its targets surface as
  *       retained and remaining shards continue. Matches the symmetric behavior on the RAM tier; see
  *       {@link io.github.luciferyang.cachedfs.core.AsyncDataCache#removeFileEntries}.
+ *   <li>{@link #close} flushes a final checkpoint per shard before closing (velox parity for
+ *       durability). Checkpoint failures are recorded as suppressed; close still proceeds.
+ *   <li>No {@code clear()} or {@code waitForWriteToFinish()}. Velox exposes both for test rigs and
+ *       Prestissimo worker ops. Java-port embedders that need an SSD-tier reset call {@link #close}
+ *       and reconstruct, or open shards directly for surgical operations.
  * </ul>
  */
 public final class SsdCache implements AutoCloseable {
@@ -268,11 +273,26 @@ public final class SsdCache implements AutoCloseable {
     if (primary != null) throw primary;
   }
 
-  /** Closes every shard. Best-effort — collects exceptions as suppressed. */
+  /**
+   * Persists state and closes every shard. Best-effort — collects exceptions as suppressed.
+   *
+   * <p>Each shard is asked to flush a final checkpoint before its file handle is closed (matches
+   * velox {@code SsdCache::shutdown} which calls {@code file->checkpoint(true)} per shard). A
+   * checkpoint failure on any shard does not abort the close path — the exception is recorded as
+   * primary/suppressed and the remaining shards still get their {@code close()} call. Without this
+   * final flush, entries written since the last auto-checkpoint would be lost on the next startup's
+   * recovery.
+   */
   @Override
   public void close() throws IOException {
     IOException primary = null;
     for (SsdFile s : shards) {
+      try {
+        s.checkpoint();
+      } catch (IOException ex) {
+        if (primary == null) primary = ex;
+        else primary.addSuppressed(ex);
+      }
       try {
         s.close();
       } catch (IOException ex) {

@@ -346,6 +346,9 @@ class SsdCacheTest {
         assertThat(retained)
             .as("failed SSD shard reports all targets as retained so the TTL controller retries")
             .containsAll(targets);
+        assertThatThrownBy(() -> retained.add(123L))
+            .as("retained set must be immutable")
+            .isInstanceOf(UnsupportedOperationException.class);
         // The mock was actually invoked (not short-circuited by the catch).
         org.mockito.Mockito.verify(mocked).removeFileEntries(org.mockito.ArgumentMatchers.anySet());
       } finally {
