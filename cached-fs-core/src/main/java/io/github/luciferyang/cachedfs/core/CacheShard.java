@@ -21,9 +21,12 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -168,9 +171,9 @@ public final class CacheShard {
    * exclusive) and could not be removed — the caller (typically the TTL controller) should retry
    * them on the next cycle. Mirrors velox {@code CacheShard::removeFileEntries}.
    */
-  public java.util.Set<Long> removeFileEntries(java.util.Set<Long> filesToRemove) {
-    java.util.Objects.requireNonNull(filesToRemove, "filesToRemove");
-    java.util.Set<Long> retained = new java.util.HashSet<>();
+  public Set<Long> removeFileEntries(Set<Long> filesToRemove) {
+    Objects.requireNonNull(filesToRemove, "filesToRemove");
+    Set<Long> retained = new HashSet<>();
     mutex.lock();
     try {
       var it = entryMap.entrySet().iterator();
