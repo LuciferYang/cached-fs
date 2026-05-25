@@ -275,6 +275,11 @@ public final class CacheShard {
     mutex.lock();
     try {
       removeEntryLocked(entry);
+      // The placeholder was counted in numNew the moment we reserved the slot; back it out so
+      // the stats reflect successful entries only (velox parity — its numNew is incremented
+      // post-initialize, but we increment under the shard mutex to keep allocation atomic with
+      // the entryMap insert, and balance via this rollback on failure).
+      if (numNew > 0) numNew--;
       promise = entry.movePromiseLocked();
     } finally {
       mutex.unlock();

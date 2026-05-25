@@ -348,6 +348,20 @@ class AsyncDataCacheTest {
   }
 
   @Test
+  @DisplayName("findOrCreate that throws inside initialize() rolls back numNew counter")
+  void findOrCreateInitFailureRollsBackNumNew() {
+    try (AsyncDataCache cache = new AsyncDataCache(AsyncDataCache.Options.defaults())) {
+      long numNewBefore = cache.refreshStats().numNew();
+      RawFileCacheKey key = new RawFileCacheKey(82L, 0L);
+      assertThatThrownBy(() -> cache.findOrCreate(key, 0, false))
+          .isInstanceOf(IllegalArgumentException.class);
+      assertThat(cache.refreshStats().numNew())
+          .as("numNew must NOT count failed initialize attempts (stats fidelity)")
+          .isEqualTo(numNewBefore);
+    }
+  }
+
+  @Test
   @DisplayName(
       "removeFileEntries: one shard throws → other shards proceed, retained surfaces failed targets")
   void removeFileEntriesPerShardFailSoft() throws Exception {

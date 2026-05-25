@@ -313,6 +313,16 @@ class SsdCacheTest {
   }
 
   @Test
+  @DisplayName("multi-directory: duplicate directory paths rejected at construction")
+  void multiDirDuplicateRejected(@TempDir Path dirA) {
+    StringIdMap ids = new StringIdMap();
+    assertThatThrownBy(
+            () -> new SsdCache.Config(List.of(dirA, dirA), "ssd", 2, 2, 0, 0L, false, false))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("duplicate directory");
+  }
+
+  @Test
   @DisplayName("multi-directory: null directories list rejected at construction")
   void multiDirNullListRejected() {
     assertThatThrownBy(() -> new SsdCache.Config(null, "ssd", 1, 1, 0, 0L, false, false))

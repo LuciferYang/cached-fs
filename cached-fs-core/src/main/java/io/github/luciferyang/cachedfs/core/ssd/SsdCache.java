@@ -109,6 +109,19 @@ public final class SsdCache implements AutoCloseable {
       if (directories.isEmpty()) {
         throw new IllegalArgumentException("directories must be non-empty");
       }
+      // Reject duplicate directory paths up-front. Duplicates would place multiple shards on the
+      // same mount, silently violating the operator's capacity-planning intent (round-robin
+      // placement assumes distinct mounts). Match Path semantics — toAbsolutePath().normalize()
+      // catches "/data" vs "/data/" vs "./data" trivially. We do NOT follow symlinks: an operator
+      // who symlinks two paths to the same target is intentionally aliasing.
+      java.util.Set<Path> normalized = new java.util.HashSet<>();
+      for (Path d : directories) {
+        Path n = d.toAbsolutePath().normalize();
+        if (!normalized.add(n)) {
+          throw new IllegalArgumentException(
+              "duplicate directory in SsdCache.Config: " + d + " resolves to " + n);
+        }
+      }
       if (numShards <= 0) {
         throw new IllegalArgumentException("numShards must be > 0: " + numShards);
       }
