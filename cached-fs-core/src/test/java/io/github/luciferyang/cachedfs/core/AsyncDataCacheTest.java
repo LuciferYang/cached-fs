@@ -365,6 +365,13 @@ class AsyncDataCacheTest {
   @DisplayName(
       "removeFileEntries: one shard throws → other shards proceed, retained surfaces failed targets")
   void removeFileEntriesPerShardFailSoft() throws Exception {
+    // Mockito's inline mock-maker rewrites final class bytecode via a JVM instrumentation
+    // agent. JDK 25+ restricts redefinition of system interfaces (CacheShard transitively
+    // touches java.lang.Object), so the inline mock-maker can't mock our final CacheShard
+    // there. Behavior is exercised under JDK 21 (the project's release target); skip on 25+.
+    org.junit.jupiter.api.Assumptions.assumeTrue(
+        Runtime.version().feature() < 25,
+        "Mockito inline mock-maker cannot redefine final classes on JDK 25+");
     AsyncDataCache cache = new AsyncDataCache(AsyncDataCache.Options.defaults());
     try {
       // Place a pre-populated entry on a NON-zero shard so a regression that early-aborts the

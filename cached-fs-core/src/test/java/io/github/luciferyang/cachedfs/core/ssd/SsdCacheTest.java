@@ -370,6 +370,10 @@ class SsdCacheTest {
   @DisplayName(
       "removeFileEntries: one SSD shard throws → other shards proceed, targets surface as retained")
   void removeFileEntriesPerShardFailSoft(@TempDir Path dir) throws Exception {
+    // See AsyncDataCacheTest.removeFileEntriesPerShardFailSoft for the JDK 25+ skip rationale.
+    org.junit.jupiter.api.Assumptions.assumeTrue(
+        Runtime.version().feature() < 25,
+        "Mockito inline mock-maker cannot redefine final classes on JDK 25+");
     StringIdMap ids = new StringIdMap();
     var cfg = SsdCache.Config.single(dir, "ssd", 4, 2, 64, 1L << 20, false, false);
     SsdCache cache = new SsdCache(cfg, ids);

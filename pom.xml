@@ -113,6 +113,15 @@
         <version>${mockito.version}</version>
         <scope>test</scope>
       </dependency>
+      <!-- Bytecode-attachment agent for Mockito's inline mock-maker (mocking final classes).
+           Pinned explicitly so JDK 24+ — which removed dynamic agent self-attach — does NOT fail
+           with 'Could not initialize plugin: MockMaker'. Wired into surefire via -javaagent below. -->
+      <dependency>
+        <groupId>net.bytebuddy</groupId>
+        <artifactId>byte-buddy-agent</artifactId>
+        <version>1.15.4</version>
+        <scope>test</scope>
+      </dependency>
       <dependency>
         <groupId>org.openjdk.jcstress</groupId>
         <artifactId>jcstress-core</artifactId>
@@ -156,8 +165,10 @@
           <artifactId>maven-surefire-plugin</artifactId>
           <version>${surefire.version}</version>
           <configuration>
-            <!-- @{argLine} expands JaCoCo's late-bound property so coverage works alongside our flags. -->
-            <argLine>@{argLine} --enable-native-access=ALL-UNNAMED</argLine>
+            <!-- @{argLine} expands JaCoCo's late-bound property so coverage works alongside our flags.
+                 -javaagent attaches byte-buddy-agent so Mockito's inline mock-maker can rewrite
+                 final classes on JDK 24+, which removed dynamic agent self-attach. -->
+            <argLine>@{argLine} -javaagent:${net.bytebuddy:byte-buddy-agent:jar} --enable-native-access=ALL-UNNAMED</argLine>
           </configuration>
         </plugin>
         <plugin>
@@ -165,8 +176,10 @@
           <artifactId>maven-failsafe-plugin</artifactId>
           <version>${surefire.version}</version>
           <configuration>
-            <!-- @{argLine} expands JaCoCo's late-bound property so coverage works alongside our flags. -->
-            <argLine>@{argLine} --enable-native-access=ALL-UNNAMED</argLine>
+            <!-- @{argLine} expands JaCoCo's late-bound property so coverage works alongside our flags.
+                 -javaagent attaches byte-buddy-agent so Mockito's inline mock-maker can rewrite
+                 final classes on JDK 24+, which removed dynamic agent self-attach. -->
+            <argLine>@{argLine} -javaagent:${net.bytebuddy:byte-buddy-agent:jar} --enable-native-access=ALL-UNNAMED</argLine>
           </configuration>
           <executions>
             <execution>
@@ -225,6 +238,22 @@
     </pluginManagement>
 
     <plugins>
+      <!-- Exposes each project dependency's local JAR path as a property like
+           ${net.bytebuddy:byte-buddy-agent:jar} so surefire's argLine can attach
+           byte-buddy-agent as a JVM -javaagent. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>resolve-dependency-properties</id>
+            <phase>initialize</phase>
+            <goals>
+              <goal>properties</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
