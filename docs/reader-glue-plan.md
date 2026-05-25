@@ -1,6 +1,6 @@
 # Reader Glue Port Plan — velox §5
 
-> **Status:** draft v4, 2026-05-25 (HEAD = 7157fea). Plan-only; no code changes yet. Updated after round-3 review. Fixes: nonexistent Hadoop constant, AtomicReference init NPE, HandleOpener.wrap with no call site, first-stripe prefetch gate dead-zone, acceptance test that masked regressions, CallerRunsPolicy synchronous fallback, executor close pin-leak bound, ThreadLocal close-on-different-thread, IoStatistics merge type asymmetry.
+> **Status:** draft v5, 2026-05-25 (HEAD = c513cc5). Plan-only; no code changes yet. Round-4 review surfaced one critical (discarded-submit deadlock on pendingPrefetch future) and several high issues — v5 fixes are in §Phase 5c (Prefetch task is now a named `PrefetchTask` class; DiscardAndCountHandler completes the future and resets the CAS slot; admission-gate overshoot bound stated explicitly; queue default 64), §Phase 5a (NO_OP IoStatistics via a `disabled` flag inside IoStatistics, mirrors ScanTracker.DISABLED; TrackingId now per-file via `TrackingId.of(fileNumHash, 0)`; trackerFor uses bootstrap.loadQuantumBytes), §Phase 5b (commits to ReadFileFactory on CacheBootstrap as the primary test seam — un-finaling CachedFileSystem dropped), §Decisions §5 (gate still on readPct, but acceptance tests add a "stale-density after seek-away" regression case so we measure speculative-prefetch waste).
 
 ## Goal
 
@@ -55,7 +55,8 @@ Port velox's `CachedBufferedInput` + `ScanTracker` reader-side wiring (velox-fil
 2. **Coalesce gap default.** `fs.cached.coalesce.max-gap-bytes = min(512 KiB, loadQuantumBytes / 16)`. Velox baseline 512 KiB (`velox/common/io/Options.h:66`) scaled down when operators tune loadQuantum small.
 3. **Prefetch executor scope.** Single shared executor on `CacheBootstrap`. **Rejection policy: `DiscardPolicy` + an explicit `IoStatistics.incPrefetchSkipped(reason)` counter.** Phase 5c originally proposed `CallerRunsPolicy`, but that would run the prefetch task synchronously on the consumer thread under saturation — strictly worse than no prefetch. Discard-and-count lets the consumer's normal per-chunk path proceed and surfaces saturation via metrics.
 4. **IoStatistics exposure.** `CachingInputStream implements IOStatisticsSource`. Bridge via `IoStatisticsAdapter` using the verified name table above.
-5. **First-stripe prefetch gate (new in v4).** Phase 5c admission gates on **`readPct() >= prefetchPctThreshold`**, not `adjustedReadPct()`. Velox's `adjustedReadPct` is computed against the most-recent-batch-excluded denominator and returns 0 on the first stripe (suppressing prefetch on unproven streams). In the Java port, where `recordReference` fires once per `readFullyFromCache` call (not per chunk), `adjustedReadPct` would stay 0 forever for a single `readFully(0, fullFile)` consumer. Use plain `readPct` so the gate opens after the first reference batch shows non-zero `readBytes`. **Acceptance test "Sequential prefetch >= 0.5 ratio" must specify the consumer access pattern** (default test: many 4 KiB `read()` calls; supplementary test: one `readFully(0, 32 MiB)` to verify the gate still opens after at least one reference event).
+5. **First-stripe prefetch gate.** Phase 5c admission gates on **`readPct() >= prefetchPctThreshold`**, not `adjustedReadPct()`. Rationale: `adjustedReadPct` returns 0 on the first reference batch (denominator collapses), which would dead-zone `readFully(0, fullFile)` consumers. `readPct` is cumulative-since-scan-start, so it never returns 0 once any byte is read; the trade-off is that a stream which transitions from sequential to random after warm-up keeps showing high `readPct`. Mitigations: (a) the per-(scanId, fileNumHash) tracker key (see §Decisions §6) limits this contamination to one file, (b) per-chunk consumer cost is cheap (one cache miss) when the speculation turns out wrong, (c) the new acceptance test `staleDensityAfterSeekAwayDoesNotExplodePrefetch` (in §5c) caps the wasted prefetch ratio at `<= 1.5×` the sequential baseline. Long-term, an EWMA-windowed `readPct` over the last K reference batches is on the open-follow-ups list.
+6. **TrackingId scoping.** Phase 5a wires `TrackingId.of(fileNumHash, 0)` where `fileNumHash = (int)(fileNum ^ (fileNum >>> 32))` (folded to 32 bits because `TrackingId` is a 32-bit packed int). Per-file keying solves the round-3 concern that a single scan reading file A sequentially and file B randomly would mix density. The streamKind nibble is still 0 (file-level virtual stream). With ~2^27 distinct nodes in the packed id space, collisions across `fileNumHash` are possible but require ~16k distinct file IDs in one scan to hit a 1% birthday-paradox collision rate — acceptable; on collision two files share a TrackingData entry, which is the v4 behavior anyway.
 
 ## Phase 5a — ScanTracker + IoStatistics wiring (small, foundation)
 
@@ -84,11 +85,11 @@ Acceptance for prework:
 
 Commits in landing order:
 
-1. **`CacheBootstrap.trackerFor(String scanId)`** — adds `private final ConcurrentMap<String, ScanTracker> scanTrackers`. Normalizes null/empty/whitespace to `"default"`. No callers in this commit.
+1. **`CacheBootstrap.trackerFor(String scanId)`** — adds `private final ConcurrentMap<String, ScanTracker> scanTrackers`. Normalizes null/empty/whitespace to `"default"`. `computeIfAbsent(normalized, k -> new ScanTracker(k, this.loadQuantumBytes))` — uses the bootstrap's `loadQuantumBytes` field (already exposed via `loadQuantumBytes()`; the value is dropped by `ScanTracker` per velox parity but the constructor still requires it). No callers in this commit.
 2. **`CacheBootstrap.currentScanId()` + `withScanId(String)`** — `ThreadLocal<String>` accessor plus `AutoCloseable withScanId(scanId)` that on `close()` calls `threadLocal.remove()`. Javadoc warns: "Single-threaded use only. Do NOT pair with Spark `TaskContext.addTaskCompletionListener` — close may run on a different thread and leak the slot. Use try-with-resources inside the task body."
 3. **`CachedFsConfig.SCAN_ID = "fs.cached.scan-id"`** — README config-reference picks up the key. No behavior change.
 4. **`CachingInputStream` constructor signature change** — gains `ScanTracker tracker`, `TrackingId trackingId`, `IoStatistics ioStats`. Constructor is package-private with a single grep-verified call site (`CachedFileSystem.open()`). The same commit updates the call site so the build stays green.
-5. **`CachedFileSystem.open()` plumbing** — resolves scanId via the Decisions §1 precedence, calls `b.trackerFor(scanId)`, instantiates `IoStatistics ioStats = new IoStatistics()`, passes `(tracker, TrackingId.of(0, 0), ioStats)` to `CachingInputStream`.
+5. **`CachedFileSystem.open()` plumbing** — resolves scanId via the Decisions §1 precedence, calls `b.trackerFor(scanId)`, instantiates `IoStatistics ioStats = metricsEnabled ? new IoStatistics() : IoStatistics.NO_OP`, derives `TrackingId trackingId = TrackingId.of(fileNumHash(handle.fileNum()), 0)` per Decisions §6, passes `(tracker, trackingId, ioStats)` to `CachingInputStream`.
 6. **`CachingInputStream.readFullyFromCache` recording**:
    - Top: `tracker.recordReference(trackingId, length); ioStats.incRead(length);`.
    - Bottom: `tracker.recordRead(trackingId, length);`.
@@ -97,12 +98,18 @@ Commits in landing order:
    **Velox-faithful caveat:** `adjustedReadPct()` returns 0 on the very first reference batch because the denominator collapses. This suppresses prefetch on unproven streams. Decisions §5 picks `readPct()` over `adjustedReadPct()` for the prefetch gate to avoid the dead-zone on `readFully(0, fullFile)` consumers.
 7. **`AggregatedIoStatistics`** new class in cached-fs-core (`stats/AggregatedIoStatistics.java`) — `public final class` with the same counter surface as `IoStatistics` but backed by `LongAdder` per counter. New `add(IoStatistics source)` method snapshots the source via its public byte/count getters (one volatile read per counter) and `LongAdder.add`s into self. Commutative and thread-safe under concurrent callers.
 
-   Spec: `IoStatistics` stays unchanged (final, `AtomicLong` fields). `CacheBootstrap.aggregateIoStats` is of type `AggregatedIoStatistics`. `CachingInputStream.close()` uses an `AtomicBoolean aggregated` guard (set-once, never reset) so double-close is idempotent: `if (aggregated.compareAndSet(false, true)) bootstrap.aggregateIoStats.add(this.ioStats);`.
+   **Snapshot invariant** (added in v5): `add(source)` does NOT snapshot the source atomically across counters — each public getter is a separate `AtomicLong.get()` volatile read. Caller MUST ensure the source is quiescent during `add`. The Phase 5a use case satisfies this: `CachingInputStream.close()` is the only `add` call site, and Hadoop's `FSDataInputStream` contract makes `close` non-thread-safe vs. reads. javadoc on `add` states the invariant.
+
+   Spec: `IoStatistics` stays `final` with `AtomicLong` fields plus a `private final boolean disabled` flag (see Off-switch). `CacheBootstrap.aggregateIoStats` is of type `AggregatedIoStatistics`. `CachingInputStream.close()` uses an `AtomicBoolean aggregated` guard (set-once, never reset) so double-close is idempotent: `if (aggregated.compareAndSet(false, true)) bootstrap.aggregateIoStats.add(this.ioStats);`.
 8. **`IoStatisticsAdapter` + `CachingInputStream implements IOStatisticsSource`** — adapter maps each cached-fs counter to either a real `StreamStatisticNames` constant or a `cachedfs_`-prefixed name per the table above. Adapter is `final class` in cached-fs-hadoop.
 
 ### Off-switch
 
-`fs.cached.scan-tracker.enabled` (default `true`). When false: `trackerFor(...)` returns `ScanTracker.DISABLED`. `IoStatistics` continues to record independently. **Master metrics off-switch:** `fs.cached.metrics.enabled` (default `true`). When false: `CachingInputStream` is constructed with `IoStatistics.NO_OP` (new singleton in `IoStatistics` whose `inc*` methods return without touching state — keeps the public API while skipping the AtomicLong writes). With both flags off, the codepath is functionally identical to today's per-chunk fetch (verified by the off-switch acceptance test).
+`fs.cached.scan-tracker.enabled` (default `true`). When false: `trackerFor(...)` returns `ScanTracker.DISABLED`. `IoStatistics` continues to record independently.
+
+**Master metrics off-switch:** `fs.cached.metrics.enabled` (default `true`). When false: `CachingInputStream` is constructed with `IoStatistics.NO_OP`.
+
+`IoStatistics` stays `final`. The off-switch is implemented via a `private final boolean disabled` field on `IoStatistics`. All `inc*` methods short-circuit at the top when `disabled == true`, mirroring the `ScanTracker.DISABLED` pattern from 5a-prework. Getters still return the underlying `AtomicLong.get()` (always 0 when disabled). `NO_OP` is a `public static final IoStatistics NO_OP = new IoStatistics(/*disabled=*/true);`. With both flags off, all `inc*` calls are one volatile load + early return; `AggregatedIoStatistics.add(NO_OP)` then adds zeros. The codepath is observably equivalent to today's per-chunk fetch (verified by the off-switch acceptance test).
 
 ### Acceptance tests
 
@@ -144,11 +151,15 @@ Cut IO syscalls for sequential reads. When a positional read crosses N missed ch
 
 ### Test plumbing (CountingReadFile seam — concrete)
 
-Today `CachedFileSystem.openHandleForKey` creates `new HadoopReadFile(fs, p, key, size)` directly (verified at the start of the method body around line 346). The seam plumbed in phase 5b:
+Today `CachedFileSystem.openHandleForKey` creates `new HadoopReadFile(fs, p, key, size)` directly at line 346 of `CachedFileSystem.java`. `CachedFileSystem` is `public final` and the codebase's established style preserves that (see multi-scheme opener registry: extensibility via factories on `CacheBootstrap`, not via subclassing).
 
-- **`CachedFileSystem` gains a protected `ReadFile newReadFile(FileSystem fs, Path p, String key, long size)`** method that returns `new HadoopReadFile(...)` by default. Phase 5b's test class extends `CachedFileSystem` (allowed: `CachedFileSystem` is `public final` today — phase 5b removes the `final` modifier as part of the test-seam change, with a justification comment noting the seam intent).
-- Test subclass `WrappingCachedFileSystem` overrides `newReadFile` to return `new CountingReadFile(super.newReadFile(...))`. `CountingReadFile` lives in `cached-fs-hadoop/src/test/`, implements `ReadFile`, delegates everything, increments an `AtomicLong preadvCalls` on `preadv`.
-- **Alternative if removing `final` is unacceptable:** introduce a `ReadFileFactory` in `cached-fs-core` (`@FunctionalInterface` taking `(FileSystem, Path, String, long) -> ReadFile`), stored on `CacheBootstrap`, defaulting to `HadoopReadFile::new`. Test code overrides via a new `CacheBootstrap.setReadFileFactoryForTesting(...)` helper (test-only mutator, package-restricted or annotated). Plan picks this alternative if the `final`-removal raises objections in review. The HandleOpener.wrap default-method from v3 is dropped (had no production call site).
+**Primary seam: `ReadFileFactory` on `CacheBootstrap`.**
+
+- New `@FunctionalInterface ReadFileFactory` in `cached-fs-core`: `ReadFile create(FileSystem fs, Path p, String key, long size)`.
+- `CacheBootstrap` adds `private volatile ReadFileFactory readFileFactory = HadoopReadFile::new` and `ReadFileFactory readFileFactory()` accessor.
+- `CachedFileSystem.openHandleForKey` (line 346) changes from `new HadoopReadFile(fs, p, key, size)` to `b.readFileFactory().create(fs, p, key, size)`. The `b` reference is already in scope at line 348-351 where `b.stringIds()` is called for `StringIdMap`; no extra lookup needed.
+- Test-only mutator: `CacheBootstrap.setReadFileFactoryForTesting(ReadFileFactory factory)` (annotated `@VisibleForTesting` or restricted to the `cached-fs-hadoop` test source-set). Test wraps: `setReadFileFactoryForTesting((fs, p, k, s) -> new CountingReadFile(HadoopReadFile::new))`.
+- `CountingReadFile` lives in `cached-fs-hadoop/src/test/`, implements `ReadFile`, delegates everything, increments an `AtomicLong preadvCalls` on `preadv`.
 
 ### Acceptance tests
 
@@ -185,7 +196,13 @@ Acceptance for 5c.0:
 
 ### Changes
 
-1. **`CacheBootstrap` prefetch executor.** New field `ExecutorService prefetchExecutor`, constructed as `ThreadPoolExecutor(threads, threads, 0L, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(queueSize), daemonFactory, new ThreadPoolExecutor.DiscardPolicy())`. Daemon ThreadFactory names threads `"cached-fs-prefetch-N"` with `daemon=true` and an uncaught-exception handler that logs at WARN. **Rejection policy is `DiscardPolicy`** (per Decisions §3) plus a wrapper that increments `ioStats.incPrefetchSkipped("queue_full")` before discarding. The wrapper is implemented as a `RejectedExecutionHandler` named `DiscardAndCountHandler`.
+1. **`CacheBootstrap` prefetch executor.** New field `ExecutorService prefetchExecutor`, constructed as `ThreadPoolExecutor(threads, threads, 0L, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(queueSize), daemonFactory, new DiscardAndCountHandler())`. Daemon ThreadFactory names threads `"cached-fs-prefetch-N"` with `daemon=true` and an uncaught-exception handler that logs at WARN.
+
+   **`PrefetchTask` is a named class** (NOT a lambda) so the rejection handler can downcast and recover state. Fields: `(CachingInputStream owner, IoStatistics ioStats, AsyncDataCache cache, long chunkSize, RawFileCacheKey nextKey, long nextOffset, CompletableFuture<RawFileCacheKey> future)`. `PrefetchTask.run()` is the body shown in step 4 below. PrefetchTask owns the future; on every exit path (success, exception, discard) the future is completed exactly once.
+
+   **`DiscardAndCountHandler implements RejectedExecutionHandler`**: on `rejectedExecution(Runnable r, ThreadPoolExecutor executor)`:
+   - If `r instanceof PrefetchTask task`: increment `task.ioStats.incPrefetchSkipped("queue_full")`; complete the future exceptionally so the consumer doesn't deadlock: `task.future.completeExceptionally(new RejectedExecutionException("prefetch queue full"))`; CAS the owner's `pendingPrefetch` slot back to null via the same VarHandle: `CachingInputStream.PENDING_VH.compareAndSet(task.owner, task.future, null)`.
+   - The byte budget counter `pendingPrefetchBytes` is NOT touched by the handler — the increment only runs inside `PrefetchTask.run()` (after the rejection branch this code never executes), so no decrement is needed and no leak occurs.
 2. **`CacheBootstrap.close()`** (new method introduced by this phase; `uninstallForTesting()` delegates to it):
    1. `closed.set(true)` (new `AtomicBoolean` field). Subsequent `submit` callers consult this and skip.
    2. **Quiesce in-flight readers.** Phase 5c does NOT add reader-side close-coordination (out of scope — phase 4's `FileHandleFactory` drain already covers per-FS close ordering). Instead, **`close()` is documented as a process-level shutdown step** that the operator triggers only after all FileSystems have closed. If the operator calls `close()` while CachingInputStreams are still open, the result is a best-effort drain plus a bounded leak:
@@ -202,45 +219,57 @@ Acceptance for 5c.0:
    Submission: `if (PENDING_VH.compareAndSet(this, null, future)) submit(...); else future.cancel(false);` — the `else` branch handles the impossible-but-defended case of two concurrent submits.
 4. **Consumer thread, post-chunk-N read**: if `pendingPrefetch == null` AND `position >= chunkNEnd - (loadQuantum * triggerTailFraction)` AND `tracker.data(trackingId).readPct() >= prefetchPctThreshold` AND `admissionGate()`: submit the prefetch task. (Per Decisions §5, gate on `readPct` not `adjustedReadPct` so the first stripe is not deadlocked.)
 
-   **Prefetch task body** (executor thread; sole site that increments/decrements `pendingPrefetchBytes`):
+   **`PrefetchTask.run()` body** (executor thread; sole site that increments/decrements `pendingPrefetchBytes`; sole site that completes the future from the run path):
    ```text
-   cache.incrementPendingPrefetch(chunkSize);     // sole increment
+   cache.incrementPendingPrefetch(chunkSize);     // sole increment in run-path
+   Throwable failure = null;
    try {
      FindResult r = cache.findOrCreate(nextKey, chunkSize, false);
-     if (r instanceof FindResult.Hit hit) { hit.pin().close(); return nextKey; }
-     if (r instanceof FindResult.Waiting w) {
-       // peer is filling; do NOT await on an executor thread — return and let
-       // the consumer's later findOrCreate see Hit or Waiting itself.
-       return nextKey;
+     if (r instanceof FindResult.Hit hit) {
+       hit.pin().close();
+       return;  // future.complete in finally
      }
-     // Exclusive: fill via preadv, then promote to shared and close.
+     if (r instanceof FindResult.Waiting w) {
+       // peer is filling; do NOT await on an executor thread.
+       return;  // future.complete in finally
+     }
      CachePin excPin = ((FindResult.Exclusive) r).pin();
      try {
-       fillExclusive(excPin, nextOffset, chunkSize);   // preadv
+       fillExclusive(excPin, nextOffset, chunkSize);     // preadv
        excPin.exclusiveToShared(true).close();
      } catch (Throwable t) {
-       releaseFailedExclusive(excPin); throw t;
+       releaseFailedExclusive(excPin);
+       throw t;
      }
      ioStats.incPrefetch(chunkSize);
-     return nextKey;
+   } catch (Throwable t) {
+     failure = t;
    } finally {
-     cache.decrementPendingPrefetch(chunkSize);   // sole decrement, in finally
+     cache.decrementPendingPrefetch(chunkSize);
+     // Complete the future exactly once. Reset the owner's CAS slot so a
+     // future read can submit a fresh prefetch.
+     CachingInputStream.PENDING_VH.compareAndSet(owner, future, null);
+     if (failure != null) future.completeExceptionally(failure);
+     else future.complete(nextKey);
    }
    ```
-   This balances increment and decrement on every path including throws and the CallerRunsPolicy-removed branch (we now use DiscardPolicy + counter, so this path doesn't apply).
-
-   **DiscardPolicy + counter on submit-side rejection:** if `submit` is rejected (queue full), the DiscardAndCountHandler increments `incPrefetchSkipped("queue_full")` and returns. The consumer's pre-submit increment of `pendingPrefetchBytes` MUST therefore NOT happen — the wrapper is what runs (it gets the discarded Runnable in `rejectedExecution(...)`). The pre-submit increment moves INSIDE the Runnable, ensuring symmetry with the decrement-in-finally regardless of whether the task runs.
+   Properties:
+   - Counter symmetric across all paths (Hit/Waiting/Exclusive-success/Exclusive-throw): one increment in run-path, one decrement in finally.
+   - Future completed exactly once via finally, regardless of path.
+   - On discard the task never runs → counter never touched; the rejection handler completes the future + resets the CAS slot.
+   - Admission gate's pre-submit check `pendingPrefetchBytes() + chunkSize <= budget` is non-atomic vs. the in-task increment. **Overshoot bound:** up to `(active consumer threads) × chunkSize` over budget under concurrent admission. Acceptable; doesn't leak.
 
 5. **Consumer thread on chunk N+1**: if `pendingPrefetch != null`, `await` the future. Regardless of normal or exceptional completion, fall through to fresh `findOrCreate`. After await, set `pendingPrefetch = null`. `ioStats.incPrefetch(chunkSize)` is set by the TASK only — a discarded or failed task never bumps the counter.
 
    **Eviction-during-handoff acceptance:** new test injects `TTL.applyTTL(0)` between task completion and consumer await. Consumer's fresh `findOrCreate` is a miss → fills cleanly. `IoStatistics.prefetch_evicted_before_use` counter is incremented (new in 5c — added in 5c.0 actually, or in 5c, see below).
 
-6. **Admission gate.** `cache.pendingPrefetchBytes() + chunkSize <= fs.cached.prefetch.max-pending-bytes`. Default `loadQuantumBytes × threads × 4` (factor of 4 is a starting heuristic — see open follow-up; cited as "rounded from a workload microbenchmark TBD"). Optional secondary signal: heap pressure — but **cached per 100 ms** to avoid the per-prefetch `MemoryMXBean` cost (~µs per call):
+6. **Admission gate.** `cache.pendingPrefetchBytes() + chunkSize <= fs.cached.prefetch.max-pending-bytes`. Default `loadQuantumBytes × threads × 4` (factor of 4 is a starting heuristic; see open follow-up for a measurement task). Optional secondary signal: heap pressure — but **cached per 100 ms** on `CacheBootstrap` (single instance per JVM, so one MemoryMXBean call per 100 ms across all streams):
    ```java
+   // Fields on CacheBootstrap (shared by all streams):
    private static final long HEAP_PRESSURE_TTL_NS = 100_000_000L;
    private volatile long heapPressureLastCheckedNs;
    private volatile boolean heapPressureActive;
-   private boolean heapPressureGate() {
+   public boolean isHeapPressureHigh() {
      long now = System.nanoTime();
      if (now - heapPressureLastCheckedNs > HEAP_PRESSURE_TTL_NS) {
        heapPressureLastCheckedNs = now;
@@ -250,6 +279,7 @@ Acceptance for 5c.0:
      return heapPressureActive;
    }
    ```
+   `CachingInputStream` admission gate calls `bootstrap.isHeapPressureHigh()`; under 100 concurrent streams + ≥100 ms TTL, total MemoryMXBean calls ≤ 10/sec regardless of stream count.
    Configurable via `fs.cached.prefetch.heap-pressure-check.enabled` (default `true`) and `fs.cached.prefetch.heap-pressure-ttl-ms` (default 100).
 
 7. **`CachingInputStream.close()`**: set `closed = true`, then `pendingPrefetch.cancel(false)` if non-null. `cancel(false)` does not interrupt running tasks; the task's finally block decrements the counter regardless. The consumer never holds the prefetch task's pin.
@@ -263,7 +293,7 @@ Phase 5c adds two counters to `IoStatistics`: `prefetchSkipped(reason)` and `pre
 
 - `fs.cached.prefetch.enabled` (default `false` — opt-in).
 - `fs.cached.prefetch.threads` (default `Runtime.getRuntime().availableProcessors()`).
-- `fs.cached.prefetch.queue` (default 1024).
+- `fs.cached.prefetch.queue` (default 64; backpressure-sized, not throughput-sized — `DiscardAndCountHandler` is the steady-state safety valve. Reduces worst-case pin-leak window at close from 8.3 GiB to ~640 MiB with default threads/loadQuantum).
 - `fs.cached.prefetch.max-pending-bytes` (default `loadQuantumBytes * threads * 4`; reasoned as "~4 chunks per thread of headroom"; see Open Follow-ups for a measurement task).
 - `fs.cached.prefetch.trigger-tail-fraction` (default `0.25`).
 - `fs.cached.prefetch.read-density-threshold` (default `80` — matches velox `FLAGS_cache_prefetch_min_pct` at `velox/flag_definitions/flags.cpp:118-121`).
@@ -275,6 +305,8 @@ Phase 5c adds two counters to `IoStatistics`: `prefetchSkipped(reason)` and `pre
 
 - **Sequential prefetch with many small reads**: 32 MiB consumed via 8000 × 4 KiB `read()` calls. `prefetch.enabled=true`, `loadQuantum=1 MiB`. Assert `prefetchBytes() / readBytes() >= 0.5`.
 - **Sequential prefetch with one large readFully**: same 32 MiB consumed via one `readFully(0, 32 MiB)`. Assert `prefetchBytes()` shows positive flow after at least one recordReference batch (i.e. prefetch is not permanently dead-zoned).
+- **Stale density after seek-away does not explode prefetch**: read 16 MiB sequentially (warms readPct to ~100), then issue 1000 random 4 KiB reads scattered across a 256 MiB file. Assert `prefetchBytes() / readBytes()` over the random phase `<= 1.5×` the same metric measured on a fresh stream that does only the random phase (i.e., stale density doesn't double the speculation rate). This is the v5 regression guard for the `readPct`-stays-cumulative trade-off.
+- **Discarded submit does not deadlock consumer**: configure `prefetch.queue=1` and saturate it; the next consumer read after a rejected submit must complete within 100 ms (not block on `pendingPrefetch.await()`). Asserts `DiscardAndCountHandler` correctly completes the future + resets the CAS slot.
 - **Random suppression**: 1000 random 4 KiB positional reads, scattered. Assert `prefetchBytes() / readBytes() < 0.05`.
 - **Admission backpressure**: configure `max-pending-bytes` to admit only 2 in-flight. Verify subsequent submits go to `DiscardAndCountHandler` and `prefetchSkipped("queue_full")` counter increases; pending counter never exceeds budget.
 - **Close cancels prefetch**: open stream, trigger prefetch, close stream. Within 1s: `pendingPrefetchBytes() == 0`, `numExclusive == 0`, `PinLeakAssertions.assertNoLeak()`.
