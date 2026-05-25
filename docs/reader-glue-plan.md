@@ -249,14 +249,21 @@ Acceptance for 5c.0:
    3. `prefetchExecutor.shutdown()` (no new submissions accepted by JDK either). `awaitTermination(timeout)` where `timeout = fs.cached.prefetch.shutdown-timeout-seconds` (default 30).
    4. If timeout, `prefetchExecutor.shutdownNow()` AND a second `awaitTermination(10s)`. If STILL not terminated, log at ERROR and proceed. **Upper bound on leaked pins:** prefetch tasks each hold at most one chunk's exclusive pin at a time AND the executor is bounded to `threads` concurrent tasks AND the queue is capped at `queueSize`. The maximum leaked pin bytes is `(threads + queueSize) × loadQuantumBytes`. Document this bound; with default `threads=availableProcessors` (~16) and `queueSize=1024` and `loadQuantum=8 MiB`, peak leak ≈ `1040 × 8 MiB = 8.3 GiB` — large in absolute terms but bounded. Operators with tight budgets should drop `queueSize` (Phase 5c knob).
    5. After executor terminates: `handleFactory.closeAll()`, `ssdCache.close()`, `ramCache.close()`.
-3. **`CachingInputStream` prefetch state.** New `volatile CompletableFuture<RawFileCacheKey> pendingPrefetch`. Documented contract: `read/seek/close` are not thread-safe (matches Hadoop `FSDataInputStream` contract). VarHandle-based `compareAndSet` on `pendingPrefetch` is defense-in-depth:
+3. **`CachingInputStream` prefetch state.** New fields:
+   - `private volatile CompletableFuture<RawFileCacheKey> pendingPrefetch` — the in-flight prefetch handle (key, not pin). VarHandle CAS is used to coordinate submission vs. rejection-handler reset.
+   - `volatile long lastRejectionNanos = Long.MIN_VALUE / 2` — **package-private** so sibling `DiscardAndCountHandler` in the same package can write it. Initialized far in the past so the first prefetch attempt is never back-pressured. Volatile is defense-in-depth: per the JDK invariant in §step 1, both the write (in the handler) and the read (in the admission gate, §step 4) execute on the same consumer thread, but `volatile` removes the assumption that no future refactor will move submission off-thread.
+   - `private volatile boolean closed` — see §step 7 for the close-race interaction.
    ```java
-   private static final VarHandle PENDING_VH =
+   static final VarHandle PENDING_VH =
        MethodHandles.lookup().findVarHandle(CachingInputStream.class,
                                             "pendingPrefetch",
                                             CompletableFuture.class);
    ```
+   `PENDING_VH` is **package-private** (no modifier) so sibling classes `DiscardAndCountHandler` and `PrefetchTask` reach the slot through the co-located helper `void clearPendingPrefetchIf(CompletableFuture<?> expected)` rather than calling `PENDING_VH.compareAndSet(...)` directly across class boundaries. The helper body is `PENDING_VH.compareAndSet(this, expected, null)` — if a peer already replaced the slot (e.g., another `seek()` cycle), the CAS is a no-op and the helper returns silently.
+
    Submission: `if (PENDING_VH.compareAndSet(this, null, future)) submit(...); else future.cancel(false);` — the `else` branch handles the impossible-but-defended case of two concurrent submits.
+
+   Documented contract: `read/seek/close` are not thread-safe (matches Hadoop `FSDataInputStream` contract). VarHandle-based `compareAndSet` on `pendingPrefetch` is defense-in-depth.
 4. **Consumer thread, post-chunk-N read**: if `pendingPrefetch == null` AND `position >= chunkNEnd - (loadQuantum * triggerTailFraction)` AND `tracker.data(trackingId).readPct() >= prefetchPctThreshold` AND `admissionGate()` AND `System.nanoTime() - lastRejectionNanos >= REJECTION_BACKOFF_NS` (per-stream backoff, default 100 ms via `fs.cached.prefetch.rejection-backoff-ms`): submit the prefetch task via `prefetchExecutor.execute(task)`. The backoff prevents a hot resubmit loop under sustained queue saturation: after a rejection the stream waits 100 ms before re-attempting prefetch submission, while the consumer's normal per-chunk path proceeds at its native rate.
 
    **`PrefetchTask.run()` body** (executor thread; sole site that increments/decrements `pendingPrefetchBytes`; sole site that completes the future from the run path):
