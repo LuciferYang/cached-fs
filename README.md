@@ -41,7 +41,8 @@ import io.github.luciferyang.cachedfs.core.ttl.CacheTTLController;
 CacheTTLController ttl = CacheBootstrap.get().orElseThrow().ttlController();
 
 // Drop every cache entry whose owning file was first opened more than 1 hour ago.
-// Returns the count of files dropped from at least one tier on this cycle.
+// Returns the count of files for which neither tier retained any pin — files still
+// pinned in EITHER tier are reported back internally and retried on the next cycle.
 int dropped = ttl.applyTTL(3600);
 ```
 

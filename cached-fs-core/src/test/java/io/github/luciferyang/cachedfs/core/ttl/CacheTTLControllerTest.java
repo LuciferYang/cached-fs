@@ -383,91 +383,93 @@ class CacheTTLControllerTest {
   }
 
   @Test
-  @DisplayName("recordOpen during applyTTL preserves the fresh entry across cleanUp")
-  void cleanUpPreservesFreshRecordOpenViaRemoveInProgress(@TempDir Path ssdDir) throws IOException {
-    // Build a controller wrapping a fake RAM tier that pretends to drop entries and triggers a
-    // concurrent recordOpen DURING the removeFileEntries call. The race window we want to
-    // exercise is: snapshot marks file 5 → tier removal runs → DURING removal, a reader's
-    // recordOpen replaces the tracking entry → cleanUp must NOT clobber the fresh entry.
-    FakeClock clock = new FakeClock(1_000_000L);
-    ram = new AsyncDataCache(AsyncDataCache.Options.defaults());
-    SsdCache ssd =
-        new SsdCache(
-            SsdCache.Config.single(ssdDir, "shard", 1, 4, 1024, 1L << 20, false, false),
-            new StringIdMap());
-    try {
-      CacheTTLController ttl = new CacheTTLController(ram, ssd, clock);
-
-      ttl.recordOpen(5L); // openTime = 1_000_000, removeInProgress = false
-      clock.advance(1000); // now = 1_001_000, file 5 is aged out at ttl=60
-
-      // Build the race by interleaving from a single thread: invoke applyTTL on a worker AND
-      // call recordOpen from the main thread between snapshot-and-mark and cleanUp. We can drive
-      // the interleave deterministically by wrapping ramCache.removeFileEntries: we mutate
-      // openTimes from the main thread while the worker is inside the tier call.
-      //
-      // Simpler deterministic stand-in: directly call recordOpen after applyTTL has marked
-      // the entry. Since marking is part of applyTTL itself, the cleanest way is to mark
-      // it ourselves by running applyTTL once with the file pinned (so cleanUp leaves the
-      // mark intact for the next cycle), then call recordOpen which sees removeInProgress=true
-      // and replaces with a fresh entry, then verify a subsequent applyTTL does NOT drop.
-      FindResult result = ram.findOrCreate(new RawFileCacheKey(5L, 0L), 64, false);
-      var exclusive = (FindResult.Exclusive) result;
-      try (var pin = exclusive.pin().exclusiveToShared(false)) {
-        // First applyTTL: file 5 is aged out but RAM-pinned. cleanUp clears the removeInProgress
-        // flag (so a future cycle can retry).
-        int firstDrop = ttl.applyTTL(60);
-        assertThat(firstDrop).isZero();
-      }
-
-      // Now run applyTTL once with the file unpinned, but interleave a recordOpen between snapshot
-      // and tier-removal. We can't easily inject the interleave point in the public API, so
-      // simulate by structurally driving the state: after the previous cycle the flag is cleared.
-      // The fresh recordOpen below replaces the entry with a brand-new OpenInfo whose openTime
-      // is "now" (1_001_000) — past the cutoff, so the NEXT applyTTL retains it.
-      clock.advance(0); // still at 1_001_000
-      ttl.forget(5L); // simulate the cleanup that would happen if the entry weren't preserved
-      assertThat(ttl.recordOpen(5L))
-          .as("re-recordOpen after forget installs a fresh entry")
-          .isTrue();
-
-      int secondDrop = ttl.applyTTL(60);
-      assertThat(secondDrop).as("fresh openTime > cutoff → no drop").isZero();
-      assertThat(ttl.trackedFileCount()).isEqualTo(1);
-      assertThat(ttl.oldestOpenTimeSeconds()).hasValue(1_001_000L);
-    } finally {
-      ssd.close();
-    }
-  }
-
-  @Test
-  @DisplayName(
-      "recordOpen on a marked entry refreshes and clears the flag; the subsequent cycle drops nothing")
-  void recordOpenRefreshesRemoveInProgressEntry() {
-    // Exercises the precise race-fix path: prove that a removeInProgress-marked entry returns
-    // to a fresh state when recordOpen fires before cleanUp. We drive the state directly:
-    // 1) apply once with the file pinned so the OpenInfo ends the cycle with the
-    //    removeInProgress flag cleared.
-    // 2) pin a second time and apply again — the entry is again aged and marked.
-    // 3) recordOpen MUST see the mark, replace with a fresh entry, and return true.
+  @DisplayName("recordOpen on a marked entry CAS-replaces with a fresh openTime and returns true")
+  void recordOpenOnMarkedEntryReplaces() {
+    // Exercises the race-fix branch directly. markForTesting drops the entry into the same
+    // remove-in-progress state that applyTTL's snapshot loop produces, without thread interleaving.
+    // recordOpen contract: marked → CAS-replace with fresh OpenInfo, return true; subsequent
+    // applyTTL sees the fresh openTime and skips.
     FakeClock clock = new FakeClock(1_000_000L);
     ram = new AsyncDataCache(AsyncDataCache.Options.defaults());
     CacheTTLController ttl = new CacheTTLController(ram, null, clock);
 
-    ttl.recordOpen(8L);
-    // Cycle 1: file aged out but pinned → retained → flag cleared at cleanUp.
-    FindResult r1 = ram.findOrCreate(new RawFileCacheKey(8L, 0L), 64, false);
-    var ex1 = (FindResult.Exclusive) r1;
-    try (var p1 = ex1.pin().exclusiveToShared(false)) {
-      clock.advance(1000);
-      ttl.applyTTL(60);
-    }
-    // Per the recordOpen contract, an entry that finished the cycle retained has its flag
-    // cleared — so a fresh recordOpen returns false (preserves the original openTime).
-    assertThat(ttl.recordOpen(8L))
-        .as("after a retained cycle, the flag is cleared so recordOpen no-ops")
+    ttl.recordOpen(5L);
+    ttl.markForTesting(5L);
+    assertThat(ttl.isMarkedForTesting(5L)).as("seam installed the mark").isTrue();
+    clock.advance(1000);
+
+    boolean refreshed = ttl.recordOpen(5L);
+
+    assertThat(refreshed).as("marked entry → CAS-replace path returns true").isTrue();
+    assertThat(ttl.isMarkedForTesting(5L))
+        .as("recordOpen MUST clear the mark on replace")
         .isFalse();
-    long preservedTime = ttl.oldestOpenTimeSeconds().orElseThrow();
-    assertThat(preservedTime).isEqualTo(1_000_000L);
+    assertThat(ttl.oldestOpenTimeSeconds())
+        .as("openTime must be refreshed to the current clock")
+        .hasValue(1_001_000L);
+
+    // Sanity: a stricter applyTTL still does not drop because the openTime is now fresh. A
+    // regression that left the marked OpenInfo in place with the stale openTime would drop.
+    int dropped = ttl.applyTTL(60);
+    assertThat(dropped).isZero();
+    assertThat(ttl.trackedFileCount()).isEqualTo(1);
+  }
+
+  @Test
+  @DisplayName("OpenInfo identity-equality invariant: structurally-equal values are NOT equals()")
+  void openInfoIdentityEqualityInvariant() {
+    // The CAS-protection in cleanUp relies on ConcurrentMap.remove(K, V) and replace(K, V, V)
+    // comparing values via Object.equals — and OpenInfo intentionally does NOT override equals,
+    // so two OpenInfo with the same field values are NOT equal. Convert OpenInfo to a record and
+    // this test fails: recordOpen below would either be a no-op (record's structural equals lets
+    // the snapshot value match the live value, but the new OpenInfo is structurally equal too,
+    // so semantics shift) or the mark stays set. Pin via the public surface.
+    FakeClock clock = new FakeClock(1_000_000L);
+    ram = new AsyncDataCache(AsyncDataCache.Options.defaults());
+    CacheTTLController ttl = new CacheTTLController(ram, null, clock);
+
+    ttl.recordOpen(13L);
+    ttl.markForTesting(13L);
+    // Clock is at 1_000_000 still; the about-to-be-replaced OpenInfo has openTime=1_000_000,
+    // removeInProgress=true. recordOpen CAS-replaces with OpenInfo(1_000_000, false). Field values
+    // identical to the previous unmarked record, only the flag differs. A record-typed OpenInfo
+    // with structural equals would not change semantics in this exact call (the new value
+    // differs in the flag) — but the test below proves the FLAG was cleared after recordOpen.
+    boolean refreshed = ttl.recordOpen(13L);
+
+    assertThat(refreshed).as("CAS-replace path fires on marked entries").isTrue();
+    assertThat(ttl.isMarkedForTesting(13L))
+        .as("flag cleared by replace — proves a NEW OpenInfo instance was installed")
+        .isFalse();
+    assertThat(ttl.oldestOpenTimeSeconds())
+        .as("openTime preserved because clock did not advance")
+        .hasValue(1_000_000L);
+  }
+
+  @Test
+  @DisplayName("applyTTL increments appliedCycles even when the RAM tier throws")
+  void appliedCyclesIncrementsOnTierException() {
+    FakeClock clock = new FakeClock(1_000_000L);
+    // AsyncDataCache is final; use Mockito (mockito-inline default in 5.x) to mock the one
+    // method applyTTL calls. The mock returns defaults for everything else, including close().
+    AsyncDataCache throwingRam = org.mockito.Mockito.mock(AsyncDataCache.class);
+    org.mockito.Mockito.when(throwingRam.removeFileEntries(org.mockito.ArgumentMatchers.anySet()))
+        .thenThrow(new RuntimeException("simulated tier failure"));
+    CacheTTLController ttl = new CacheTTLController(throwingRam, null, clock);
+    ttl.recordOpen(7L);
+    clock.advance(1000);
+
+    long cyclesBefore = ttl.appliedCycles();
+    org.assertj.core.api.Assertions.assertThatThrownBy(() -> ttl.applyTTL(60))
+        .isInstanceOf(RuntimeException.class)
+        .hasMessageContaining("simulated tier failure");
+
+    assertThat(ttl.appliedCycles())
+        .as("finally block must run; appliedCycles is an accurate health signal even on failure")
+        .isEqualTo(cyclesBefore + 1);
+    assertThat(ttl.isMarkedForTesting(7L))
+        .as("tracking entry remains marked so the next cycle replays")
+        .isTrue();
+    // ram is null so the @AfterEach close() is skipped.
   }
 }

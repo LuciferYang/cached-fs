@@ -54,8 +54,20 @@ import java.util.concurrent.atomic.AtomicLong;
  * the case where the cycle drops a cache entry, a reader re-populates it, and tracking is then
  * cleaned up leaving the fresh entry invisible to subsequent TTL cycles.
  *
- * <p><b>Thread safety:</b> all public methods are safe for concurrent calls. {@link #recordOpen} is
- * a hot-path call (every successful {@code open}); {@link #applyTTL} is intended to be infrequent.
+ * <p><b>Thread safety:</b> all public methods are safe for concurrent calls — the tracking map's
+ * invariants hold under concurrent {@link #recordOpen}, {@link #applyTTL}, and {@link #forget}.
+ * Caveat on the {@code int} return value of {@link #applyTTL}: when two threads call {@code
+ * applyTTL} simultaneously, both may see a carried-over marked entry and both will count its
+ * removal in their own return value — so the return value is meaningful as a per-cycle metric only
+ * when {@code applyTTL} is invoked serially. The shard-level {@code numAgedOut} counter in {@link
+ * AsyncDataCache#refreshStats()} is correctly serialized by per-shard mutexes and is the
+ * authoritative aggregate signal.
+ *
+ * <p><b>Memory:</b> {@code openTimes} grows monotonically until {@link #applyTTL} prunes aged
+ * entries or {@link #forget} explicitly drops one. A long-lived JVM that opens many distinct files
+ * without ever invoking {@code applyTTL} will accumulate a tracking-map entry per file for the
+ * process lifetime. Production embedders MUST either schedule {@code applyTTL} on a cadence that
+ * matches their open() throughput or call {@code forget} at known end-of-life points.
  */
 public final class CacheTTLController {
 
@@ -139,6 +151,14 @@ public final class CacheTTLController {
    * never be read again (e.g. it was deleted upstream). This DOES NOT drop the file's cache entries
    * — call {@link #applyTTL} or the explicit eviction APIs to release cached bytes. {@code
    * forget()} on an untracked id is a silent no-op.
+   *
+   * <p>{@code forget} unconditionally removes the tracking entry regardless of its {@code
+   * removeInProgress} state — it bypasses the mark-and-CAS protocol used by {@link #recordOpen} and
+   * {@link #applyTTL}. A {@code forget} that races with an in-flight {@code applyTTL} cycle orphans
+   * the tracking entry but the cycle's tier-removal still completes for the file; this is benign
+   * because the file is, by the caller's contract, never going to be read again.
+   *
+   * <p>This is a Java-port extension and has no velox equivalent.
    */
   public void forget(long fileNum) {
     openTimes.remove(fileNum);
@@ -173,8 +193,10 @@ public final class CacheTTLController {
    * @param ttlSeconds aging threshold in seconds; files whose first-observed open-time is strictly
    *     older than {@code now - ttlSeconds} are eligible for removal. {@code ttlSeconds = 0} means
    *     "drop every file opened in any earlier second".
-   * @return the number of files dropped from BOTH tiers on this cycle. Files retained by either
-   *     tier are not counted.
+   * @return the number of files for which neither tier retained any pin on this cycle. A file that
+   *     is pinned in EITHER tier counts as retained and is NOT included in the return value. Files
+   *     with no entries in either tier still count as "dropped" — the controller cannot distinguish
+   *     that case from a successful eviction.
    * @throws IllegalArgumentException if {@code ttlSeconds} is negative.
    */
   public int applyTTL(long ttlSeconds) {
@@ -252,6 +274,25 @@ public final class CacheTTLController {
   /** Number of completed {@link #applyTTL} cycles. Visible for tests. */
   public long appliedCycles() {
     return numAppliedCycles.get();
+  }
+
+  /**
+   * Test seam: force the tracking entry for {@code fileNum} into the {@code removeInProgress=true}
+   * state without running a full {@link #applyTTL} cycle. This lets a single-threaded test exercise
+   * the {@link #recordOpen} CAS-replace branch (which fires only when an entry is already marked)
+   * deterministically. No-op if the file is not tracked or is already marked.
+   */
+  void markForTesting(long fileNum) {
+    OpenInfo cur = openTimes.get(fileNum);
+    if (cur != null && !cur.removeInProgress) {
+      openTimes.replace(fileNum, cur, new OpenInfo(cur.openTimeSeconds, true));
+    }
+  }
+
+  /** Test seam: returns true if the tracking entry exists and is marked remove-in-progress. */
+  boolean isMarkedForTesting(long fileNum) {
+    OpenInfo cur = openTimes.get(fileNum);
+    return cur != null && cur.removeInProgress;
   }
 
   /**
