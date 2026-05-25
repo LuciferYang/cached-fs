@@ -85,6 +85,16 @@ public final class CachedFileSystem extends FilterFileSystem {
     return uri != null ? uri : super.getUri();
   }
 
+  /**
+   * Initializes the decorator: instantiates the inner FS (per {@link CachedFsConfig#INNER_IMPL}),
+   * runs its {@code initialize}, then — when {@link CachedFsConfig#ENABLED} is true — installs this
+   * decorator's {@code scheme://authority} opener into the bootstrap registry and finally flips
+   * {@link #enabled} to true. Order is load-bearing: the opener MUST be visible before {@code
+   * enabled} so a racing reader cannot observe {@code enabled=true} and miss the opener.
+   *
+   * <p>On any throw the partially-constructed inner FS is closed, preventing socket/thread leaks
+   * since Hadoop's FileSystem.CACHE does not call {@link #close} on a failed initialize.
+   */
   @Override
   public void initialize(URI name, Configuration conf) throws IOException {
     this.uri = name;
@@ -210,6 +220,23 @@ public final class CachedFileSystem extends FilterFileSystem {
     }
   }
 
+  /**
+   * Closes the decorator in a strict order:
+   *
+   * <ol>
+   *   <li>flip {@link #enabled} to false so racing readers either bypass or have already captured
+   *       the bootstrap reference;
+   *   <li>identity-aware {@link CacheBootstrap#removeOpener} so a peer decorator that re-registered
+   *       the same endpoint keeps its registration;
+   *   <li>drain only this decorator's handles via {@code closeMatching};
+   *   <li>finally close the wrapped inner FS.
+   * </ol>
+   *
+   * <p>Reversing steps 2 and 3 would leak handles: a mid-dispatch thread that already captured the
+   * opener could install a fresh handle into the LRU after drain returned and before the opener was
+   * removed; {@link #close} would then leave a stale handle whose stream gets invalidated by the
+   * inner-FS close.
+   */
   @Override
   public void close() throws IOException {
     // Order is load-bearing:

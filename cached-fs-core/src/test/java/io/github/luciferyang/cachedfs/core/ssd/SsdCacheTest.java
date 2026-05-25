@@ -318,4 +318,41 @@ class SsdCacheTest {
     assertThatThrownBy(() -> new SsdCache.Config(null, "ssd", 1, 1, 0, 0L, false, false))
         .isInstanceOf(NullPointerException.class);
   }
+
+  @Test
+  @DisplayName(
+      "removeFileEntries: one SSD shard throws → other shards proceed, targets surface as retained")
+  void removeFileEntriesPerShardFailSoft(@TempDir Path dir) throws Exception {
+    StringIdMap ids = new StringIdMap();
+    var cfg = SsdCache.Config.single(dir, "ssd", 4, 2, 64, 1L << 20, false, false);
+    SsdCache cache = new SsdCache(cfg, ids);
+    try {
+      // Swap shard 0 for a Mockito mock that throws on removeFileEntries — mirrors the
+      // AsyncDataCacheTest pattern. Locks in the SSD-side per-shard fail-soft contract added in
+      // SsdCache.removeFileEntries.
+      java.lang.reflect.Field shardsField = SsdCache.class.getDeclaredField("shards");
+      shardsField.setAccessible(true);
+      SsdFile[] shards = (SsdFile[]) shardsField.get(cache);
+      SsdFile original = shards[0];
+      SsdFile mocked = org.mockito.Mockito.mock(SsdFile.class);
+      org.mockito.Mockito.when(mocked.removeFileEntries(org.mockito.ArgumentMatchers.anySet()))
+          .thenThrow(new RuntimeException("simulated SSD shard 0 failure"));
+      try {
+        shards[0] = mocked;
+
+        Set<Long> targets = Set.of(0L, 4L, 8L);
+        Set<Long> retained = cache.removeFileEntries(targets);
+
+        assertThat(retained)
+            .as("failed SSD shard reports all targets as retained so the TTL controller retries")
+            .containsAll(targets);
+        // The mock was actually invoked (not short-circuited by the catch).
+        org.mockito.Mockito.verify(mocked).removeFileEntries(org.mockito.ArgumentMatchers.anySet());
+      } finally {
+        shards[0] = original;
+      }
+    } finally {
+      cache.close();
+    }
+  }
 }
