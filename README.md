@@ -30,6 +30,28 @@ fs.cached.enabled=true
 
 For multi-scheme caching in the same JVM, give each `FileSystem.get(uri, conf)` call its own `Configuration` whose `fs.cached.inner.impl` names the inner class for that scheme — the bootstrap's RAM/SSD tiers are shared while each decorator registers its own `scheme://authority` opener.
 
+### Configuration reference
+
+All keys live under the `fs.cached.*` namespace; the first `installIfNeeded` call wins (subsequent calls are no-ops), so set them on the `Configuration` you pass to `FileSystem.get`.
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `fs.cached.enabled` | `false` | Master switch; when false, `open()` delegates straight to the inner FS. |
+| `fs.cached.inner.impl` | — | FQCN of the wrapped FileSystem (required when enabled). |
+| `fs.cached.ram.shards` | `4` | RAM-tier shard count (power of 2). Higher reduces mutex contention. |
+| `fs.cached.ram.max-write-ratio` | `0.7` | Fraction of RAM the cache may use for write-side staging. |
+| `fs.cached.ram.ssd-savable-ratio` | `0.125` | Fraction of new entries the SSD tier is asked to absorb. |
+| `fs.cached.ram.min-ssd-savable-bytes` | `16777216` | Lower bound on a write batch before flushing to SSD. |
+| `fs.cached.ssd.paths` | — | Comma-separated mount points (omit to disable SSD tier). |
+| `fs.cached.ssd.shards` | `4` | SSD-tier shard count; independent of `ssd.paths` count. |
+| `fs.cached.ssd.shard-prefix` | `ssd` | Filename prefix for per-shard `.data`/`.cpt`/`.log` files. |
+| `fs.cached.ssd.regions-per-shard` | `16` | 64 MiB regions per shard. |
+| `fs.cached.ssd.max-entries-per-shard` | `0` | Upper bound on cached entries per shard; `0` means unbounded. |
+| `fs.cached.ssd.checksum.enabled` | `false` | Compute payload checksums on write. |
+| `fs.cached.ssd.checksum.read-verify` | `false` | Verify checksums on read (requires `checksum.enabled`). |
+| `fs.cached.load-quantum-bytes` | `8388608` | Read granularity on the cached path; supersedes Hadoop's `bufferSize`. |
+| `fs.cached.handle-cache-capacity` | `1024` | Open-handle LRU capacity (per JVM, shared across schemes). |
+
 ## TTL (cache aging)
 
 The cache tracks the open-time of every file it's been asked to serve and exposes an externally-driven aging knob via `CacheTTLController`. No background thread runs inside cached-fs — the embedding application invokes `applyTTL(seconds)` on its own schedule (compliance age-out, invalidation of files known to have been replaced upstream, etc.).

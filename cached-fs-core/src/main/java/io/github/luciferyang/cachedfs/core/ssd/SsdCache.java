@@ -56,6 +56,17 @@ public final class SsdCache implements AutoCloseable {
    * the per-shard interval floors to 0, which disables auto-checkpointing for every shard. A value
    * of {@code 0} also disables auto-checkpointing entirely. Explicit {@link SsdCache#checkpoint()}
    * always runs regardless of this setting.
+   *
+   * @param directories non-empty list of mount points; shards are placed round-robin
+   * @param shardPrefix filename prefix for the per-shard data/log/checkpoint files; should not
+   *     contain path separators or characters reserved by the host filesystem
+   * @param numShards positive shard count, independent of {@code directories.size()}
+   * @param regionsPerShard positive number of 64 MiB regions allocated per shard
+   * @param maxEntriesPerShard upper bound on cached entries per shard; {@code 0} means unbounded
+   * @param checkpointIntervalBytes see note above
+   * @param checksumEnabled when true, payload checksums are computed on write and stored
+   * @param checksumReadVerificationEnabled when true, payload checksums are verified on read
+   *     (requires {@code checksumEnabled})
    */
   public record Config(
       List<Path> directories,
@@ -87,7 +98,10 @@ public final class SsdCache implements AutoCloseable {
       }
     }
 
-    /** Convenience for the common single-directory case. */
+    /**
+     * Convenience for the common single-directory case. Wraps {@code directory} in a one-element
+     * list and forwards the rest of the arguments to the canonical constructor.
+     */
     public static Config single(
         Path directory,
         String shardPrefix,

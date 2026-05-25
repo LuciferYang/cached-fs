@@ -27,13 +27,35 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Process-wide RAM cache. Mirrors velox {@code AsyncDataCache} for the RAM tier; the SSD tier ships
- * in Phase 2.
+ * in {@link io.github.luciferyang.cachedfs.core.ssd.SsdCache}.
  *
- * <p>Sharded by {@code key.hashCode() & shardMask}. Default 4 shards (must be a power of 2). Each
- * shard owns its own mutex, entries, and counters. The cache itself is essentially a thin router
+ * <p><b>Driver model:</b> reactive. The cache exposes a synchronous lookup/insert API and runs no
+ * background threads. RAM growth is bounded by the configured shard count and the eviction policy
+ * inside each {@link CacheShard}. Aging is externally driven via {@link
+ * io.github.luciferyang.cachedfs.core.ttl.CacheTTLController}.
+ *
+ * <p><b>Sharding:</b> by {@code key.hashCode() & shardMask}. Default 4 shards (must be a power of
+ * 2). Each shard owns its own mutex, entries map, and counters. The cache itself is a thin router
  * that picks the right shard for each request.
  *
- * <p><b>Thread safety:</b> all public methods are safe for concurrent calls.
+ * <p><b>Singleton lifecycle:</b> {@link #setInstance} / {@link #getInstance} / {@link
+ * #clearInstance} expose a process-wide reference. Hadoop embedders typically install via {@link
+ * io.github.luciferyang.cachedfs.hadoop.CacheBootstrap}; pure-Java embedders may install directly.
+ *
+ * <p><b>Thread safety:</b> all public methods are safe for concurrent calls. Per-shard mutexes
+ * serialize within a shard; cross-shard operations have no global ordering.
+ *
+ * <p><b>Velox-parity divergences:</b>
+ *
+ * <ul>
+ *   <li>{@link #removeFileEntries} fails soft per shard: if a shard throws, its targets surface as
+ *       retained so the caller (TTL controller) retries next cycle. Velox returns a bool {@code
+ *       success} signal; the Java port surfaces the failure via the retained set + WARN log.
+ *   <li>Some Phase-2 fields in {@link CacheStats} are hardcoded to {@code 0L} pending SSD-tier
+ *       wiring — see the {@link #refreshStats()} body for the current set.
+ *   <li>{@link #close} is idempotent (see {@link AtomicBoolean} guard); velox's {@code shutdown} is
+ *       not.
+ * </ul>
  */
 public final class AsyncDataCache implements AutoCloseable {
 
@@ -42,7 +64,21 @@ public final class AsyncDataCache implements AutoCloseable {
   /** Velox: {@code kDefaultNumShards = 4}. */
   public static final int DEFAULT_NUM_SHARDS = 4;
 
-  /** Configuration knobs. Mirror velox {@code AsyncDataCache::Options}. */
+  /**
+   * Configuration knobs. Mirror velox {@code AsyncDataCache::Options}.
+   *
+   * @param numShards number of per-shard mutex/entries containers. Must be a power of 2; higher
+   *     values reduce mutex contention at the cost of per-shard overhead. Default 4 (velox {@code
+   *     kDefaultNumShards}).
+   * @param maxWriteRatio fraction of RAM the cache may use for write-side staging (range [0, 1]).
+   *     Default 0.7 (velox {@code kDefaultMaxWriteRatio}).
+   * @param ssdSavableRatio fraction of new entries that the SSD tier is asked to absorb (range [0,
+   *     1]). Default 0.125. A value of 0 disables SSD save-back entirely.
+   * @param minSsdSavableBytes lower bound on a write batch before it is flushed to SSD; below this
+   *     the entries stay RAM-resident. Must be {@code >= 0}. Default 16 MiB.
+   * @param ssdFlushThresholdBytes pending-write bytes that trigger an SSD flush. Must be {@code >=
+   *     0}. Default 0 (rely on {@code minSsdSavableBytes} alone).
+   */
   public record Options(
       int numShards,
       double maxWriteRatio,
@@ -57,8 +93,20 @@ public final class AsyncDataCache implements AutoCloseable {
       if (maxWriteRatio < 0.0 || maxWriteRatio > 1.0) {
         throw new IllegalArgumentException("maxWriteRatio must be in [0,1]: " + maxWriteRatio);
       }
+      if (ssdSavableRatio < 0.0 || ssdSavableRatio > 1.0) {
+        throw new IllegalArgumentException("ssdSavableRatio must be in [0,1]: " + ssdSavableRatio);
+      }
+      if (minSsdSavableBytes < 0L) {
+        throw new IllegalArgumentException(
+            "minSsdSavableBytes must be >= 0: " + minSsdSavableBytes);
+      }
+      if (ssdFlushThresholdBytes < 0L) {
+        throw new IllegalArgumentException(
+            "ssdFlushThresholdBytes must be >= 0: " + ssdFlushThresholdBytes);
+      }
     }
 
+    /** Returns the velox-parity default settings. */
     public static Options defaults() {
       return new Options(DEFAULT_NUM_SHARDS, 0.7, 0.125, 16L << 20, 0L);
     }
@@ -100,36 +148,78 @@ public final class AsyncDataCache implements AutoCloseable {
     }
   }
 
+  /**
+   * @return the configuration this cache was constructed with.
+   */
   public Options options() {
     return options;
   }
 
+  /**
+   * @return the number of shards.
+   */
   public int numShards() {
     return shards.length;
   }
 
-  /** Routes a key to its shard. Mirrors velox sharding by full {@code (fileNum, offset)} hash. */
+  /**
+   * Routes {@code key} to its owning shard. Mirrors velox sharding by full {@code (fileNum,
+   * offset)} hash. The returned shard reference is stable for the cache's lifetime; callers MUST
+   * NOT close it.
+   */
   public CacheShard shardFor(RawFileCacheKey key) {
     return shards[key.hashCode() & shardMask];
   }
 
+  /**
+   * Returns an existing entry's pin or installs an exclusive placeholder for a new one — single-
+   * flight: only one caller observes the {@code Exclusive} placeholder per key, all others block on
+   * the placeholder's load. Mirrors velox {@code AsyncDataCache::findOrCreate}.
+   *
+   * @param key cache key (file id + offset)
+   * @param size the entry's intended payload size in bytes; must be {@code > 0}
+   * @param contiguous if {@code true} request contiguous memory (velox kLarge tier); {@code false}
+   *     allows the cache to allocate a small (kTiny) buffer where appropriate
+   * @return either an {@link FindResult.Exclusive} placeholder (caller MUST initialize and promote
+   *     via {@link Pin#exclusiveToShared}) or a {@link FindResult.Shared} hit
+   * @throws IllegalArgumentException if {@code size <= 0}
+   */
   public FindResult findOrCreate(RawFileCacheKey key, int size, boolean contiguous) {
     return shardFor(key).findOrCreate(key, size, contiguous);
   }
 
+  /**
+   * Returns a shared pin for {@code key} if an entry exists and is not exclusively held; empty
+   * otherwise. Non-blocking — does NOT wait for an in-flight load to complete.
+   *
+   * @return the shared pin, or empty if absent / mid-load
+   */
   public Optional<FindResult> find(RawFileCacheKey key) {
     return shardFor(key).find(key);
   }
 
+  /**
+   * @return {@code true} if an entry for {@code key} is currently in the cache (pinned or
+   *     evictable). Does not affect pin counts.
+   */
   public boolean exists(RawFileCacheKey key) {
     return shardFor(key).exists(key);
   }
 
+  /**
+   * Marks the entry for {@code key} as eligible for eviction. No-op when the entry is absent.
+   * Equivalent to releasing the last shared pin without ever having had one — used by readers that
+   * load into the cache and never intend to keep an exclusive hold.
+   */
   public void makeEvictable(RawFileCacheKey key) {
     shardFor(key).makeEvictable(key);
   }
 
-  /** Drops all unpinned entries across all shards. */
+  /**
+   * Drops all unpinned entries across all shards. Pinned entries are kept; the eviction is
+   * best-effort, not strict. Use {@link #removeFileEntries} or {@link
+   * io.github.luciferyang.cachedfs.core.ttl.CacheTTLController#applyTTL} for targeted removal.
+   */
   public void clear() {
     for (CacheShard s : shards) {
       s.clear();
