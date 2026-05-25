@@ -48,6 +48,14 @@ import org.apache.hadoop.util.ReflectionUtils;
  * hdfs://nn-a}, {@code s3a://bucket-x}, {@code bos://bucket-y}, and any other Hadoop {@link
  * FileSystem} side by side. Closing one decorator unregisters its endpoint and drains only its own
  * handles; sibling decorators keep their entries.
+ *
+ * <p><b>Cached vs passthrough APIs:</b> only the legacy {@code open(Path)} / {@code open(Path,
+ * int)} entry points route through the cache. The modern builder API ({@link
+ * FilterFileSystem#openFile(Path)}, {@code openFile(PathHandle)}) and {@code open(PathHandle, int)}
+ * delegate to the inner FS unchanged — they bypass the cache. Readers that prefer the builder API
+ * (S3A select reads, some Iceberg / Parquet code paths) will see zero cache hits. Routing those
+ * through the cache is a future task; configure your reader to use {@code open(Path, int)} until
+ * then.
  */
 public final class CachedFileSystem extends FilterFileSystem {
 

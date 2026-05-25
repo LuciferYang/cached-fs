@@ -30,6 +30,12 @@ fs.cached.enabled=true
 
 For multi-scheme caching in the same JVM, give each `FileSystem.get(uri, conf)` call its own `Configuration` whose `fs.cached.inner.impl` names the inner class for that scheme — the bootstrap's RAM/SSD tiers are shared while each decorator registers its own `scheme://authority` opener.
 
+### Limitations
+
+- Only the legacy `open(Path)` / `open(Path, int)` reader entry points route through the cache. The modern `openFile(Path)` builder API and `open(PathHandle, ...)` paths delegate to the inner FS unchanged. Configure your reader (Spark, Iceberg, Parquet, etc.) to call the legacy `open` if you want cache hits.
+- `applyTTL(ttlSeconds)` rejects negative values and values larger than the current epoch second.
+- The `cached-fs-metrics` module is not yet shipped; depending on it today gets an empty jar.
+
 ### Configuration reference
 
 All keys live under the `fs.cached.*` namespace; the first `installIfNeeded` call wins (subsequent calls are no-ops), so set them on the `Configuration` you pass to `FileSystem.get`.

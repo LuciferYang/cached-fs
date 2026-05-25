@@ -326,12 +326,19 @@ public final class CacheBootstrap {
     }
   }
 
+  /**
+   * @return the RAM-tier cache; never null.
+   */
   public AsyncDataCache ramCache() {
     return ramCache;
   }
 
-  public SsdCache ssdCache() {
-    return ssdCache;
+  /**
+   * @return the SSD-tier cache, or empty when {@code fs.cached.ssd.paths} is unset (RAM-only
+   *     deployment).
+   */
+  public Optional<SsdCache> ssdCache() {
+    return Optional.ofNullable(ssdCache);
   }
 
   public StringIdMap stringIds() {
