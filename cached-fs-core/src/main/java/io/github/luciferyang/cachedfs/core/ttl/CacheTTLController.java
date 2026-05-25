@@ -266,8 +266,11 @@ public final class CacheTTLController {
     // Snapshot AND mark: replace each candidate with a marked OpenInfo so a concurrent recordOpen
     // can CAS-replace with a fresh entry and survive cleanUp. Velox's getAndMarkAgedOutFiles does
     // the same thing under a write lock; ConcurrentHashMap.replace gives us per-key atomicity
-    // without a global lock. Size-hint the snapshot to avoid rehashing on large tracking maps.
-    Map<Long, OpenInfo> snapshot = new HashMap<>(Math.min(openTimes.size(), 1024));
+    // without a global lock. Size-hint to openTimes.size() (which IS the upper bound) so the
+    // snapshot HashMap pre-allocates enough buckets even on very large tracking maps. The cost
+    // is one HashMap allocation matching the tracking-map size — acceptable since applyTTL is
+    // documented as infrequent.
+    Map<Long, OpenInfo> snapshot = new HashMap<>(openTimes.size());
     for (var entry : openTimes.entrySet()) {
       OpenInfo info = entry.getValue();
       // Velox semantic: strict less-than. Already-marked entries (a previous cycle's retried

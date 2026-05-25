@@ -170,7 +170,7 @@ public final class CacheShard {
    */
   public java.util.Set<Long> removeFileEntries(java.util.Set<Long> filesToRemove) {
     java.util.Objects.requireNonNull(filesToRemove, "filesToRemove");
-    java.util.HashSet<Long> retained = new java.util.HashSet<>();
+    java.util.Set<Long> retained = new java.util.HashSet<>();
     mutex.lock();
     try {
       var it = entryMap.entrySet().iterator();
@@ -315,8 +315,7 @@ public final class CacheShard {
    * TTL hot path). The shard mutex serializes the scan with reads/writes, so the per-call cost is
    * paid under contention. Acceptable today because per-shard entry counts stay in the low
    * thousands at typical configurations; if profiling shows it dominating, store the slot index on
-   * {@link CacheEntry} so removal becomes O(1) — see the {@code AsyncDataCache} class-level
-   * divergence list.
+   * {@link CacheEntry} so removal becomes O(1).
    */
   private int findSlotIndexLocked(CacheEntry entry) {
     for (int i = 0; i < entries.size(); i++) {
