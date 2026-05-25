@@ -45,7 +45,9 @@ CacheTTLController ttl = CacheBootstrap.get().orElseThrow().ttlController();
 int dropped = ttl.applyTTL(3600);
 ```
 
-Two-tier removal runs RAM first then SSD; pinned entries (a reader still holding the handle) are reported back and retried on the next cycle. `numAgedOut` in `AsyncDataCache.refreshStats()` is the cumulative counter for entries dropped by TTL.
+Two-tier removal calls RAM and SSD independently with the full set of aged-out files — matching velox, the SSD fan-out is NOT gated on RAM retention so a long-lived shared pin in RAM does not extend the SSD copy's lifetime. Pinned entries (in either tier) are reported back and retried on the next cycle. A reader that re-opens a file mid-TTL refreshes the tracking entry so freshly-loaded cache bytes are not silently lost on the cycle's cleanup. `numAgedOut` in `AsyncDataCache.refreshStats()` is the RAM-tier counter for entries dropped via `removeFileEntries` — applicable to TTL but also any other caller of that API; it does NOT count SSD-side drops.
+
+Call `applyTTL` no more than once per minute in production: each invocation scans every RAM shard under its mutex and every SSD region, so frequent calls starve readers.
 
 ## Modules
 

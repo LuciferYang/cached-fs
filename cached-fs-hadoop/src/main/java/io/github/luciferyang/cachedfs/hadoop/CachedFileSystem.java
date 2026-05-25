@@ -165,18 +165,19 @@ public final class CachedFileSystem extends FilterFileSystem {
       // would bubble up as an unhandled task failure and skip retry entirely.
       throw new IOException(ex);
     }
-    // Register the file's open-time with the TTL controller. recordOpen is putIfAbsent semantics,
-    // so the first observed open wins — repeat calls for the same fileNum are cheap and the
-    // original timestamp is preserved (matches velox's "files keep their original open timestamp"
-    // behavior). Cost on the hot path is one ConcurrentMap.putIfAbsent.
-    b.ttlController().recordOpen(ptr.value().fileNum());
     // Ownership of `ptr` transfers to `cis` once CachingInputStream's constructor succeeds (its
     // close() releases the pin). Until then we own it ourselves, so any throw must release the
     // pin AND unwrap UncheckedIOException so callers see the declared IOException type instead
-    // of a runtime exception.
+    // of a runtime exception. recordOpen is inside the guarded block because it can throw
+    // under memory pressure (HashMap.Node allocation, etc.) and a leaked pin would keep this
+    // file's cache entries un-evictable for the JVM lifetime.
     CachingInputStream cis = null;
     boolean ptrTransferred = false;
     try {
+      // Register the file's open-time with the TTL controller. recordOpen returns true when it
+      // installs (or refreshes a remove-in-progress) entry; false when an existing entry was
+      // preserved. The return value is dropped — the hook is fire-and-forget on this path.
+      b.ttlController().recordOpen(ptr.value().fileNum());
       cis = new CachingInputStream(ptr, b.ramCache(), b.loadQuantumBytes());
       ptrTransferred = true;
       return new FSDataInputStream(cis);

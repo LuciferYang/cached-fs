@@ -19,7 +19,6 @@ import io.github.luciferyang.cachedfs.core.AsyncDataCache;
 import io.github.luciferyang.cachedfs.core.ssd.SsdCache;
 import java.time.Clock;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
 import java.util.OptionalLong;
@@ -36,19 +35,27 @@ import java.util.concurrent.atomic.AtomicLong;
  * schedule — typical use cases are PII age-out for compliance and invalidating files known to have
  * been replaced upstream.
  *
- * <p><b>What it tracks:</b> a {@code fileNum -> openTimeSeconds} map keyed by the {@code
- * StringIdLease} id minted at handle-open time. {@link #recordOpen} is wired by {@code
- * CachedFileSystem.open} so the controller sees every file the cache has been asked to serve.
+ * <p><b>What it tracks:</b> a {@code fileNum -> openTime} map keyed by the {@link
+ * io.github.luciferyang.cachedfs.core.id.StringIdMap} id minted at handle-open time. {@link
+ * #recordOpen} is wired by {@code CachedFileSystem.open} so the controller sees every file the
+ * cache has been asked to serve.
  *
  * <p><b>Two-tier removal:</b> on each {@code applyTTL} call, the controller computes the set of
- * files whose open-time is older than {@code now - ttl}, calls {@link
- * AsyncDataCache#removeFileEntries} (RAM tier first), then {@link SsdCache#removeFileEntries} (SSD
- * tier). Pinned entries in either tier come back as {@code retained} — the controller keeps those
- * file ids in its tracking map so a later cycle can retry; non-retained file ids are pruned via
- * {@link #cleanUp}.
+ * files whose first-observed open-time is strictly older than {@code now - ttl} (the boundary
+ * predicate matches velox: a file opened exactly at the cutoff is retained), marks each as
+ * <i>remove-in-progress</i>, then calls {@link AsyncDataCache#removeFileEntries} (RAM) and {@link
+ * SsdCache#removeFileEntries} (SSD) with the full target set — SSD is NOT gated on RAM retention,
+ * matching velox's contract that the SSD tier independently tracks pinned regions. Files reported
+ * back as retained (pinned in either tier) keep their tracking entry for retry on a future cycle.
  *
- * <p><b>Thread safety:</b> all public methods are safe for concurrent calls. {@code recordOpen} is
- * a hot-path call (every read of a fresh file); {@code applyTTL} is intended to be infrequent.
+ * <p><b>Race-free re-open:</b> a reader that calls {@link #recordOpen} for a file currently in the
+ * remove-in-progress state replaces the tracking entry with a fresh open-time and clears the flag.
+ * The cycle's {@code cleanUp} uses compare-and-remove so the replaced entry survives — preventing
+ * the case where the cycle drops a cache entry, a reader re-populates it, and tracking is then
+ * cleaned up leaving the fresh entry invisible to subsequent TTL cycles.
+ *
+ * <p><b>Thread safety:</b> all public methods are safe for concurrent calls. {@link #recordOpen} is
+ * a hot-path call (every successful {@code open}); {@link #applyTTL} is intended to be infrequent.
  */
 public final class CacheTTLController {
 
@@ -61,15 +68,22 @@ public final class CacheTTLController {
 
   /**
    * Per-file tracking record. Instance identity matters: {@link #cleanUp} uses {@link
-   * ConcurrentMap#remove(Object, Object)} to compare-and-remove against the {@code OpenInfo}
-   * captured at the start of the cycle, so a concurrent {@link #recordOpen} that re-inserts a fresh
-   * {@code OpenInfo} during the cycle is preserved (its identity is different).
+   * ConcurrentMap#remove(Object, Object)} and {@link ConcurrentMap#replace(Object, Object, Object)}
+   * which compare with {@code equals}. {@code OpenInfo} keeps {@code Object}'s identity-based
+   * {@code equals}/{@code hashCode}, so two {@code OpenInfo(100L, false)} instances are NOT equal —
+   * the compare-and-swap protects against a concurrent {@link #recordOpen} that re-inserts a fresh
+   * instance during the cycle.
+   *
+   * <p>Intentionally NOT a {@code record}: a record's structural {@code equals} would silently
+   * break the identity-based compare-and-swap.
    */
   private static final class OpenInfo {
     final long openTimeSeconds;
+    final boolean removeInProgress;
 
-    OpenInfo(long openTimeSeconds) {
+    OpenInfo(long openTimeSeconds, boolean removeInProgress) {
       this.openTimeSeconds = openTimeSeconds;
+      this.removeInProgress = removeInProgress;
     }
   }
 
@@ -85,40 +99,82 @@ public final class CacheTTLController {
   }
 
   /**
-   * Records the open-time for {@code fileNum} if not already tracked. Subsequent calls for the same
-   * file are no-ops — the first observed open-time is the one TTL compares against (matches velox's
-   * "files keep their original open timestamp" semantic).
+   * Records the open-time for {@code fileNum}. Mirrors velox {@code addOpenFileInfo}: if no
+   * tracking entry exists, insert one at the current clock time and return {@code true}. If a
+   * tracking entry exists but is in the remove-in-progress state (the next-to-run {@link #applyTTL}
+   * cycle would drop it), REPLACE it with a fresh open-time and clear the flag — this keeps the
+   * file tracked for the freshly-loaded cache entries the caller is about to populate. Otherwise,
+   * no-op and return {@code false} so the first-observed open-time wins.
+   *
+   * @return {@code true} when this call installed or refreshed the tracking entry; {@code false}
+   *     when an existing not-in-progress entry was preserved.
    */
-  public void recordOpen(long fileNum) {
+  public boolean recordOpen(long fileNum) {
     long now = clock.instant().getEpochSecond();
-    openTimes.putIfAbsent(fileNum, new OpenInfo(now));
+    while (true) {
+      OpenInfo existing = openTimes.get(fileNum);
+      if (existing == null) {
+        OpenInfo prev = openTimes.putIfAbsent(fileNum, new OpenInfo(now, false));
+        if (prev == null) {
+          return true;
+        }
+        // Race lost — retry on the now-present entry.
+        continue;
+      }
+      if (!existing.removeInProgress) {
+        // Keep the original timestamp. Matches velox 'first open wins' semantic.
+        return false;
+      }
+      // The cycle that marked this entry must not drop our about-to-be-populated cache entries.
+      // CAS-replace: if a concurrent cleanUp already cleared the flag (cycle finished and decided
+      // to retain), or a concurrent recordOpen already replaced it, retry.
+      if (openTimes.replace(fileNum, existing, new OpenInfo(now, false))) {
+        return true;
+      }
+    }
   }
 
   /**
-   * Removes the tracking entry for {@code fileNum}. Used when an external caller knows the file
-   * will never be read again (e.g. it was deleted upstream). Not normally needed — {@link
-   * #applyTTL} handles steady-state pruning.
+   * Removes the tracking entry for {@code fileNum}. Use when an external caller knows the file will
+   * never be read again (e.g. it was deleted upstream). This DOES NOT drop the file's cache entries
+   * — call {@link #applyTTL} or the explicit eviction APIs to release cached bytes. {@code
+   * forget()} on an untracked id is a silent no-op.
    */
   public void forget(long fileNum) {
     openTimes.remove(fileNum);
   }
 
   /**
-   * Drops every cache entry whose owning file's open-time is older than {@code now - ttlSeconds}.
-   * Runs RAM-tier removal first, then SSD-tier removal (skipped if no SSD tier was configured).
-   * Pinned entries in either tier are kept in the controller's tracking map so a subsequent {@code
-   * applyTTL} cycle can retry them; non-retained file ids whose entries are now gone are pruned
-   * from the map.
+   * Drops every cache entry whose owning file's first-observed open-time is strictly older than
+   * {@code now - ttlSeconds}. Boundary semantic matches velox: a file opened exactly at the cutoff
+   * is retained.
+   *
+   * <p>Algorithm:
+   *
+   * <ol>
+   *   <li>Snapshot all eligible files AND mark each tracking entry as remove-in-progress, so a
+   *       concurrent {@link #recordOpen} for the same file can CAS-replace with a fresh entry
+   *       (which {@code cleanUp} below will leave alone).
+   *   <li>Call {@link AsyncDataCache#removeFileEntries} for the RAM tier and (if configured) {@link
+   *       SsdCache#removeFileEntries} for the SSD tier. Both calls receive the full target set —
+   *       SSD is NOT gated on RAM retention, matching velox's {@code AsyncDataCache::
+   *       removeFileEntries} which always fans the request out to both tiers.
+   *   <li>{@code cleanUp(retained)}: for each file that came back retained by EITHER tier, clear
+   *       its remove-in-progress flag so a future cycle can retry; for each file not retained,
+   *       compare-and-remove the tracking entry against the marked value.
+   * </ol>
    *
    * <p>The cycle counter is incremented in a {@code finally} block so {@link #appliedCycles}
    * remains an accurate health signal even when a tier's {@code removeFileEntries} throws
-   * unexpectedly. On exception, RAM-side drops that already succeeded are kept; {@code openTimes}
-   * is left as it was so the next cycle replays the remaining work.
+   * unexpectedly. On exception, RAM-side drops that already succeeded are kept; tracking entries
+   * stay marked as remove-in-progress so a subsequent recordOpen can recover their fresh state and
+   * the next applyTTL cycle replays the remaining work.
    *
-   * @param ttlSeconds aging threshold in seconds; files whose first-observed open-time is {@code
-   *     now - ttlSeconds} or older are eligible for removal.
-   * @return the number of files dropped from at least one tier on this cycle. Files that came back
-   *     fully retained (pinned in RAM or SSD) are not counted.
+   * @param ttlSeconds aging threshold in seconds; files whose first-observed open-time is strictly
+   *     older than {@code now - ttlSeconds} are eligible for removal. {@code ttlSeconds = 0} means
+   *     "drop every file opened in any earlier second".
+   * @return the number of files dropped from BOTH tiers on this cycle. Files retained by either
+   *     tier are not counted.
    * @throws IllegalArgumentException if {@code ttlSeconds} is negative.
    */
   public int applyTTL(long ttlSeconds) {
@@ -126,17 +182,26 @@ public final class CacheTTLController {
       throw new IllegalArgumentException("ttlSeconds must be >= 0: " + ttlSeconds);
     }
     long cutoff = clock.instant().getEpochSecond() - ttlSeconds;
-    // Capture the OpenInfo reference along with the fileNum so cleanUp can compare-and-remove
-    // against the exact snapshot. A concurrent recordOpen that re-inserts a different OpenInfo
-    // during the cycle keeps its tracking entry — see ConcurrentMap.remove(key, value) contract.
+    // Snapshot AND mark: replace each candidate with a marked OpenInfo so a concurrent recordOpen
+    // can CAS-replace with a fresh entry and survive cleanUp. Velox's getAndMarkAgedOutFiles does
+    // the same thing under a write lock; ConcurrentHashMap.replace gives us per-key atomicity
+    // without a global lock.
     Map<Long, OpenInfo> snapshot = new HashMap<>();
-    // ConcurrentHashMap.entrySet() is weakly-consistent: no CME, may miss newly-inserted entries
-    // (which are young and not aged-out anyway), may report just-removed entries (whose
-    // removeFileEntries call becomes a no-op). Both are acceptable.
     for (var entry : openTimes.entrySet()) {
       OpenInfo info = entry.getValue();
-      if (info.openTimeSeconds <= cutoff) {
+      // Velox semantic: strict less-than. Already-marked entries (a previous cycle's retried
+      // files) are also picked up so retries make progress.
+      if (info.removeInProgress) {
         snapshot.put(entry.getKey(), info);
+        continue;
+      }
+      if (info.openTimeSeconds < cutoff) {
+        OpenInfo marked = new OpenInfo(info.openTimeSeconds, true);
+        if (openTimes.replace(entry.getKey(), info, marked)) {
+          snapshot.put(entry.getKey(), marked);
+        }
+        // If replace failed, a concurrent recordOpen replaced this entry with a fresh
+        // not-in-progress one — it's no longer aged out, skip.
       }
     }
     try {
@@ -144,22 +209,15 @@ public final class CacheTTLController {
         return 0;
       }
       Set<Long> filesToRemove = snapshot.keySet();
-      // RAM tier first — matches velox AsyncDataCache.cpp:1107-1126 order.
       Set<Long> ramRetained = ramCache.removeFileEntries(filesToRemove);
-      // SSD tier next, but only for files that RAM was willing to drop (no point removing SSD-side
-      // if the RAM-side handle is still being read — velox semantics).
       Set<Long> ssdRetained = Set.of();
       if (ssdCache != null) {
-        Set<Long> ssdTargets = new HashSet<>(filesToRemove);
-        ssdTargets.removeAll(ramRetained);
-        if (!ssdTargets.isEmpty()) {
-          ssdRetained = ssdCache.removeFileEntries(ssdTargets);
-        }
+        // Velox AsyncDataCache::removeFileEntries fans out to SSD with the full target set, not
+        // (filesToRemove - ramRetained). The SSD tier independently tracks pinned regions; a RAM
+        // pin does not imply the SSD copy is in use.
+        ssdRetained = ssdCache.removeFileEntries(filesToRemove);
       }
-      // Either tier retaining a file keeps it tracked, so the NEXT cycle can retry the side whose
-      // entries are still pinned. Dropping an SSD-only-retained file from openTimes would orphan
-      // its SSD entries (the next cycle wouldn't see the file in openTimes and would skip SSD).
-      Set<Long> stillRetained = new HashSet<>(ramRetained);
+      java.util.HashSet<Long> stillRetained = new java.util.HashSet<>(ramRetained);
       stillRetained.addAll(ssdRetained);
       cleanUp(snapshot, stillRetained);
       return filesToRemove.size() - stillRetained.size();
@@ -178,7 +236,7 @@ public final class CacheTTLController {
    * tracked. Useful as an observability signal for "how far behind is the TTL cycle running?".
    *
    * <p>Reads {@code openTimes} without a lock; ConcurrentHashMap weak-consistency means a fully
-   * concurrent {@code applyTTL} that empties the map mid-iteration produces {@code empty}, never
+   * concurrent {@link #applyTTL} that empties the map mid-iteration produces {@code empty}, never
    * {@code Long.MAX_VALUE}. O(n) in the tracking map size.
    */
   public OptionalLong oldestOpenTimeSeconds() {
@@ -197,16 +255,26 @@ public final class CacheTTLController {
   }
 
   /**
-   * Prunes the tracking map: for each file in {@code attempted} whose recorded {@link OpenInfo}
-   * snapshot has NOT been replaced and that does not appear in {@code stillRetained}, remove the
-   * entry. {@link ConcurrentMap#remove(Object, Object)} compares by value identity so a concurrent
-   * {@link #recordOpen} that re-inserted a fresh {@code OpenInfo} during the cycle is preserved.
+   * For each file in the snapshot:
+   *
+   * <ul>
+   *   <li>If retained by either tier, CAS-replace the marked entry with one whose {@code
+   *       removeInProgress} flag is cleared (so a future cycle can retry). If a concurrent {@link
+   *       #recordOpen} already replaced the entry, the replace is a no-op — that's fine, the
+   *       record-open already cleared the flag and refreshed the time.
+   *   <li>Otherwise, compare-and-remove the marked entry. A concurrent {@link #recordOpen} that
+   *       replaced it (different identity, removeInProgress=false) is preserved — the freshly
+   *       populated cache entries stay tracked.
+   * </ul>
    */
   private void cleanUp(Map<Long, OpenInfo> attempted, Set<Long> stillRetained) {
     for (var entry : attempted.entrySet()) {
       Long fn = entry.getKey();
-      if (!stillRetained.contains(fn)) {
-        openTimes.remove(fn, entry.getValue());
+      OpenInfo marked = entry.getValue();
+      if (stillRetained.contains(fn)) {
+        openTimes.replace(fn, marked, new OpenInfo(marked.openTimeSeconds, false));
+      } else {
+        openTimes.remove(fn, marked);
       }
     }
   }
