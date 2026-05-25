@@ -255,14 +255,45 @@ class AsyncDataCacheTest {
   }
 
   @Test
-  @DisplayName("Options validates power-of-2 numShards and 0..1 maxWriteRatio")
+  @DisplayName("Options validates numShards, ratios, and byte thresholds")
   void optionsValidation() {
+    // numShards: power-of-2 and positive
     assertThatThrownBy(() -> new AsyncDataCache.Options(3, 0.7, 0.125, 0L, 0L))
-        .isInstanceOf(IllegalArgumentException.class);
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("numShards");
     assertThatThrownBy(() -> new AsyncDataCache.Options(0, 0.7, 0.125, 0L, 0L))
-        .isInstanceOf(IllegalArgumentException.class);
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("numShards");
+    // maxWriteRatio: [0,1]
     assertThatThrownBy(() -> new AsyncDataCache.Options(2, 1.5, 0.125, 0L, 0L))
-        .isInstanceOf(IllegalArgumentException.class);
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("maxWriteRatio");
+    assertThatThrownBy(() -> new AsyncDataCache.Options(2, -0.1, 0.125, 0L, 0L))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("maxWriteRatio");
+    // ssdSavableRatio: [0,1]
+    assertThatThrownBy(() -> new AsyncDataCache.Options(2, 0.7, 1.5, 0L, 0L))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("ssdSavableRatio");
+    assertThatThrownBy(() -> new AsyncDataCache.Options(2, 0.7, -0.1, 0L, 0L))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("ssdSavableRatio");
+    // minSsdSavableBytes: >= 0
+    assertThatThrownBy(() -> new AsyncDataCache.Options(2, 0.7, 0.125, -1L, 0L))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("minSsdSavableBytes");
+    // ssdFlushThresholdBytes: >= 0
+    assertThatThrownBy(() -> new AsyncDataCache.Options(2, 0.7, 0.125, 0L, -1L))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("ssdFlushThresholdBytes");
+  }
+
+  @Test
+  @DisplayName("constructor rejects null Options with a named NPE")
+  void constructorRejectsNullOptions() {
+    assertThatThrownBy(() -> new AsyncDataCache(null))
+        .isInstanceOf(NullPointerException.class)
+        .hasMessageContaining("options");
   }
 
   @Test

@@ -139,7 +139,17 @@ public final class AsyncDataCache implements AutoCloseable {
   private final CacheShard[] shards;
   private final AtomicBoolean closed = new AtomicBoolean();
 
+  /**
+   * Constructs a cache with the given {@link Options}. The cache is ready to serve once this
+   * returns. Pure-Java embedders may call {@link #setInstance} to publish the cache to the
+   * process-wide singleton; Hadoop embedders should go through {@link
+   * io.github.luciferyang.cachedfs.hadoop.CacheBootstrap}.
+   *
+   * @param options configuration; must not be null
+   * @throws NullPointerException if {@code options} is null
+   */
   public AsyncDataCache(Options options) {
+    Objects.requireNonNull(options, "options");
     this.options = options;
     this.shardMask = options.numShards() - 1;
     this.shards = new CacheShard[options.numShards()];
@@ -172,16 +182,20 @@ public final class AsyncDataCache implements AutoCloseable {
   }
 
   /**
-   * Returns an existing entry's pin or installs an exclusive placeholder for a new one — single-
-   * flight: only one caller observes the {@code Exclusive} placeholder per key, all others block on
-   * the placeholder's load. Mirrors velox {@code AsyncDataCache::findOrCreate}.
+   * Returns an existing entry's pin or installs an exclusive placeholder for a new one —
+   * single-flight: only one caller observes the {@link FindResult.Exclusive} placeholder per key,
+   * all others either see a {@link FindResult.Hit} (entry already loaded, shared-pinned) or a
+   * {@link FindResult.Waiting} (someone else holds the exclusive pin; await the future). Mirrors
+   * velox {@code AsyncDataCache::findOrCreate}.
    *
    * @param key cache key (file id + offset)
    * @param size the entry's intended payload size in bytes; must be {@code > 0}
    * @param contiguous if {@code true} request contiguous memory (velox kLarge tier); {@code false}
    *     allows the cache to allocate a small (kTiny) buffer where appropriate
-   * @return either an {@link FindResult.Exclusive} placeholder (caller MUST initialize and promote
-   *     via {@link Pin#exclusiveToShared}) or a {@link FindResult.Shared} hit
+   * @return one of: {@link FindResult.Hit} (shared pin on a resident entry), {@link
+   *     FindResult.Exclusive} (caller MUST initialize and promote via {@link
+   *     CachePin#exclusiveToShared(boolean)}), or {@link FindResult.Waiting} (await the future,
+   *     then retry — see {@link FindResult} class javadoc).
    * @throws IllegalArgumentException if {@code size <= 0}
    */
   public FindResult findOrCreate(RawFileCacheKey key, int size, boolean contiguous) {

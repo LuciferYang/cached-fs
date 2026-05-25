@@ -42,11 +42,13 @@ All keys live under the `fs.cached.*` namespace; the first `installIfNeeded` cal
 | `fs.cached.ram.max-write-ratio` | `0.7` | Fraction of RAM the cache may use for write-side staging. |
 | `fs.cached.ram.ssd-savable-ratio` | `0.125` | Fraction of new entries the SSD tier is asked to absorb. |
 | `fs.cached.ram.min-ssd-savable-bytes` | `16777216` | Lower bound on a write batch before flushing to SSD. |
+| `fs.cached.ram.ssd-flush-threshold-bytes` | `0` | Pending-write bytes that trigger an SSD flush; `0` defers to `min-ssd-savable-bytes`. |
 | `fs.cached.ssd.paths` | — | Comma-separated mount points (omit to disable SSD tier). |
 | `fs.cached.ssd.shards` | `4` | SSD-tier shard count; independent of `ssd.paths` count. |
 | `fs.cached.ssd.shard-prefix` | `ssd` | Filename prefix for per-shard `.data`/`.cpt`/`.log` files. |
 | `fs.cached.ssd.regions-per-shard` | `16` | 64 MiB regions per shard. |
 | `fs.cached.ssd.max-entries-per-shard` | `0` | Upper bound on cached entries per shard; `0` means unbounded. |
+| `fs.cached.ssd.checkpoint-interval-bytes` | `0` | Cache-wide checkpoint budget; per-shard threshold is this÷shards. `0` disables auto-checkpointing. |
 | `fs.cached.ssd.checksum.enabled` | `false` | Compute payload checksums on write. |
 | `fs.cached.ssd.checksum.read-verify` | `false` | Verify checksums on read (requires `checksum.enabled`). |
 | `fs.cached.load-quantum-bytes` | `8388608` | Read granularity on the cached path; supersedes Hadoop's `bufferSize`. |
