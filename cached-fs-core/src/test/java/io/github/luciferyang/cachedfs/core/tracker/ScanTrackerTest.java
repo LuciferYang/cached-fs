@@ -67,12 +67,31 @@ class ScanTrackerTest {
   }
 
   @Test
-  @DisplayName("TrackingId bit packing roundtrips")
+  @DisplayName("TrackingId bit packing roundtrips (29-bit node, 2-bit streamKind)")
   void trackingIdBitPacking() {
-    TrackingId id = TrackingId.of(12345, 7);
+    TrackingId id = TrackingId.of(12345, 3);
     assertThat(id.node()).isEqualTo(12345);
-    assertThat(id.streamKind()).isEqualTo(7);
+    assertThat(id.streamKind()).isEqualTo(3);
     assertThat(TrackingId.EMPTY.isEmpty()).isTrue();
+  }
+
+  @Test
+  @DisplayName("TrackingId max node value (2^29 - 1) packs and unpacks")
+  void trackingIdMaxNode() {
+    int maxNode = (1 << 29) - 1;
+    TrackingId id = TrackingId.of(maxNode, 0);
+    assertThat(id.id()).isEqualTo(maxNode << 2);
+    assertThat(id.node()).isEqualTo(maxNode);
+    assertThat(id.streamKind()).isZero();
+  }
+
+  @Test
+  @DisplayName("TrackingId rejects out-of-range node and streamKind")
+  void trackingIdRejectsOutOfRange() {
+    assertThatThrownBy(() -> TrackingId.of(1 << 29, 0))
+        .isInstanceOf(IllegalArgumentException.class);
+    assertThatThrownBy(() -> TrackingId.of(0, 4)).isInstanceOf(IllegalArgumentException.class);
+    assertThatThrownBy(() -> TrackingId.of(-1, 0)).isInstanceOf(IllegalArgumentException.class);
   }
 
   @Test

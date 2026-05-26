@@ -16,9 +16,20 @@
 package io.github.luciferyang.cachedfs.core.tracker;
 
 /**
- * Per-stream identifier within a scan: a {@code (node, streamKind)} pair packed into an int32 with
- * node in the high 27 bits and stream kind in the low 5. Mirrors velox {@code TrackingId}
- * (ScanTracker.h:30-32, 33-56).
+ * Per-stream identifier within a scan: a {@code (node, streamKind)} pair packed into an int32.
+ * Packed layout (32 bits, MSB→LSB):
+ *
+ * <ul>
+ *   <li>bit 31: reserved sign bit (always 0)
+ *   <li>bits 30..2: node (29 bits, range {@code [0, 2^29)})
+ *   <li>bits 1..0: streamKind (2 bits, range {@code [0, 4)})
+ * </ul>
+ *
+ * <p>Packed value = {@code (node << 2) | streamKind}, range {@code [0, 2^31)}. Mirrors velox {@code
+ * TrackingId} (ScanTracker.h:30-32, 33-56), with cached-fs's narrower streamKind: at the Hadoop
+ * layer only one streamKind value is used today, so v7 narrowed the field from velox's 5-bit kind
+ * to 2 bits, gaining 3 bits of node-space to support per-(scanId, fileNumHash) keying across larger
+ * scans.
  *
  * <p>The value {@code -1} is the "empty" sentinel.
  */
@@ -27,10 +38,10 @@ public record TrackingId(int id) {
   /** Empty / "no-id" sentinel. */
   public static final TrackingId EMPTY = new TrackingId(-1);
 
-  private static final int STREAM_KIND_BITS = 5;
+  private static final int STREAM_KIND_BITS = 2;
   private static final int STREAM_KIND_MASK = (1 << STREAM_KIND_BITS) - 1;
 
-  /** Exclusive upper bound on {@code node}: 2^(31 - 5) = 2^26 (signed int, top bit reserved). */
+  /** Exclusive upper bound on {@code node}: 2^(31 - 2) = 2^29 (signed int, top bit reserved). */
   private static final int NODE_MAX = 1 << (Integer.SIZE - STREAM_KIND_BITS - 1);
 
   public static TrackingId of(int node, int streamKind) {
