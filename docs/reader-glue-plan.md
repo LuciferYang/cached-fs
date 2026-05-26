@@ -159,7 +159,7 @@ Commits in landing order:
      }
    }
    ```
-   Six lines, no dependencies. Unit test asserts known fixed-point values (e.g., `fmix32(0) == 0`, `fmix32(1) == 0xe6546b64` from the reference impl).
+   Six lines, no dependencies. Unit test asserts known fixed-point values **verified against Apache Commons Codec / Guava `Hashing.murmur3_32().hashInt(i).asInt()`**: `fmix32(0) == 0x00000000`, `fmix32(1) == 0x514e28b7`, `fmix32(2) == 0x30f4c306`. (The constant `0xe6546b64` referenced in earlier plan drafts is the body-mix additive used inside the main MurmurHash3 loop — NOT an fmix32 output; do not use as a fixed-point literal.)
 
    **`fileNumHash` implementation:** `static int fileNumHash(long fileNum) { return Murmur3.fmix32((int) fileNum) & ((1<<29) - 1); }`. Today `FileHandle.fileNum()` comes from `StringIdMap` which assigns sequential ints from 0 — a raw XOR-fold would produce zero collisions until id ≥ 2^29 (degenerate distribution; the birthday-paradox analysis in §Decisions §6 would not apply). `Murmur3.fmix32` uniformly distributes sequential ids across the 32-bit space; masking to 29 bits then satisfies `TrackingId.of`'s range constraint. Acceptance test: hash the first 1M sequential ids; assert the bucket-population stddev is within 1.5× of the theoretical √(N/B) for uniform distribution (N=10^6, B=2^29 → ~0.0019 mean per bucket; stddev ~0.043).
 6. **`CachingInputStream.readFullyFromCache` recording**:
@@ -343,17 +343,26 @@ Acceptance for 5c.0:
    Documented contract: `read/seek/close` are not thread-safe (matches Hadoop `FSDataInputStream` contract). VarHandle-based `compareAndSet` on `pendingPrefetch` is defense-in-depth.
 4. **Consumer thread, post-chunk-N read**: if `pendingPrefetch == null` AND `position >= chunkNEnd - (loadQuantum * triggerTailFraction)` AND `tracker.data(trackingId).readPct() >= prefetchPctThreshold` AND `admissionGate()` AND `System.nanoTime() - lastRejectionNanos >= REJECTION_BACKOFF_NS` (per-stream backoff, default 100 ms via `fs.cached.prefetch.rejection-backoff-ms`): submit the prefetch task via `prefetchExecutor.execute(task)`, wrapped in `try { … } catch (RejectedExecutionException e) { /* same recovery as DiscardAndCountHandler: complete future exceptionally, bump prefetchSkipped("queue_full"), clearPendingPrefetchIf, set lastRejectionNanos */ }` to handle the post-shutdown race where `closed.set(true)` won the visibility race to `closed.get()` but the executor moved to SHUTDOWN between then and the `execute()` call. The backoff prevents a hot resubmit loop under sustained queue saturation: after a rejection the stream waits 100 ms before re-attempting prefetch submission, while the consumer's normal per-chunk path proceeds at its native rate.
 
-   **Consumer state machine (v7.10).** The trigger predicate requires `chunkNEnd` and a notion of "post-chunk-N read." `CachingInputStream` maintains two new fields:
-   - `private long sequentialReadHighWater = -1L` — sentinel `-1L` means "no sequential read observed yet; prefetch disabled until first sequential or contiguous-positional read". Updated by the **sequential** read path (`InputStream.read()` + `Seekable.read()` after the per-chunk fill completes) to `position + chunkSize`. **Also updated by `PositionedReadable.read(long pos, …)` when `pos == sequentialReadHighWater`** — this captures the contiguous-positional pattern that Parquet/ORC/Iceberg readers use (a sequence of `readFully(pos, …)` calls whose offsets are contiguous). For purely scattered positional reads (`pos != sequentialReadHighWater`), the field is NOT updated — preserves the original "positional reads don't perturb sequential state" intent for random-access workloads.
-   - `private long currentChunkEnd` — derived from `sequentialReadHighWater` rounded up to the nearest chunk boundary; equals `chunkNEnd` in the predicate above. Updated whenever `sequentialReadHighWater` is.
+   **Consumer state machine (v7.11).** The trigger predicate requires `chunkNEnd` and a notion of "post-chunk-N read." `CachingInputStream` maintains:
+   - `private final AtomicLong sequentialReadHighWater = new AtomicLong(-1L)` — sentinel `-1L` means "no read observed yet; prefetch disabled until armed." **AtomicLong (not plain `long`)** because `PositionedReadable.read(long, byte[], int, int)` is contractually thread-safe per Hadoop's `PositionedReadable` javadoc, so any update site within it MUST tolerate concurrent callers. (Plain `long` on 32-bit JVMs allows torn writes per JLS §17.7; on 64-bit JVMs the read-compare-write would lose updates.)
+   - **Updated via CAS** in three sites:
+     1. **Sequential read path** (`InputStream.read()` / `Seekable.read()` after per-chunk fill): `seqHWM.set(position + chunkSize)` — single-threaded per Hadoop FSDataInputStream non-thread-safety contract for sequential ops; plain set is safe and matches CAS semantics under one writer.
+     2. **PositionedReadable.read(long pos, byte[] b, int off, int len)** — CAS-advance: `seqHWM.updateAndGet(prev -> (prev == -1L) ? (pos + len) : (pos == prev) ? (pos + len) : prev)`. Bootstrap from the `-1L` sentinel happens on the FIRST positional call regardless of `pos` (so a `readFully(0, …)` first call arms the state machine). Subsequent positional calls advance the HWM only when the call is contiguous (pos == prev HWM); scattered calls leave it unchanged.
+     3. **Seekable.seek(long)**: `seqHWM.set(-1L)` — resets so the next read on the new region re-arms.
+   - `currentChunkEnd` is **derived inline** from `seqHWM.get()` rounded up to the nearest chunk boundary inside the trigger predicate — NOT a separate field (eliminates the v7.10 "two writers, two fields" race).
 
-   `Seekable.seek(long)` resets `sequentialReadHighWater = -1L` (so the next sequential or contiguous-positional read re-arms the state machine starting at the seek target), then runs the §step 8 invalidation. **`Seekable.getPos()` reads `position` (NOT `sequentialReadHighWater`)** — the Hadoop `Seekable.getPos()` contract requires the current byte cursor, which is unchanged by v7.10. Field-level javadoc on both new fields restates the single-writer (consumer thread) invariant.
+   **`Seekable.getPos()` reads `position`** (the Hadoop byte-cursor contract is unchanged from current impl). The HWM is a prefetch-only internal field with no external observers.
 
-   Trigger predicate amended to require `sequentialReadHighWater > 0`:
+   Trigger predicate amended (gated on the HWM being armed):
    ```
-   pendingPrefetch == null && sequentialReadHighWater > 0 && position >= currentChunkEnd - (loadQuantum * triggerTailFraction) && …
+   long hwm = seqHWM.get();
+   if (pendingPrefetch == null && hwm > 0
+       && position >= ((hwm + chunkSize - 1) / chunkSize) * chunkSize - (loadQuantum * triggerTailFraction)
+       && /* readPct + admissionGate + backoff … */) { … }
    ```
-   This gates prefetch on observed sequentiality or contiguous-positional access; purely scattered positional consumers never trigger it. Acceptance tests: (a) 1000 scattered `readFully(pos, …)` calls produce `prefetchBytes == 0`; (b) 1000 contiguous `readFully(pos, …)` calls (pos increases by chunkSize each iteration) trigger prefetch on the same cadence as a sequential `read(…)` loop.
+   Acceptance tests: (a) 1000 scattered `readFully(pos, …)` calls (pos values randomly distributed) produce `prefetchBytes == 0`; (b) 1000 contiguous `readFully(pos, …)` calls starting at `pos=0` with `pos += chunkSize` each iteration trigger prefetch on the same cadence as a sequential `read(…)` loop — sentinel-bootstrap is exercised on the first iteration; (c) 8 threads each issuing `readFully(threadIdx*chunkSize, …)` then `readFully((threadIdx+1)*chunkSize, …)` (interleaved contiguous patterns) — no HWM corruption, no negative HWM, eventual monotonicity over a contiguous prefix; verifies the CAS-advance contract.
+
+   Field javadoc: `/** Prefetch-only high-water-mark. Multi-writer via CAS: PositionedReadable.read is contractually thread-safe in Hadoop, so any update site within it uses updateAndGet. Sequential read path is single-writer per Hadoop FSDataInputStream contract and uses plain set; the CAS contract still holds under one writer. Sentinel -1L disables prefetch arming. */`.
 
    `triggerTailFraction` is a per-bootstrap config `fs.cached.prefetch.trigger-tail-fraction` (default `0.5` — submit when the consumer is past the chunk midpoint), exposed as a static read once at bootstrap install.
 
