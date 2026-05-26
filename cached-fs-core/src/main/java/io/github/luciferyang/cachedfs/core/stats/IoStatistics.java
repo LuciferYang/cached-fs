@@ -15,7 +15,11 @@
  */
 package io.github.luciferyang.cachedfs.core.stats;
 
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Per-reader IO counters. Mirrors velox {@code IoStatistics} (velox/common/io/IoStatistics.h),
@@ -26,6 +30,21 @@ import java.util.concurrent.atomic.AtomicLong;
  * as a whole did (number of new entries, evictions, etc.).
  */
 public final class IoStatistics {
+
+  private static final Logger LOG = LoggerFactory.getLogger(IoStatistics.class);
+
+  /**
+   * Phase 5c prefetch-skipped reason buckets. Fixed set so the metrics surface has bounded
+   * cardinality. Unknown reasons silently route to {@code "other"} AND log a deduped WARN once per
+   * unknown key (via {@link #seenUnknownReasons}) so contributor bugs (new rejection mode lacking a
+   * registered reason) surface rather than getting silently absorbed.
+   */
+  private static final String[] PREFETCH_SKIPPED_REASONS = {
+    "queue_full", "budget", "heap_pressure", "other"
+  };
+
+  private static final java.util.Set<String> KNOWN_PREFETCH_SKIPPED_REASONS =
+      java.util.Set.of(PREFETCH_SKIPPED_REASONS);
 
   /**
    * Shared off-switch sentinel. All {@code inc*} calls short-circuit; all getters return 0.
@@ -58,6 +77,34 @@ public final class IoStatistics {
   private final AtomicLong coalescedSsdLoadLatencyUs = new AtomicLong();
   private final AtomicLong coalescedStorageLoadLatencyUs = new AtomicLong();
 
+  // --- Phase 5c counters -------------------------------------------------
+
+  /**
+   * Bytes skipped by reason. Reason set is fixed at construction (see {@link
+   * #PREFETCH_SKIPPED_REASONS}); unknown reasons route to {@code "other"} with a deduped WARN.
+   * Reason → AtomicLong; the map structure is immutable, only the AtomicLong values mutate.
+   */
+  private final Map<String, AtomicLong> prefetchSkippedByReason;
+
+  /** Set of unknown reason strings already WARN-logged; bounded by unique typos. */
+  private final java.util.Map<String, Boolean> seenUnknownReasons = new ConcurrentHashMap<>();
+
+  /** Bytes prefetched then evicted by TTL before the consumer's await could observe them. */
+  private final AtomicLong prefetchEvictedBeforeUse = new AtomicLong();
+
+  /**
+   * Bytes the admission gate suppressed when the density predicate ({@code readPct &lt; threshold})
+   * was the sole reason a position-eligible, backoff-elapsed chunk was dropped. Union signal — see
+   * §Decisions §6 in the reader-glue plan for operator-attribution guidance.
+   */
+  private final AtomicLong prefetchEligibleSuppressedBytes = new AtomicLong();
+
+  /**
+   * Count of regime-change resets on the sequential read path's HWM CAS loop (Phase 5c). Bumped
+   * exactly once per logical regime-change event regardless of CAS retries.
+   */
+  private final AtomicLong seqHwmRegimeResets = new AtomicLong();
+
   /** Default constructor — counters are live and writable. */
   public IoStatistics() {
     this(false);
@@ -65,6 +112,11 @@ public final class IoStatistics {
 
   private IoStatistics(boolean disabled) {
     this.disabled = disabled;
+    Map<String, AtomicLong> reasons = new java.util.HashMap<>();
+    for (String reason : PREFETCH_SKIPPED_REASONS) {
+      reasons.put(reason, new AtomicLong());
+    }
+    this.prefetchSkippedByReason = Map.copyOf(reasons);
   }
 
   public void incRamHit(long bytes) {
@@ -124,6 +176,64 @@ public final class IoStatistics {
   public void incCoalescedStorageLoadLatencyUs(long us) {
     if (disabled) return;
     coalescedStorageLoadLatencyUs.addAndGet(us);
+  }
+
+  // --- Phase 5c inc methods ----------------------------------------------
+
+  /**
+   * Bumps the prefetch-skipped counter for {@code reason} by {@code bytes}. Unknown reasons
+   * silently route to the {@code "other"} bucket AND log a deduped WARN once per unknown key.
+   */
+  public void incPrefetchSkipped(String reason, long bytes) {
+    if (disabled) return;
+    AtomicLong c = prefetchSkippedByReason.get(reason);
+    if (c == null) {
+      if (seenUnknownReasons.putIfAbsent(reason, Boolean.TRUE) == null) {
+        LOG.warn(
+            "unknown prefetchSkipped reason '{}' routed to 'other' bucket — register it in"
+                + " PREFETCH_SKIPPED_REASONS",
+            reason);
+      }
+      c = prefetchSkippedByReason.get("other");
+    }
+    c.addAndGet(bytes);
+  }
+
+  public void incPrefetchEvictedBeforeUse(long bytes) {
+    if (disabled) return;
+    prefetchEvictedBeforeUse.addAndGet(bytes);
+  }
+
+  public void incPrefetchEligibleSuppressed(long bytes) {
+    if (disabled) return;
+    prefetchEligibleSuppressedBytes.addAndGet(bytes);
+  }
+
+  public void incSeqHwmRegimeResets() {
+    if (disabled) return;
+    seqHwmRegimeResets.incrementAndGet();
+  }
+
+  /** Reason → bytes view of the prefetchSkipped buckets. Live, not a snapshot. */
+  public Map<String, AtomicLong> prefetchSkippedByReasonView() {
+    return prefetchSkippedByReason;
+  }
+
+  public long prefetchSkipped(String reason) {
+    AtomicLong c = prefetchSkippedByReason.get(reason);
+    return c == null ? 0L : c.get();
+  }
+
+  public long prefetchEvictedBeforeUse() {
+    return prefetchEvictedBeforeUse.get();
+  }
+
+  public long prefetchEligibleSuppressedBytes() {
+    return prefetchEligibleSuppressedBytes.get();
+  }
+
+  public long seqHwmRegimeResets() {
+    return seqHwmRegimeResets.get();
   }
 
   public long ramHit() {

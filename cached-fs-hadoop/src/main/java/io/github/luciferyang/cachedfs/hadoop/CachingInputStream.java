@@ -30,6 +30,8 @@ import io.github.luciferyang.cachedfs.core.tracker.ScanTracker;
 import io.github.luciferyang.cachedfs.core.tracker.TrackingId;
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
@@ -79,6 +81,41 @@ public final class CachingInputStream extends InputStream
   private final int coalesceMaxChunksPerGroup;
   private final int coalesceMaxRestarts;
 
+  // --- Phase 5c prefetch state (no callers in this commit; wired in next) -
+
+  /**
+   * In-flight prefetch handle (key, not pin — Phase 5c key-not-pin design). VarHandle CAS is used
+   * to coordinate submission vs rejection-handler reset; the helper {@link
+   * #clearPendingPrefetchIf(CompletableFuture)} is the single mutation surface from sibling classes
+   * ({@link PrefetchTask}, {@link DiscardAndCountHandler}).
+   */
+  private volatile CompletableFuture<io.github.luciferyang.cachedfs.core.RawFileCacheKey>
+      pendingPrefetch;
+
+  /** Package-private; sibling classes use {@link #clearPendingPrefetchIf}. */
+  static final VarHandle PENDING_VH;
+
+  static {
+    try {
+      PENDING_VH =
+          MethodHandles.lookup()
+              .findVarHandle(CachingInputStream.class, "pendingPrefetch", CompletableFuture.class);
+    } catch (ReflectiveOperationException ex) {
+      throw new ExceptionInInitializerError(ex);
+    }
+  }
+
+  /**
+   * Per-stream nanoTime of the last rejection-handler bump. Read by the admission gate to enforce a
+   * per-stream backoff after a saturated-queue rejection. Initialized in the constructor as {@code
+   * System.nanoTime() - REJECTION_BACKOFF_NS - 1} so the first prefetch attempt is never
+   * back-pressured AND the static-sentinel overflow edge (146-year uptime) is avoided. Volatile for
+   * defense-in-depth: write site (rejection handler) and read site (admission gate) BOTH run on the
+   * consumer thread per the {@link ThreadPoolExecutor} synchronous-on-submit-thread invariant, but
+   * {@code volatile} removes the assumption against a future executor wrapper.
+   */
+  volatile long lastRejectionNanos;
+
   // volatile so a caller who holds a raw CachingInputStream reference (bypassing
   // FSDataInputStream's own monitor) cannot observe a torn 64-bit read on JVMs where long writes
   // are not atomic. Cost is one fence per access; the I/O dwarfs it.
@@ -118,6 +155,51 @@ public final class CachingInputStream extends InputStream
     this.coalesceMaxGapBytes = coalesceMaxGapBytes;
     this.coalesceMaxChunksPerGroup = coalesceMaxChunksPerGroup;
     this.coalesceMaxRestarts = coalesceMaxRestarts;
+    // Place lastRejectionNanos far in the past so the very first prefetch attempt is never
+    // back-pressured. Constructor-time computation avoids the overflow edge of a static sentinel.
+    this.lastRejectionNanos = System.nanoTime() - 1_000_000_000L;
+  }
+
+  // --- Phase 5c sibling helpers (package-private; called by PrefetchTask + Handler) -
+
+  /**
+   * CAS-resets the {@link #pendingPrefetch} slot to null iff its current value is {@code expected}.
+   * Safe no-op if a peer already replaced the slot. Used by {@link PrefetchTask#run} and {@link
+   * DiscardAndCountHandler} to release ownership of the CAS slot without exposing the underlying
+   * {@link VarHandle} cross-class.
+   */
+  void clearPendingPrefetchIf(CompletableFuture<?> expected) {
+    PENDING_VH.compareAndSet(this, expected, null);
+  }
+
+  /** Sibling-class setter for the per-stream rejection backoff timestamp. */
+  void setLastRejectionNanos(long nanos) {
+    this.lastRejectionNanos = nanos;
+  }
+
+  /**
+   * Package-private static extracted from the original instance {@code fillExclusive} so {@link
+   * PrefetchTask} can fill cache entries without duplicating the preadv logic. The instance method
+   * below is now a thin wrapper around this static so the existing read path is unchanged.
+   */
+  static void fillExclusive(
+      ReadFile readFile, CachePin exclusivePin, long chunkStart, int chunkSize) throws IOException {
+    CacheEntry entry = exclusivePin.entry();
+    List<ByteBuffer> ranges = entry.dataRanges(chunkSize);
+    try {
+      readFile.preadv(chunkStart, ranges);
+    } catch (IOException | RuntimeException | Error ex) {
+      // Release the failed exclusive so waiters retry instead of deadlocking on the promise.
+      // OutOfMemoryError from preadv would otherwise leak the exclusive pin, leaving the cache
+      // slot in EXCLUSIVE state forever — every future findOrCreate for that key would block on
+      // the promise that no thread will complete.
+      try {
+        exclusivePin.close();
+      } catch (RuntimeException | Error suppressed) {
+        ex.addSuppressed(suppressed);
+      }
+      throw ex;
+    }
   }
 
   // --- InputStream ---------------------------------------------------------
@@ -577,22 +659,7 @@ public final class CachingInputStream extends InputStream
 
   private void fillExclusive(CachePin exclusivePin, long chunkStart, int chunkSize)
       throws IOException {
-    CacheEntry entry = exclusivePin.entry();
-    List<ByteBuffer> ranges = entry.dataRanges(chunkSize);
-    try {
-      handle.readFile().preadv(chunkStart, ranges);
-    } catch (IOException | RuntimeException | Error ex) {
-      // Release the failed exclusive so waiters retry instead of deadlocking on the promise.
-      // Catching Error too: an OutOfMemoryError from preadv would otherwise leak the
-      // exclusive pin, leaving the cache slot in EXCLUSIVE state forever — every future
-      // findOrCreate for that key would block on the promise that no thread will complete.
-      try {
-        exclusivePin.close();
-      } catch (RuntimeException | Error suppressed) {
-        ex.addSuppressed(suppressed);
-      }
-      throw ex;
-    }
+    fillExclusive(handle.readFile(), exclusivePin, chunkStart, chunkSize);
   }
 
   private static void copyOutOfEntry(
