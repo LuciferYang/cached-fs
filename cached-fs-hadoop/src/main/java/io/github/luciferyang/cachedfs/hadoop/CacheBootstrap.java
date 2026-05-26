@@ -105,6 +105,15 @@ public final class CacheBootstrap {
   private final AtomicInteger staleSlotWarnCount = new AtomicInteger();
 
   /**
+   * Phase 5b seam — production default is {@code HadoopReadFile::new}. Volatile so a test-only swap
+   * via {@link #setReadFileFactoryForTesting(ReadFileFactory)} is visible to the next {@code
+   * openHandleForKey} on any thread. Single-writer-at-a-time in practice (Surefire default
+   * forkCount=1, reuseForks=true); tests with parallel execution should serialize on this slot via
+   * {@code @Execution(SAME_THREAD)}.
+   */
+  private volatile ReadFileFactory readFileFactory = HadoopReadFile::new;
+
+  /**
    * Live opener registry, keyed by {@code scheme://authority}. Each {@link CachedFileSystem}
    * instance owns exactly one entry for the lifetime of its initialize/close pair. The {@link
    * FileHandleFactory}'s generator dispatches into this map at handle-open time.
@@ -390,6 +399,34 @@ public final class CacheBootstrap {
 
   public int loadQuantumBytes() {
     return loadQuantumBytes;
+  }
+
+  /**
+   * Returns the current {@link ReadFileFactory}. Called by {@code
+   * CachedFileSystem.openHandleForKey} on every {@code FileHandleFactory} miss to materialize the
+   * underlying {@code ReadFile}.
+   */
+  public ReadFileFactory readFileFactory() {
+    return readFileFactory;
+  }
+
+  /**
+   * Test-only mutator: swaps the production {@link ReadFileFactory} for a stub and returns an
+   * {@link AutoCloseable} that restores the prior factory on close. Use as {@code try (var ignored
+   * = bootstrap.setReadFileFactoryForTesting(stub)) { … }} so a test crash inside the block does
+   * not leave a stale factory installed for the next test.
+   *
+   * <p><b>NOT thread-safe.</b> Concurrent test threads invoking this seam can race on the captured
+   * {@code prior} reference. Repository's Surefire default ({@code forkCount=1, reuseForks=true},
+   * NO {@code parallel}) already serializes test execution; tests that opt into Surefire {@code
+   * parallel=classes} or {@code threadCount>1} MUST annotate the seam-using test class with
+   * {@code @Execution(SAME_THREAD)}.
+   */
+  AutoCloseable setReadFileFactoryForTesting(ReadFileFactory factory) {
+    Objects.requireNonNull(factory, "factory");
+    ReadFileFactory prior = this.readFileFactory;
+    this.readFileFactory = factory;
+    return () -> this.readFileFactory = prior;
   }
 
   /**

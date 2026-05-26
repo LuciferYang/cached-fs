@@ -18,6 +18,7 @@ package io.github.luciferyang.cachedfs.hadoop;
 import io.github.luciferyang.cachedfs.core.AsyncDataCache;
 import io.github.luciferyang.cachedfs.core.CacheEntry;
 import io.github.luciferyang.cachedfs.core.CachePin;
+import io.github.luciferyang.cachedfs.core.CoalesceIo;
 import io.github.luciferyang.cachedfs.core.FindResult;
 import io.github.luciferyang.cachedfs.core.RawFileCacheKey;
 import io.github.luciferyang.cachedfs.core.handle.CachedFactory;
@@ -30,6 +31,7 @@ import io.github.luciferyang.cachedfs.core.tracker.TrackingId;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
@@ -71,6 +73,12 @@ public final class CachingInputStream extends InputStream
   private final AggregatedIoStatistics aggregateIoStats;
   private final AtomicBoolean aggregated = new AtomicBoolean();
 
+  // Phase 5b coalescing knobs — captured at open time from the Configuration.
+  private final boolean coalesceEnabled;
+  private final int coalesceMaxGapBytes;
+  private final int coalesceMaxChunksPerGroup;
+  private final int coalesceMaxRestarts;
+
   // volatile so a caller who holds a raw CachingInputStream reference (bypassing
   // FSDataInputStream's own monitor) cannot observe a torn 64-bit read on JVMs where long writes
   // are not atomic. Cost is one fence per access; the I/O dwarfs it.
@@ -87,7 +95,11 @@ public final class CachingInputStream extends InputStream
       ScanTracker tracker,
       TrackingId trackingId,
       IoStatistics ioStats,
-      AggregatedIoStatistics aggregateIoStats) {
+      AggregatedIoStatistics aggregateIoStats,
+      boolean coalesceEnabled,
+      int coalesceMaxGapBytes,
+      int coalesceMaxChunksPerGroup,
+      int coalesceMaxRestarts) {
     this.handlePtr = handlePtr;
     this.handle = handlePtr.value();
     this.cache = cache;
@@ -102,6 +114,10 @@ public final class CachingInputStream extends InputStream
     this.trackingId = trackingId;
     this.ioStats = ioStats;
     this.aggregateIoStats = aggregateIoStats;
+    this.coalesceEnabled = coalesceEnabled;
+    this.coalesceMaxGapBytes = coalesceMaxGapBytes;
+    this.coalesceMaxChunksPerGroup = coalesceMaxChunksPerGroup;
+    this.coalesceMaxRestarts = coalesceMaxRestarts;
   }
 
   // --- InputStream ---------------------------------------------------------
@@ -240,6 +256,29 @@ public final class CachingInputStream extends InputStream
     // TrackingId.EMPTY; incRead is a no-op on IoStatistics.NO_OP.
     tracker.recordReference(trackingId, length);
     ioStats.incRead(length);
+
+    // Phase 5b: if the read crosses 2+ chunks AND coalescing is enabled, attempt the coalesce
+    // path. Falls back to per-chunk on Waiting-driven restart exhaustion.
+    long firstChunkStart = (pos / loadQuantum) * (long) loadQuantum;
+    long endExclusive = pos + length;
+    long lastChunkStart = ((endExclusive - 1) / loadQuantum) * (long) loadQuantum;
+    int chunkCount = (int) ((lastChunkStart - firstChunkStart) / loadQuantum) + 1;
+
+    if (coalesceEnabled && chunkCount >= 2) {
+      for (int restart = 0; restart <= coalesceMaxRestarts; restart++) {
+        CoalesceOutcome outcome = readCoalesced(pos, dst, off, length, firstChunkStart, chunkCount);
+        if (outcome == CoalesceOutcome.OK) {
+          tracker.recordRead(trackingId, length);
+          return;
+        }
+        // RESTART: pins released, waited-on future completed; loop and try again.
+      }
+      // Bound exceeded — fall through to the per-chunk path below. This is correctness-preserving;
+      // we just lose the coalesce benefit on this read. ioStats.read was already incremented
+      // above, so we don't double-count.
+    }
+
+    // Per-chunk fallback (also handles single-chunk reads and the disabled-coalesce path).
     long cursor = pos;
     int dstCursor = off;
     int remaining = length;
@@ -257,6 +296,230 @@ public final class CachingInputStream extends InputStream
     // request via the loop or throw). recordRead drives readPct() / adjustedReadPct() in the
     // tracker; the prefetch admission gate (Phase 5c) reads those values to gate prefetch.
     tracker.recordRead(trackingId, length);
+  }
+
+  // --- coalesce path (Phase 5b) -------------------------------------------
+
+  /** Outcome of a single coalesce attempt — caller decides whether to retry or move on. */
+  private enum CoalesceOutcome {
+    /** All chunks served; bytes copied into the destination. */
+    OK,
+    /**
+     * A {@link FindResult.Waiting} forced us to release pins and await a peer fill. Caller restarts
+     * the walk from scratch (up to {@code coalesceMaxRestarts}).
+     */
+    RESTART
+  }
+
+  /**
+   * One chunk slot in the walk + classify list. Holds a single pin: the original Hit/Exclusive pin
+   * on entry; replaced in-place with the promoted Shared pin after preadv completes successfully.
+   * Setting {@code pin = null} releases ownership (used after {@code close} in the finally block to
+   * avoid double-close).
+   */
+  private static final class Resolved {
+    final long chunkStart;
+    final int chunkSize;
+
+    /** True if this slot needs filling via preadv; false for already-cached Hit. */
+    final boolean exclusive;
+
+    CachePin pin;
+
+    Resolved(long chunkStart, int chunkSize, boolean exclusive, CachePin pin) {
+      this.chunkStart = chunkStart;
+      this.chunkSize = chunkSize;
+      this.exclusive = exclusive;
+      this.pin = pin;
+    }
+  }
+
+  /**
+   * One attempt at the coalesce path. On {@link CoalesceOutcome#RESTART} all pins acquired in this
+   * attempt have been released and the awaited future has completed; the caller re-issues {@link
+   * #readCoalesced} to walk-classify-coalesce again from {@code firstChunkStart}.
+   */
+  private CoalesceOutcome readCoalesced(
+      long pos, byte[] dst, int off, int length, long firstChunkStart, int chunkCount)
+      throws IOException {
+    List<Resolved> resolved = new ArrayList<>(chunkCount);
+    CompletableFuture<Void> waitOn = null;
+    boolean copyDone = false;
+    try {
+      // Step 1: Walk + classify. Acquire pins for Hit/Exclusive, abort on Waiting.
+      for (int i = 0; i < chunkCount; i++) {
+        long chunkStart = firstChunkStart + (long) i * loadQuantum;
+        int chunkSize = (int) Math.min((long) loadQuantum, fileSize - chunkStart);
+        RawFileCacheKey key = new RawFileCacheKey(fileNum, chunkStart);
+        FindResult r = cache.findOrCreate(key, chunkSize, /* contiguous= */ false);
+        switch (r) {
+          case FindResult.Hit hit ->
+              resolved.add(new Resolved(chunkStart, chunkSize, /* exclusive= */ false, hit.pin()));
+          case FindResult.Exclusive ex ->
+              resolved.add(new Resolved(chunkStart, chunkSize, /* exclusive= */ true, ex.pin()));
+          case FindResult.Waiting w -> {
+            waitOn = w.future();
+          }
+        }
+        if (waitOn != null) break;
+      }
+
+      if (waitOn != null) {
+        // Abort sub-routine: release pins (ascending offset), then await the future, then signal
+        // restart. Failures during release are suppressed onto the await exception (if any).
+        IOException releaseFailure = closeAllPinsCollect(resolved);
+        try {
+          awaitFuture(waitOn);
+        } catch (IOException ex) {
+          if (releaseFailure != null) ex.addSuppressed(releaseFailure);
+          throw ex;
+        }
+        if (releaseFailure != null) throw releaseFailure;
+        // Pins were released; clear so the finally block doesn't try again.
+        for (Resolved r : resolved) r.pin = null;
+        return CoalesceOutcome.RESTART;
+      }
+
+      // Step 2-3: Coalesce consecutive Exclusives and issue preadv per group; record overread.
+      fillCoalescedExclusives(resolved);
+
+      // Step 4: Promote each Exclusive to Shared. On any throw, the failed exclusive is closed
+      // inside the helper; the finally block below cleans up the rest.
+      promoteExclusivesToShared(resolved);
+
+      // Step 5: Copy bytes out of the now-Shared (and Hit) entries.
+      copyFromResolved(resolved, pos, dst, off, length);
+      copyDone = true;
+      return CoalesceOutcome.OK;
+    } finally {
+      // Close every pin still owned by `resolved` (Hit pins; Shared pins from successful promotion;
+      // un-promoted Exclusives left over after a mid-step failure). Best-effort: collect into the
+      // already-propagating exception via the JVM's default suppression machinery.
+      for (Resolved r : resolved) {
+        if (r.pin != null) {
+          try {
+            r.pin.close();
+          } catch (RuntimeException | Error ignored) {
+            // Throwing again here would mask the original exception. Tests assert
+            // PinLeakAssertions.assertNoLeak() so a genuine leak would surface there.
+          }
+        }
+      }
+      if (!copyDone && waitOn == null) {
+        // Unexpected exception path: ensure ioStats reflects what we did attempt. recordRead
+        // happens in the caller only on OK; failed reads do NOT bump readBytes-consumed since
+        // the consumer has no usable bytes yet.
+      }
+    }
+  }
+
+  /**
+   * Coalesces consecutive {@code exclusive} entries in {@code resolved} (preserving offset order)
+   * and issues one {@code preadv} per group via the {@link CoalesceIo} helper. Adjacent Hit entries
+   * split groups. Throws on the FIRST preadv failure; entries in the failed group keep their
+   * Exclusive pins (caller's finally closes them).
+   */
+  private void fillCoalescedExclusives(List<Resolved> resolved) throws IOException {
+    int n = resolved.size();
+    int i = 0;
+    while (i < n) {
+      if (!resolved.get(i).exclusive) {
+        i++;
+        continue;
+      }
+      // Find the end of the contiguous Exclusive run, bounded by coalesceMaxChunksPerGroup.
+      int j = i + 1;
+      while (j < n && resolved.get(j).exclusive && (j - i) < coalesceMaxChunksPerGroup) {
+        j++;
+      }
+      int groupCount = j - i;
+      final int start = i;
+      ReadFile readFile = handle.readFile();
+      CoalesceIo.CoalesceIoStats stats =
+          CoalesceIo.coalesce(
+              groupCount,
+              k -> resolved.get(start + k).chunkStart,
+              k -> resolved.get(start + k).chunkSize,
+              k ->
+                  resolved.get(start + k).pin.entry().dataRanges(resolved.get(start + k).chunkSize),
+              coalesceMaxGapBytes,
+              groupCount, // already bounded by the outer loop; per-call cap == group size
+              readFile::preadv);
+      // CoalesceIo's extraBytes is the gap bytes the coalescer absorbed (0 for adjacent chunks).
+      if (stats.extraBytes() > 0) {
+        ioStats.incRawOverreadBytes(stats.extraBytes());
+      }
+      i = j;
+    }
+  }
+
+  /**
+   * Promotes every Exclusive in {@code resolved} to Shared via {@link CachePin#exclusiveToShared}.
+   * Mutates the list in-place: {@code resolved[k].pin} becomes the Shared pin on success. On any
+   * throw, closes the failing Exclusive and leaves earlier already-promoted Shared pins in place
+   * for the caller's finally to clean up.
+   */
+  private void promoteExclusivesToShared(List<Resolved> resolved) {
+    for (Resolved r : resolved) {
+      if (!r.exclusive) continue;
+      CachePin excPin = r.pin;
+      CachePin shared;
+      try {
+        shared = excPin.exclusiveToShared(/* ssdSavable= */ true);
+      } catch (RuntimeException | Error ex) {
+        try {
+          excPin.close();
+        } catch (RuntimeException | Error suppressed) {
+          ex.addSuppressed(suppressed);
+        }
+        r.pin = null; // we just closed it; finally must not double-close
+        throw ex;
+      }
+      r.pin = shared;
+    }
+  }
+
+  /** Copies the requested byte range out of every {@link Resolved} entry into {@code dst}. */
+  private static void copyFromResolved(
+      List<Resolved> resolved, long pos, byte[] dst, int off, int length) {
+    long cursor = pos;
+    int dstCursor = off;
+    int remaining = length;
+    for (Resolved r : resolved) {
+      if (remaining == 0) break;
+      int withinChunk = (int) (cursor - r.chunkStart);
+      int copyLen = Math.min(remaining, r.chunkSize - withinChunk);
+      copyOutOfEntry(r.pin.entry(), withinChunk, copyLen, dst, dstCursor);
+      cursor += copyLen;
+      dstCursor += copyLen;
+      remaining -= copyLen;
+    }
+    if (remaining != 0) {
+      throw new IllegalStateException(
+          "copyFromResolved under-read: remaining=" + remaining + " expected=0");
+    }
+  }
+
+  /**
+   * Releases all pins in {@code resolved} in ascending offset order (their natural order in the
+   * list). Returns the first failure wrapped as IOException (with subsequent failures attached as
+   * suppressed), or {@code null} if every release succeeded. Used by the abort sub-routine. {@link
+   * CachePin#close} declares no checked exceptions; we catch {@link RuntimeException} and {@link
+   * Error} for defense-in-depth and surface them as {@link IOException} so the consumer sees a
+   * checked exception consistent with the rest of the read path.
+   */
+  private static IOException closeAllPinsCollect(List<Resolved> resolved) {
+    IOException primary = null;
+    for (Resolved r : resolved) {
+      if (r.pin == null) continue;
+      try {
+        r.pin.close();
+      } catch (RuntimeException | Error ex) {
+        if (primary == null) primary = new IOException("pin release failure", ex);
+        else primary.addSuppressed(ex);
+      }
+    }
+    return primary;
   }
 
   /**

@@ -19,6 +19,7 @@ import io.github.luciferyang.cachedfs.core.handle.CachedFactory;
 import io.github.luciferyang.cachedfs.core.handle.FileHandle;
 import io.github.luciferyang.cachedfs.core.id.StringIdLease;
 import io.github.luciferyang.cachedfs.core.id.StringIdMap;
+import io.github.luciferyang.cachedfs.core.io.ReadFile;
 import io.github.luciferyang.cachedfs.core.stats.IoStatistics;
 import io.github.luciferyang.cachedfs.core.tracker.ScanTracker;
 import io.github.luciferyang.cachedfs.core.tracker.TrackingId;
@@ -218,6 +219,17 @@ public final class CachedFileSystem extends FilterFileSystem {
       // ids exceed 2^29).
       int fileNumNode = Murmur3.fmix32((int) ptr.value().fileNum()) & ((1 << 29) - 1);
       TrackingId trackingId = TrackingId.of(fileNumNode, 0);
+      // Phase 5b: capture coalesce knobs at open time. Auto-disable on small caches per the
+      // coalesce.enabled resolver (cap==2 AND always-on=false → off). totalRamBytes proxies via
+      // the JVM heap budget — AsyncDataCache has no fixed capacity getter today; for the
+      // auto-disable rule, heap-budget is a reasonable upper bound on what the cache can hold.
+      long totalRamBytes = Runtime.getRuntime().maxMemory();
+      boolean coalesceEnabled =
+          CachedFsConfig.coalesceEnabled(conf, totalRamBytes, b.loadQuantumBytes());
+      int maxGap = CachedFsConfig.coalesceMaxGapBytes(conf, b.loadQuantumBytes());
+      int maxChunksPerGroup =
+          CachedFsConfig.coalesceMaxChunksPerGroup(conf, totalRamBytes, b.loadQuantumBytes());
+      int maxRestarts = CachedFsConfig.coalesceMaxRestarts(conf);
       cis =
           new CachingInputStream(
               ptr,
@@ -226,7 +238,11 @@ public final class CachedFileSystem extends FilterFileSystem {
               tracker,
               trackingId,
               ioStats,
-              b.aggregateIoStats());
+              b.aggregateIoStats(),
+              coalesceEnabled,
+              maxGap,
+              maxChunksPerGroup,
+              maxRestarts);
       ptrTransferred = true;
       return new FSDataInputStream(cis);
     } catch (java.io.UncheckedIOException ex) {
@@ -373,7 +389,15 @@ public final class CachedFileSystem extends FilterFileSystem {
     Path p = new Path(fileUri);
     FileStatus status = fs.getFileStatus(p);
     long size = status.getLen();
-    HadoopReadFile rf = new HadoopReadFile(fs, p, key, size);
+    // Phase 5b: route through the bootstrap's ReadFileFactory so tests can swap in a counting
+    // wrapper via setReadFileFactoryForTesting without subclassing CachedFileSystem. Production
+    // path: HadoopReadFile::new, unchanged behavior from prior `new HadoopReadFile(fs, p, key,
+    // size)`.
+    ReadFile rf =
+        CacheBootstrap.get()
+            .orElseThrow(() -> new IllegalStateException("CacheBootstrap missing"))
+            .readFileFactory()
+            .create(fs, p, key, size);
     try {
       StringIdMap ids =
           CacheBootstrap.get()

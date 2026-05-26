@@ -160,6 +160,52 @@ public final class CachedFsConfig {
 
   public static final boolean DEFAULT_METRICS_ENABLED = true;
 
+  // --- coalescing (Phase 5b) -----------------------------------------------
+
+  /**
+   * {@code fs.cached.coalesce.enabled} — master toggle for multi-chunk coalescing. Default {@code
+   * true}, but auto-disabled when the auto-scaled cap (see {@link #COALESCE_MAX_CHUNKS_PER_GROUP})
+   * reaches 2 AND {@link #COALESCE_ALWAYS_ON} is false — small caches (under ~384 MiB at the
+   * default load quantum) gain nothing from coalescing and pay non-trivial per-call overhead, so
+   * the default flips off automatically.
+   */
+  public static final String COALESCE_ENABLED = "fs.cached.coalesce.enabled";
+
+  public static final boolean DEFAULT_COALESCE_ENABLED = true;
+
+  /**
+   * {@code fs.cached.coalesce.always-on} — when true, ignores the auto-disable rule on small caches
+   * and respects {@link #COALESCE_ENABLED} verbatim. Use only for benchmarking on intentionally
+   * under-sized caches.
+   */
+  public static final String COALESCE_ALWAYS_ON = "fs.cached.coalesce.always-on";
+
+  public static final boolean DEFAULT_COALESCE_ALWAYS_ON = false;
+
+  /**
+   * {@code fs.cached.coalesce.max-gap-bytes} — maximum byte gap absorbed when grouping consecutive
+   * Exclusive chunks for a single {@code preadv}. Default {@code min(512 KiB, loadQuantumBytes /
+   * 16)} — scales down on operators tuning the load quantum small.
+   */
+  public static final String COALESCE_MAX_GAP_BYTES = "fs.cached.coalesce.max-gap-bytes";
+
+  /**
+   * {@code fs.cached.coalesce.max-chunks-per-group} — maximum chunks per coalesced {@code preadv}
+   * call. Default {@code max(2, min(16, totalRamBytes / loadQuantumBytes / 16))}.
+   */
+  public static final String COALESCE_MAX_CHUNKS_PER_GROUP =
+      "fs.cached.coalesce.max-chunks-per-group";
+
+  /**
+   * {@code fs.cached.coalesce.max-restarts} — bound on the abort-and-restart loop when a {@link
+   * io.github.luciferyang.cachedfs.core.FindResult.Waiting Waiting} chunk forces the coalescer to
+   * release its pins and retry. Default {@code 3}; on exceeding, the read falls back to the
+   * per-chunk path and completes correctly without coalescing.
+   */
+  public static final String COALESCE_MAX_RESTARTS = "fs.cached.coalesce.max-restarts";
+
+  public static final int DEFAULT_COALESCE_MAX_RESTARTS = 3;
+
   // --- parsers -------------------------------------------------------------
 
   /** True if {@link #ENABLED} is set to {@code true}. */
@@ -211,6 +257,65 @@ public final class CachedFsConfig {
 
   public static boolean metricsEnabled(Configuration conf) {
     return conf.getBoolean(METRICS_ENABLED, DEFAULT_METRICS_ENABLED);
+  }
+
+  // --- coalescing parsers --------------------------------------------------
+
+  /**
+   * Auto-scaled default cap on chunks-per-group: {@code max(2, min(16, totalRamBytes /
+   * loadQuantumBytes / 16))}. Operators with caches below ~384 MiB get 2; ~2 GiB gets 16.
+   */
+  public static int defaultCoalesceMaxChunksPerGroup(long totalRamBytes, int loadQuantumBytes) {
+    long scaled = totalRamBytes / (long) loadQuantumBytes / 16L;
+    int clamped = (int) Math.min(16L, Math.max(2L, scaled));
+    return clamped;
+  }
+
+  public static int coalesceMaxChunksPerGroup(
+      Configuration conf, long totalRamBytes, int loadQuantumBytes) {
+    int autoDefault = defaultCoalesceMaxChunksPerGroup(totalRamBytes, loadQuantumBytes);
+    int v = conf.getInt(COALESCE_MAX_CHUNKS_PER_GROUP, autoDefault);
+    if (v < 1) {
+      throw new IllegalArgumentException(COALESCE_MAX_CHUNKS_PER_GROUP + " must be >= 1: " + v);
+    }
+    return v;
+  }
+
+  /** Auto-scaled default max-gap: {@code min(512 KiB, loadQuantumBytes / 16)}. */
+  public static int defaultCoalesceMaxGapBytes(int loadQuantumBytes) {
+    return (int) Math.min(512L << 10, loadQuantumBytes / 16L);
+  }
+
+  public static int coalesceMaxGapBytes(Configuration conf, int loadQuantumBytes) {
+    int v = conf.getInt(COALESCE_MAX_GAP_BYTES, defaultCoalesceMaxGapBytes(loadQuantumBytes));
+    if (v < 0) {
+      throw new IllegalArgumentException(COALESCE_MAX_GAP_BYTES + " must be >= 0: " + v);
+    }
+    return v;
+  }
+
+  public static int coalesceMaxRestarts(Configuration conf) {
+    int v = conf.getInt(COALESCE_MAX_RESTARTS, DEFAULT_COALESCE_MAX_RESTARTS);
+    if (v < 0) {
+      throw new IllegalArgumentException(COALESCE_MAX_RESTARTS + " must be >= 0: " + v);
+    }
+    return v;
+  }
+
+  /**
+   * Resolves the effective coalesce-enabled value: the master toggle gated by the small-cache
+   * auto-disable rule (cap==2 AND always-on=false → disabled).
+   */
+  public static boolean coalesceEnabled(
+      Configuration conf, long totalRamBytes, int loadQuantumBytes) {
+    if (!conf.getBoolean(COALESCE_ENABLED, DEFAULT_COALESCE_ENABLED)) {
+      return false;
+    }
+    if (conf.getBoolean(COALESCE_ALWAYS_ON, DEFAULT_COALESCE_ALWAYS_ON)) {
+      return true;
+    }
+    int cap = coalesceMaxChunksPerGroup(conf, totalRamBytes, loadQuantumBytes);
+    return cap > 2;
   }
 
   public static int handleCacheCapacity(Configuration conf) {
