@@ -133,7 +133,7 @@
        CachingInputStream.fillExclusive(readFile, excPin, nextOffset, chunkSize);  // preadv via PrefetchTask's readFile field
        excPin.exclusiveToShared(true).close();
      } catch (Throwable t) {
-       pin.close() (which routes Exclusive pins to CacheShard.releaseFailedExclusive internally; see CachePin.close at line 101-112)(excPin);
+       excPin.close();  // routes to CacheShard.releaseFailedExclusive internally via CachePin.close (line 101-112)
        throw t;
      }
      ioStats.incPrefetch(chunkSize);
