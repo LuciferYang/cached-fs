@@ -255,6 +255,102 @@ class CachedFileSystemTest {
     }
   }
 
+  // --- Phase 5a: tracker + IoStatistics + IOStatisticsSource wiring -----
+
+  @Test
+  @DisplayName("reads bump ScanTracker (referencedBytes + readBytes) and IoStatistics (read+bytes)")
+  void readsUpdateTrackerAndStats(@TempDir java.nio.file.Path dir) throws IOException {
+    byte[] payload = bytes(16 * 1024);
+    java.nio.file.Path file = dir.resolve("trk.bin");
+    Files.write(file, payload);
+
+    Configuration conf = defaultConf();
+    conf.set(CachedFsConfig.SCAN_ID, "scan-track");
+    try (CachedFileSystem cfs = newCfs(file.toUri(), conf)) {
+      Path p = new Path(file.toUri());
+      try (FSDataInputStream in = cfs.open(p, 4096)) {
+        byte[] got = new byte[8192];
+        in.readFully(got);
+        // Aggregate is merged on close, so query the per-stream surface via IOStatistics.
+        org.apache.hadoop.fs.statistics.IOStatistics stats = in.getIOStatistics();
+        assertThat(stats).isNotNull();
+        assertThat(stats.counters().get("stream_read_bytes")).isEqualTo(8192L);
+        assertThat(stats.counters().get("stream_read_operations")).isEqualTo(1L);
+      }
+      // After close, the bootstrap aggregate has the merged values.
+      CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+      assertThat(b.aggregateIoStats().readBytes()).isEqualTo(8192L);
+      assertThat(b.aggregateIoStats().read()).isEqualTo(1L);
+      // The tracker entry exists and reflects the read.
+      assertThat(b.scanTrackerEntries()).isPositive();
+    }
+  }
+
+  @Test
+  @DisplayName("second read of the same chunk records a RAM hit on the per-stream IoStatistics")
+  void cacheHitBumpsRamHitCounter(@TempDir java.nio.file.Path dir) throws IOException {
+    byte[] payload = bytes(4096);
+    java.nio.file.Path file = dir.resolve("hit.bin");
+    Files.write(file, payload);
+
+    try (CachedFileSystem cfs = newCfs(file.toUri(), defaultConf())) {
+      Path p = new Path(file.toUri());
+      // First read populates the cache via Exclusive.
+      try (FSDataInputStream in = cfs.open(p, 4096)) {
+        in.readAllBytes();
+      }
+      // Second read is served by Hit → incRamHit fires per chunk.
+      try (FSDataInputStream in = cfs.open(p, 4096)) {
+        in.readAllBytes();
+        org.apache.hadoop.fs.statistics.IOStatistics stats = in.getIOStatistics();
+        assertThat(stats.counters().get("cachedfs_stream_cache_hit")).isEqualTo(1L);
+        assertThat(stats.counters().get("cachedfs_stream_cache_hit_bytes")).isEqualTo(4096L);
+      }
+    }
+  }
+
+  @Test
+  @DisplayName("fs.cached.metrics.enabled=false routes streams to IoStatistics.NO_OP")
+  void metricsOffSwitchUsesNoOp(@TempDir java.nio.file.Path dir) throws IOException {
+    byte[] payload = bytes(4096);
+    java.nio.file.Path file = dir.resolve("noop.bin");
+    Files.write(file, payload);
+
+    Configuration conf = defaultConf();
+    conf.setBoolean(CachedFsConfig.METRICS_ENABLED, false);
+    try (CachedFileSystem cfs = newCfs(file.toUri(), conf)) {
+      Path p = new Path(file.toUri());
+      try (FSDataInputStream in = cfs.open(p, 4096)) {
+        in.readAllBytes();
+        // NO_OP getters return 0 even after a successful read.
+        org.apache.hadoop.fs.statistics.IOStatistics stats = in.getIOStatistics();
+        assertThat(stats.counters().get("stream_read_bytes")).isZero();
+      }
+    }
+  }
+
+  @Test
+  @DisplayName("fs.cached.scan-tracker.enabled=false routes streams to ScanTracker.DISABLED")
+  void scanTrackerOffSwitch(@TempDir java.nio.file.Path dir) throws IOException {
+    byte[] payload = bytes(4096);
+    java.nio.file.Path file = dir.resolve("disabled.bin");
+    Files.write(file, payload);
+
+    Configuration conf = defaultConf();
+    conf.setBoolean(CachedFsConfig.SCAN_TRACKER_ENABLED, false);
+    try (CachedFileSystem cfs = newCfs(file.toUri(), conf)) {
+      Path p = new Path(file.toUri());
+      try (FSDataInputStream in = cfs.open(p, 4096)) {
+        in.readAllBytes();
+      }
+      // DISABLED tracker never enters scanTrackers; aggregate gauge stays at 0.
+      CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+      assertThat(b.scanTrackerEntries()).isZero();
+      // IoStatistics still records (only the tracker is off-switch'd).
+      assertThat(b.aggregateIoStats().read()).isPositive();
+    }
+  }
+
   // --- helpers -------------------------------------------------------------
 
   private static CachedFileSystem newCfs(URI fileUri, Configuration conf) throws IOException {

@@ -19,6 +19,10 @@ import io.github.luciferyang.cachedfs.core.handle.CachedFactory;
 import io.github.luciferyang.cachedfs.core.handle.FileHandle;
 import io.github.luciferyang.cachedfs.core.id.StringIdLease;
 import io.github.luciferyang.cachedfs.core.id.StringIdMap;
+import io.github.luciferyang.cachedfs.core.stats.IoStatistics;
+import io.github.luciferyang.cachedfs.core.tracker.ScanTracker;
+import io.github.luciferyang.cachedfs.core.tracker.TrackingId;
+import io.github.luciferyang.cachedfs.core.util.Murmur3;
 import java.io.IOException;
 import java.net.URI;
 import org.apache.hadoop.conf.Configuration;
@@ -196,7 +200,33 @@ public final class CachedFileSystem extends FilterFileSystem {
       // installs (or refreshes a remove-in-progress) entry; false when an existing entry was
       // preserved. The return value is dropped — the hook is fire-and-forget on this path.
       b.ttlController().recordOpen(ptr.value().fileNum());
-      cis = new CachingInputStream(ptr, b.ramCache(), b.loadQuantumBytes());
+      // Phase 5a wiring: resolve scanId via ThreadLocal → Configuration → "default", then look up
+      // the tracker. When fs.cached.scan-tracker.enabled=false, substitute ScanTracker.DISABLED so
+      // recordReference/recordRead are no-ops with zero map traffic. metricsEnabled likewise gates
+      // between a fresh per-stream IoStatistics and the shared NO_OP sentinel.
+      Configuration conf = getConf();
+      String scanId = b.currentScanId();
+      if (scanId == null || scanId.isBlank()) {
+        scanId = conf.getTrimmed(CachedFsConfig.SCAN_ID, "default");
+      }
+      ScanTracker tracker =
+          CachedFsConfig.scanTrackerEnabled(conf) ? b.trackerFor(scanId) : ScanTracker.DISABLED;
+      IoStatistics ioStats =
+          CachedFsConfig.metricsEnabled(conf) ? new IoStatistics() : IoStatistics.NO_OP;
+      // per-(scanId, fileNumHash) TrackingId: Murmur3.fmix32 distributes sequential StringIdMap
+      // ids uniformly across the 29-bit bucket space (a raw xor-fold would collide-zero until
+      // ids exceed 2^29).
+      int fileNumNode = Murmur3.fmix32((int) ptr.value().fileNum()) & ((1 << 29) - 1);
+      TrackingId trackingId = TrackingId.of(fileNumNode, 0);
+      cis =
+          new CachingInputStream(
+              ptr,
+              b.ramCache(),
+              b.loadQuantumBytes(),
+              tracker,
+              trackingId,
+              ioStats,
+              b.aggregateIoStats());
       ptrTransferred = true;
       return new FSDataInputStream(cis);
     } catch (java.io.UncheckedIOException ex) {

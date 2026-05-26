@@ -23,6 +23,10 @@ import io.github.luciferyang.cachedfs.core.RawFileCacheKey;
 import io.github.luciferyang.cachedfs.core.handle.CachedFactory;
 import io.github.luciferyang.cachedfs.core.handle.FileHandle;
 import io.github.luciferyang.cachedfs.core.io.ReadFile;
+import io.github.luciferyang.cachedfs.core.stats.AggregatedIoStatistics;
+import io.github.luciferyang.cachedfs.core.stats.IoStatistics;
+import io.github.luciferyang.cachedfs.core.tracker.ScanTracker;
+import io.github.luciferyang.cachedfs.core.tracker.TrackingId;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
@@ -33,6 +37,8 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.hadoop.fs.PositionedReadable;
 import org.apache.hadoop.fs.Seekable;
+import org.apache.hadoop.fs.statistics.IOStatistics;
+import org.apache.hadoop.fs.statistics.IOStatisticsSource;
 
 /**
  * {@link InputStream} that satisfies reads from the RAM cache, populating it on miss from the
@@ -46,7 +52,8 @@ import org.apache.hadoop.fs.Seekable;
  * <p><b>Pin lifetime:</b> chunk pins are acquired and released within a single read call. The
  * stream does not hold pins across calls — that's the cache's job via its LRU.
  */
-public final class CachingInputStream extends InputStream implements Seekable, PositionedReadable {
+public final class CachingInputStream extends InputStream
+    implements Seekable, PositionedReadable, IOStatisticsSource {
 
   private final CachedFactory.CachedPtr<String, FileHandle> handlePtr;
   private final FileHandle handle;
@@ -54,6 +61,15 @@ public final class CachingInputStream extends InputStream implements Seekable, P
   private final int loadQuantum;
   private final long fileSize;
   private final long fileNum;
+
+  // Phase 5a: per-(scanId, file) density tracker + packed TrackingId + per-stream IO counters.
+  // Aggregate sink is the bootstrap-level AggregatedIoStatistics; merged exactly once on close()
+  // via the `aggregated` AtomicBoolean to keep close() idempotent.
+  private final ScanTracker tracker;
+  private final TrackingId trackingId;
+  private final IoStatistics ioStats;
+  private final AggregatedIoStatistics aggregateIoStats;
+  private final AtomicBoolean aggregated = new AtomicBoolean();
 
   // volatile so a caller who holds a raw CachingInputStream reference (bypassing
   // FSDataInputStream's own monitor) cannot observe a torn 64-bit read on JVMs where long writes
@@ -67,7 +83,11 @@ public final class CachingInputStream extends InputStream implements Seekable, P
   CachingInputStream(
       CachedFactory.CachedPtr<String, FileHandle> handlePtr,
       AsyncDataCache cache,
-      int loadQuantum) {
+      int loadQuantum,
+      ScanTracker tracker,
+      TrackingId trackingId,
+      IoStatistics ioStats,
+      AggregatedIoStatistics aggregateIoStats) {
     this.handlePtr = handlePtr;
     this.handle = handlePtr.value();
     this.cache = cache;
@@ -78,6 +98,10 @@ public final class CachingInputStream extends InputStream implements Seekable, P
       throw new java.io.UncheckedIOException(ex);
     }
     this.fileNum = handle.fileNum();
+    this.tracker = tracker;
+    this.trackingId = trackingId;
+    this.ioStats = ioStats;
+    this.aggregateIoStats = aggregateIoStats;
   }
 
   // --- InputStream ---------------------------------------------------------
@@ -124,7 +148,18 @@ public final class CachingInputStream extends InputStream implements Seekable, P
     if (!closed.compareAndSet(false, true)) {
       return;
     }
+    // Merge per-stream stats into the bootstrap aggregate exactly once. The merge contract
+    // requires `ioStats` to be quiescent here — Hadoop's FSDataInputStream.close is non-thread-
+    // safe vs reads, so callers that follow the contract satisfy this. NO_OP merges as zeros.
+    if (aggregated.compareAndSet(false, true)) {
+      aggregateIoStats.add(ioStats);
+    }
     handlePtr.close();
+  }
+
+  @Override
+  public IOStatistics getIOStatistics() {
+    return IoStatisticsAdapter.forStream(ioStats);
   }
 
   // --- Seekable ------------------------------------------------------------
@@ -200,6 +235,11 @@ public final class CachingInputStream extends InputStream implements Seekable, P
    * AsyncDataCache#findOrCreate}.
    */
   private void readFullyFromCache(long pos, byte[] dst, int off, int length) throws IOException {
+    // Phase 5a: record top-of-call signals BEFORE issuing IO so a throw mid-read still reflects
+    // the planned reference. recordReference is a no-op on ScanTracker.DISABLED and on
+    // TrackingId.EMPTY; incRead is a no-op on IoStatistics.NO_OP.
+    tracker.recordReference(trackingId, length);
+    ioStats.incRead(length);
     long cursor = pos;
     int dstCursor = off;
     int remaining = length;
@@ -213,6 +253,10 @@ public final class CachingInputStream extends InputStream implements Seekable, P
       dstCursor += copyLen;
       remaining -= copyLen;
     }
+    // Bottom-of-call: bytes actually consumed equal `length` (we always satisfy the whole
+    // request via the loop or throw). recordRead drives readPct() / adjustedReadPct() in the
+    // tracker; the prefetch admission gate (Phase 5c) reads those values to gate prefetch.
+    tracker.recordRead(trackingId, length);
   }
 
   /**
@@ -229,6 +273,8 @@ public final class CachingInputStream extends InputStream implements Seekable, P
       switch (result) {
         case FindResult.Hit hit -> {
           try (CachePin pin = hit.pin()) {
+            // Sealed-result branch is the canonical hit signal — no separate cache.exists probe.
+            ioStats.incRamHit(copyLen);
             copyOutOfEntry(pin.entry(), withinChunk, copyLen, dst, dstCursor);
             return;
           }
