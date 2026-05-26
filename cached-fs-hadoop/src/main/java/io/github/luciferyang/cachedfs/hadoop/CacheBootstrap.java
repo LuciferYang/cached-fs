@@ -22,6 +22,8 @@ import io.github.luciferyang.cachedfs.core.id.FileIds;
 import io.github.luciferyang.cachedfs.core.id.StringIdLease;
 import io.github.luciferyang.cachedfs.core.id.StringIdMap;
 import io.github.luciferyang.cachedfs.core.ssd.SsdCache;
+import io.github.luciferyang.cachedfs.core.stats.AggregatedIoStatistics;
+import io.github.luciferyang.cachedfs.core.tracker.ScanTracker;
 import io.github.luciferyang.cachedfs.core.ttl.CacheTTLController;
 import java.io.IOException;
 import java.net.URI;
@@ -30,8 +32,11 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import org.apache.hadoop.conf.Configuration;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Per-JVM singleton holder for the cache tiers. Hadoop's {@link
@@ -59,8 +64,18 @@ import org.apache.hadoop.conf.Configuration;
  */
 public final class CacheBootstrap {
 
+  private static final Logger LOG = LoggerFactory.getLogger(CacheBootstrap.class);
   private static final ReentrantLock LOCK = new ReentrantLock();
   private static volatile CacheBootstrap installed;
+
+  /**
+   * Cap on the number of WARN-level stale-slot-recovery log lines per JVM. Beyond this, recoveries
+   * are logged at DEBUG (the {@link AggregatedIoStatistics#staleScanIdRecoveries()} counter keeps
+   * ticking regardless). 16 is enough to surface a new failure mode in logs without flooding
+   * long-lived JVMs (Spark drivers, YARN NMs) where executor-thread reuse legitimately produces
+   * recoveries across many tasks.
+   */
+  private static final int STALE_SLOT_WARN_CAP = 16;
 
   private final AsyncDataCache ramCache;
   private final SsdCache ssdCache;
@@ -68,6 +83,26 @@ public final class CacheBootstrap {
   private final FileHandleFactory handleFactory;
   private final int loadQuantumBytes;
   private final CacheTTLController ttlController;
+
+  /**
+   * Per-scan {@link ScanTracker} registry. Lifetime entries are inserted lazily by {@link
+   * #trackerFor(String)} and evicted by {@link #withScanId(String)} close or explicit {@link
+   * #removeScanTracker(String)}. See phase-5a doc for the long-lived-JVM eviction rationale.
+   */
+  private final ConcurrentMap<String, ScanTracker> scanTrackers = new ConcurrentHashMap<>();
+
+  /**
+   * Per-thread scanId slot. Read precedence: {@code currentScanId()} → {@code
+   * conf.getTrimmed(SCAN_ID)} → {@code "default"}. Single-thread close contract — see {@link
+   * #withScanId(String)}.
+   */
+  private final ThreadLocal<String> currentScanId = new ThreadLocal<>();
+
+  /** Bootstrap-level aggregated IO stats; populated by per-stream {@code close()} merges. */
+  private final AggregatedIoStatistics aggregateIoStats = new AggregatedIoStatistics();
+
+  /** WARN-cap counter for stale-slot recovery; see {@link #STALE_SLOT_WARN_CAP}. */
+  private final AtomicInteger staleSlotWarnCount = new AtomicInteger();
 
   /**
    * Live opener registry, keyed by {@code scheme://authority}. Each {@link CachedFileSystem}
@@ -301,6 +336,10 @@ public final class CacheBootstrap {
       // but a test that forgot to close its CachedFileSystem would otherwise leak stale openers
       // into the next test's installIfNeeded — only relevant when the same JVM is reused).
       b.openersByEndpoint.clear();
+      // Same rationale: a test that forgot to close its withScanId scope would leak a tracker
+      // into the next test. Also drops any forgotten ThreadLocal slot on the current thread.
+      b.scanTrackers.clear();
+      b.currentScanId.remove();
       if (b.ssdCache != null) {
         try {
           b.ssdCache.close();
@@ -351,6 +390,138 @@ public final class CacheBootstrap {
 
   public int loadQuantumBytes() {
     return loadQuantumBytes;
+  }
+
+  /**
+   * Bootstrap-level aggregate IO stats. Per-stream {@code IoStatistics} snapshots are merged here
+   * on {@code CachingInputStream.close()} (Phase 5a wiring §6). The aggregate is intentionally
+   * lossy under crashes — streams that never close don't contribute, matching velox parity.
+   */
+  public AggregatedIoStatistics aggregateIoStats() {
+    return aggregateIoStats;
+  }
+
+  // --- scan-tracker registry (Phase 5a) ----------------------------------
+
+  /**
+   * Returns the (possibly newly-created) {@link ScanTracker} for {@code scanId}. {@code null},
+   * empty, and blank inputs are normalized to {@code "default"}. Returned tracker lives until the
+   * matching {@link #withScanId(String)} close OR an explicit {@link #removeScanTracker(String)}.
+   *
+   * <p>When the master toggle {@code fs.cached.scan-tracker.enabled=false} is set at install time,
+   * the caller's {@code CachedFileSystem.open()} resolves the toggle and substitutes {@link
+   * ScanTracker#DISABLED}; this method itself ignores the toggle.
+   */
+  public ScanTracker trackerFor(String scanId) {
+    String normalized = normalizeScanId(scanId);
+    return scanTrackers.computeIfAbsent(normalized, k -> new ScanTracker(k, this.loadQuantumBytes));
+  }
+
+  /**
+   * Removes the tracker entry for {@code scanId}, making its inner {@code TrackingData} map
+   * GC-eligible. Idempotent: missing/already-removed entries return cleanly without throwing.
+   * Thread-safe — may be called from any thread (e.g. Spark {@code TaskCompletionListener}).
+   */
+  public void removeScanTracker(String scanId) {
+    scanTrackers.remove(normalizeScanId(scanId));
+  }
+
+  /** Number of distinct scanIds currently tracked. Used by tests and a future dynamic gauge. */
+  public int scanTrackerCount() {
+    return scanTrackers.size();
+  }
+
+  /**
+   * Total {@code TrackingId} entries summed across all live trackers. O(active scans). Used by
+   * tests and a future dynamic gauge.
+   */
+  public long scanTrackerEntries() {
+    long total = 0;
+    for (ScanTracker t : scanTrackers.values()) {
+      total += t.size();
+    }
+    return total;
+  }
+
+  /** Max entry count across all live trackers; pairs with {@link #scanTrackerEntries()}. */
+  public long scanTrackerMaxEntries() {
+    long max = 0;
+    for (ScanTracker t : scanTrackers.values()) {
+      int s = t.size();
+      if (s > max) max = s;
+    }
+    return max;
+  }
+
+  // --- scanId ThreadLocal (Phase 5a) -------------------------------------
+
+  /**
+   * Returns the scanId currently set on this thread (via {@link #withScanId(String)}), or {@code
+   * null} if no scope is active. Used by {@code CachedFileSystem.open()} as the highest precedence
+   * in the scanId resolution chain.
+   */
+  public String currentScanId() {
+    return currentScanId.get();
+  }
+
+  /**
+   * Sets the per-thread scanId for the duration of the returned scope. On close: clears the
+   * ThreadLocal slot AND calls {@link #removeScanTracker(String)} so the tracker is GC-eligible.
+   *
+   * <p><b>Stale-slot recovery.</b> If the thread already has a slot set on entry (a prior task
+   * crashed before {@code close()}, common on Spark executor thread reuse), this method logs WARN
+   * (first {@value #STALE_SLOT_WARN_CAP} occurrences per JVM, DEBUG thereafter), removes the stale
+   * tracker, and bumps {@link AggregatedIoStatistics#staleScanIdRecoveries()}. Recovery preserves
+   * the benign-leak property of the dangling-tracker design.
+   *
+   * <p><b>Single-thread close contract.</b> The returned {@code AutoCloseable}'s {@code close()}
+   * MUST run on the same thread that called {@code withScanId}. Do NOT wire it into {@code
+   * TaskContext.addTaskCompletionListener} — close may fire on a different thread and either no-op
+   * the wrong slot or leak a wrong-thread orphan. For Spark integrators using the Configuration-key
+   * path: {@link #removeScanTracker(String)} IS the right TCL payload (not ThreadLocal-bound;
+   * thread-safe).
+   */
+  public AutoCloseable withScanId(String scanId) {
+    String normalized = normalizeScanId(scanId);
+    String stale = currentScanId.get();
+    if (stale != null) {
+      int cnt = staleSlotWarnCount.incrementAndGet();
+      if (cnt <= STALE_SLOT_WARN_CAP) {
+        LOG.warn(
+            "stale scanId slot '{}' detected on thread {}; auto-recovering — likely a prior task"
+                + " crashed between withScanId and close",
+            stale,
+            Thread.currentThread().getName());
+      } else if (LOG.isDebugEnabled()) {
+        LOG.debug(
+            "stale scanId slot '{}' (cap of {} WARN logs reached; counter still ticking)",
+            stale,
+            STALE_SLOT_WARN_CAP);
+      }
+      scanTrackers.remove(stale);
+      aggregateIoStats.incStaleScanIdRecoveries();
+    }
+    currentScanId.set(normalized);
+    return () -> {
+      currentScanId.remove();
+      scanTrackers.remove(normalized);
+    };
+  }
+
+  /**
+   * Clears the per-thread scanId slot WITHOUT evicting any tracker. Use for intentional nesting:
+   * {@code try (var outer = withScanId("a")) { releaseCurrentScanId(); try (var inner =
+   * withScanId("b")) {…} }}. Outer's close still evicts "a" via {@link #removeScanTracker} (the
+   * AutoCloseable captures scanId at construction time). Idempotent: no-op on missing slot.
+   */
+  public void releaseCurrentScanId() {
+    currentScanId.remove();
+  }
+
+  private static String normalizeScanId(String scanId) {
+    if (scanId == null) return "default";
+    String trimmed = scanId.trim();
+    return trimmed.isEmpty() ? "default" : trimmed;
   }
 
   /**

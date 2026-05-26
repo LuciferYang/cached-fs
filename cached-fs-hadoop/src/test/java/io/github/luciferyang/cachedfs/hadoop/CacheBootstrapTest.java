@@ -150,6 +150,131 @@ class CacheBootstrapTest {
     assertThat(fresh.hasOpener("s3a://bucket-x")).isFalse();
   }
 
+  // --- Phase 5a: scanId / ScanTracker / aggregateIoStats ----------------
+
+  @Test
+  @DisplayName("trackerFor normalizes null/empty/whitespace to 'default' and caches by scanId")
+  void trackerForNormalizesAndCaches() throws IOException {
+    CacheBootstrap.installIfNeeded(minimalConf());
+    CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+
+    var t1 = b.trackerFor(null);
+    var t2 = b.trackerFor("");
+    var t3 = b.trackerFor("  ");
+    var t4 = b.trackerFor("default");
+    assertThat(t1).isSameAs(t2).isSameAs(t3).isSameAs(t4);
+    assertThat(t1.scanId()).isEqualTo("default");
+
+    var distinct = b.trackerFor("scan-A");
+    assertThat(distinct).isNotSameAs(t1);
+    assertThat(b.scanTrackerCount()).isEqualTo(2);
+  }
+
+  @Test
+  @DisplayName("withScanId close path: ThreadLocal cleared AND tracker evicted")
+  void withScanIdCloseEvictsTracker() throws Exception {
+    CacheBootstrap.installIfNeeded(minimalConf());
+    CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+    try (var ignored = b.withScanId("scan-evict")) {
+      b.trackerFor("scan-evict"); // materialize the entry
+      assertThat(b.currentScanId()).isEqualTo("scan-evict");
+      assertThat(b.scanTrackerCount()).isEqualTo(1);
+    }
+    assertThat(b.currentScanId()).isNull();
+    assertThat(b.scanTrackerCount()).isZero();
+    assertThat(b.aggregateIoStats().staleScanIdRecoveries()).isZero();
+  }
+
+  @Test
+  @DisplayName(
+      "stale slot triggers WARN-recover: prior tracker evicted, counter ticks, new slot set")
+  void staleSlotRecovery() throws Exception {
+    CacheBootstrap.installIfNeeded(minimalConf());
+    CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+    // Simulate a prior task that crashed mid-scope (slot set, never closed).
+    AutoCloseable orphan = b.withScanId("scan-A");
+    b.trackerFor("scan-A"); // materialize so we can observe eviction
+    assertThat(b.scanTrackerCount()).isEqualTo(1);
+
+    // Next withScanId on the same thread auto-recovers.
+    try (var ignored = b.withScanId("scan-B")) {
+      assertThat(b.currentScanId()).isEqualTo("scan-B");
+      // "scan-A" was evicted by the recovery path.
+      assertThat(b.scanTrackerCount()).isZero();
+      assertThat(b.aggregateIoStats().staleScanIdRecoveries()).isEqualTo(1);
+    }
+    // Drop the orphan AutoCloseable. Its close() removes "scan-A" (no-op now) and clears the slot.
+    orphan.close();
+    assertThat(b.currentScanId()).isNull();
+  }
+
+  @Test
+  @DisplayName("releaseCurrentScanId clears the ThreadLocal slot without evicting the tracker")
+  void releaseCurrentScanIdPreservesTracker() throws Exception {
+    CacheBootstrap.installIfNeeded(minimalConf());
+    CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+    try (var ignored = b.withScanId("outer")) {
+      b.trackerFor("outer");
+      assertThat(b.currentScanId()).isEqualTo("outer");
+      b.releaseCurrentScanId();
+      assertThat(b.currentScanId()).isNull();
+      // Tracker entry MUST still be present — releaseCurrentScanId is slot-only.
+      assertThat(b.scanTrackerCount()).isEqualTo(1);
+      try (var nested = b.withScanId("inner")) {
+        assertThat(b.currentScanId()).isEqualTo("inner");
+        // No stale-slot recovery should fire because the slot was already cleared.
+        assertThat(b.aggregateIoStats().staleScanIdRecoveries()).isZero();
+      }
+    }
+    // Outer close evicts "outer" via removeScanTracker; inner already evicted itself.
+    assertThat(b.scanTrackerCount()).isZero();
+  }
+
+  @Test
+  @DisplayName("releaseCurrentScanId is idempotent — safe on missing slot, double-call no-ops")
+  void releaseCurrentScanIdIdempotent() throws IOException {
+    CacheBootstrap.installIfNeeded(minimalConf());
+    CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+    b.releaseCurrentScanId();
+    b.releaseCurrentScanId();
+    assertThat(b.currentScanId()).isNull();
+  }
+
+  @Test
+  @DisplayName("removeScanTracker is idempotent and thread-safe (callable off the owning thread)")
+  void removeScanTrackerIdempotent() throws Exception {
+    CacheBootstrap.installIfNeeded(minimalConf());
+    CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+    b.removeScanTracker("ghost"); // never created
+    b.trackerFor("scan-tcl");
+    assertThat(b.scanTrackerCount()).isEqualTo(1);
+    // Simulate a TCL on a different thread.
+    Thread other = new Thread(() -> b.removeScanTracker("scan-tcl"));
+    other.start();
+    other.join();
+    assertThat(b.scanTrackerCount()).isZero();
+    b.removeScanTracker("scan-tcl"); // second call is a no-op
+  }
+
+  @Test
+  @DisplayName(
+      "scanTrackerEntries / scanTrackerMaxEntries aggregate across trackers; respond to record*")
+  void scanTrackerEntriesGauges() throws IOException {
+    CacheBootstrap.installIfNeeded(minimalConf());
+    CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+    assertThat(b.scanTrackerEntries()).isZero();
+    assertThat(b.scanTrackerMaxEntries()).isZero();
+
+    var a = b.trackerFor("scan-A");
+    var c = b.trackerFor("scan-C");
+    a.recordReference(io.github.luciferyang.cachedfs.core.tracker.TrackingId.of(1, 0), 100);
+    a.recordReference(io.github.luciferyang.cachedfs.core.tracker.TrackingId.of(2, 0), 100);
+    c.recordReference(io.github.luciferyang.cachedfs.core.tracker.TrackingId.of(3, 0), 100);
+
+    assertThat(b.scanTrackerEntries()).isEqualTo(3); // 2 + 1
+    assertThat(b.scanTrackerMaxEntries()).isEqualTo(2); // max(2, 1)
+  }
+
   private static Configuration minimalConf() {
     Configuration conf = new Configuration(false);
     conf.setBoolean(CachedFsConfig.ENABLED, true);

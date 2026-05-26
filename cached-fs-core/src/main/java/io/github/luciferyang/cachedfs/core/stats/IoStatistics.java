@@ -27,6 +27,15 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class IoStatistics {
 
+  /**
+   * Shared off-switch sentinel. All {@code inc*} calls short-circuit; all getters return 0.
+   * Returned by {@code CachedFileSystem.open()} when {@code fs.cached.metrics.enabled=false}. NOT
+   * thread-isolated: every consumer that gets {@code NO_OP} shares this single instance.
+   */
+  public static final IoStatistics NO_OP = new IoStatistics(true);
+
+  private final boolean disabled;
+
   private final AtomicLong ramHit = new AtomicLong();
   private final AtomicLong ramHitBytes = new AtomicLong();
 
@@ -49,51 +58,71 @@ public final class IoStatistics {
   private final AtomicLong coalescedSsdLoadLatencyUs = new AtomicLong();
   private final AtomicLong coalescedStorageLoadLatencyUs = new AtomicLong();
 
+  /** Default constructor — counters are live and writable. */
+  public IoStatistics() {
+    this(false);
+  }
+
+  private IoStatistics(boolean disabled) {
+    this.disabled = disabled;
+  }
+
   public void incRamHit(long bytes) {
+    if (disabled) return;
     ramHit.incrementAndGet();
     ramHitBytes.addAndGet(bytes);
   }
 
   public void incRead(long bytes) {
+    if (disabled) return;
     read.incrementAndGet();
     readBytes.addAndGet(bytes);
   }
 
   public void incPrefetch(long bytes) {
+    if (disabled) return;
     prefetch.incrementAndGet();
     prefetchBytes.addAndGet(bytes);
   }
 
   public void incSsdRead(long bytes) {
+    if (disabled) return;
     ssdRead.incrementAndGet();
     ssdReadBytes.addAndGet(bytes);
   }
 
   public void incRawOverreadBytes(long bytes) {
+    if (disabled) return;
     rawOverreadBytes.addAndGet(bytes);
   }
 
   public void incQueryThreadIoLatencyUs(long us) {
+    if (disabled) return;
     queryThreadIoLatencyUs.addAndGet(us);
   }
 
   public void incStorageReadLatencyUs(long us) {
+    if (disabled) return;
     storageReadLatencyUs.addAndGet(us);
   }
 
   public void incSsdCacheReadLatencyUs(long us) {
+    if (disabled) return;
     ssdCacheReadLatencyUs.addAndGet(us);
   }
 
   public void incCacheWaitLatencyUs(long us) {
+    if (disabled) return;
     cacheWaitLatencyUs.addAndGet(us);
   }
 
   public void incCoalescedSsdLoadLatencyUs(long us) {
+    if (disabled) return;
     coalescedSsdLoadLatencyUs.addAndGet(us);
   }
 
   public void incCoalescedStorageLoadLatencyUs(long us) {
+    if (disabled) return;
     coalescedStorageLoadLatencyUs.addAndGet(us);
   }
 

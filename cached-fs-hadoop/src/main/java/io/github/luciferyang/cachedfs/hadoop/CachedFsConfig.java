@@ -133,6 +133,33 @@ public final class CachedFsConfig {
 
   public static final int DEFAULT_HANDLE_CACHE_CAPACITY = 1024;
 
+  // --- scan tracking + IO stats (Phase 5a) ---------------------------------
+
+  /**
+   * {@code fs.cached.scan-id} — per-file scan identifier. Resolved at {@link
+   * org.apache.hadoop.fs.FileSystem#open} via the precedence in {@link
+   * CacheBootstrap#currentScanId()} → this conf key → {@code "default"}.
+   */
+  public static final String SCAN_ID = "fs.cached.scan-id";
+
+  /**
+   * {@code fs.cached.scan-tracker.enabled} — master toggle for the per-scan {@code ScanTracker};
+   * default {@code true}. When false, {@link CacheBootstrap#trackerFor} returns {@code
+   * ScanTracker.DISABLED} and all density-tracking is a no-op.
+   */
+  public static final String SCAN_TRACKER_ENABLED = "fs.cached.scan-tracker.enabled";
+
+  public static final boolean DEFAULT_SCAN_TRACKER_ENABLED = true;
+
+  /**
+   * {@code fs.cached.metrics.enabled} — master toggle for per-stream {@link
+   * io.github.luciferyang.cachedfs.core.stats.IoStatistics}; default {@code true}. When false,
+   * streams are constructed with {@code IoStatistics.NO_OP}.
+   */
+  public static final String METRICS_ENABLED = "fs.cached.metrics.enabled";
+
+  public static final boolean DEFAULT_METRICS_ENABLED = true;
+
   // --- parsers -------------------------------------------------------------
 
   /** True if {@link #ENABLED} is set to {@code true}. */
@@ -176,6 +203,14 @@ public final class CachedFsConfig {
       throw new IllegalArgumentException(LOAD_QUANTUM_BYTES + " must be > 0: " + v);
     }
     return v;
+  }
+
+  public static boolean scanTrackerEnabled(Configuration conf) {
+    return conf.getBoolean(SCAN_TRACKER_ENABLED, DEFAULT_SCAN_TRACKER_ENABLED);
+  }
+
+  public static boolean metricsEnabled(Configuration conf) {
+    return conf.getBoolean(METRICS_ENABLED, DEFAULT_METRICS_ENABLED);
   }
 
   public static int handleCacheCapacity(Configuration conf) {
