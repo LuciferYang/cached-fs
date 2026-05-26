@@ -143,6 +143,27 @@ public final class AsyncDataCache implements AutoCloseable {
   private final CacheShard[] shards;
   private final AtomicBoolean closed = new AtomicBoolean();
 
+  // --- Phase 5c.0: prefetch byte-budget counter --------------------------
+
+  /**
+   * Sum of bytes pinned by in-flight prefetch tasks. PrefetchTask (Phase 5c) increments at start
+   * and decrements in the run() finally; the admission gate reads this to bound concurrent prefetch
+   * volume. LongAdder is non-atomic vs concurrent reads — see decrement guard below.
+   */
+  private final java.util.concurrent.atomic.LongAdder pendingPrefetchBytes =
+      new java.util.concurrent.atomic.LongAdder();
+
+  /**
+   * Bounded rate-limit ring for the decrement-guard WARN. AtomicLong holds the next-allowed
+   * timestamp (epoch ms); each guard fire compares-and-swaps to advance by the cooldown window.
+   * Goal: a buggy desync surfaces continuously (one WARN per minute), not just on first occurrence
+   * (which would silently swallow repeats once a static AtomicBoolean tripped).
+   */
+  private static final long DECREMENT_WARN_COOLDOWN_MS = 60_000L;
+
+  private final java.util.concurrent.atomic.AtomicLong decrementWarnNextAllowedMs =
+      new java.util.concurrent.atomic.AtomicLong();
+
   /**
    * Constructs a cache with the given {@link Options}. The cache is ready to serve once this
    * returns. Pure-Java embedders may call {@link #setInstance} to publish the cache to the
@@ -238,6 +259,54 @@ public final class AsyncDataCache implements AutoCloseable {
    * best-effort, not strict. Use {@link #removeFileEntries} or {@link
    * io.github.luciferyang.cachedfs.core.ttl.CacheTTLController#applyTTL} for targeted removal.
    */
+  // --- Phase 5c.0 byte-budget API (no callers yet; wired by Phase 5c) ---
+
+  /**
+   * Sum of bytes pinned by in-flight prefetch tasks. Used by the Phase 5c admission gate. Returns a
+   * non-atomic snapshot; transient values may briefly differ from the global invariant under
+   * concurrent inc/dec — the guard in {@link #decrementPendingPrefetch(long)} accommodates this.
+   */
+  public long pendingPrefetchBytes() {
+    return pendingPrefetchBytes.sum();
+  }
+
+  /**
+   * Increments the prefetch byte-budget counter. {@code internal — call only from the cached-fs
+   * prefetch task}; future contributors adding callers MUST pair every increment with exactly one
+   * decrement on every exit path or the counter desyncs (see decrement guard).
+   */
+  public void incrementPendingPrefetch(long bytes) {
+    pendingPrefetchBytes.add(bytes);
+  }
+
+  /**
+   * Decrements the prefetch byte-budget counter. WARN-not-throw integrity guard: on a transient
+   * observation where {@code sum() < bytes}, logs a rate-limited WARN and STILL applies the
+   * decrement (so the public observer never gets stuck on a stale value). LongAdder.sum() is
+   * non-atomic vs concurrent adds; legitimate PrefetchTask concurrency can briefly observe the
+   * guard condition even when the global invariant {@code eventually(sum &gt;= 0)} holds.
+   *
+   * <p>{@code internal — call only from the cached-fs prefetch task}.
+   */
+  public void decrementPendingPrefetch(long bytes) {
+    long current = pendingPrefetchBytes.sum();
+    if (current < bytes) {
+      long now = System.currentTimeMillis();
+      long nextAllowed = decrementWarnNextAllowedMs.get();
+      if (now >= nextAllowed
+          && decrementWarnNextAllowedMs.compareAndSet(
+              nextAllowed, now + DECREMENT_WARN_COOLDOWN_MS)) {
+        LOG.warn(
+            "pendingPrefetchBytes guard: decrement {} bytes but observed sum() == {}; counter"
+                + " will go negative — likely a programming bug in a prefetch caller. Applying"
+                + " decrement anyway to keep the counter live.",
+            bytes,
+            current);
+      }
+    }
+    pendingPrefetchBytes.add(-bytes);
+  }
+
   public void clear() {
     for (CacheShard s : shards) {
       s.clear();
