@@ -110,6 +110,7 @@
 
    ```
    admissionGateFalseCount * chunkSize == prefetchSkipped("budget") + prefetchSkipped("heap_pressure") + prefetchEligibleSuppressedBytes
+   // chunkSize is per-stream-constant (CachingInputStream is constructed with a fixed loadQuantumBytes value from bootstrap), so the multiplication is well-defined. Tail-chunk reads at file end use chunkSize == loadQuantum on the prefetch path (prefetch always operates on the next full chunk; tail-prefetch is skipped when the next chunk would be < chunkSize, so the invariant doesn't see ragged sizes).
    ```
 
    The `"queue_full"` bucket is EXCLUDED because it fires in `DiscardAndCountHandler` AFTER the admission gate has already passed (see §step 3); `queue_full` does NOT correspond to a gate-false branch. The test must `.join()` the consumer thread (or await a latch released after the last admission-gate evaluation) before reading `admissionGateFalseCount` to ensure the volatile read happens-after the last consumer write. This codifies the invariant that every admission-gate-false branch bumps exactly one dedicated byte counter by exactly `chunkSize`.

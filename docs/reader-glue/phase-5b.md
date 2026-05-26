@@ -15,11 +15,11 @@ Cut IO syscalls for sequential reads. When a positional read crosses N missed ch
 
 ### Group sizing
 
-`fs.cached.coalesce.max-chunks-per-group` default = `max(2, min(16, totalRamBytes / loadQuantumBytes / 16))`. With 256 MiB cache and `loadQuantum=8 MiB`, that's `max(2, min(16, 2)) = 2`. **When the auto-scaled cap is exactly 2 the coalesce path adds non-trivial overhead for marginal benefit** — the spec gates: when `cap == 2` AND `fs.cached.coalesce.always-on=false`, `coalesce.enabled` is treated as `false`. Operators with small caches who want coalescing anyway set `always-on=true`. The default flips coalescing off automatically on under-sized caches to avoid pessimization.
+`fs.cached.coalesce.max-chunks-per-group` default = `max(2, min(16, totalRamBytes / loadQuantumBytes / 16))`. With 256 MiB cache and `loadQuantum=8 MiB`, that's `max(2, min(16, 2)) = 2`. **The auto-scaled cap reaches 3 at ~384 MiB cache; reaches 16 at ~2 GiB cache** (8 MiB × 16 × 16 = 2048 MiB). **When the auto-scaled cap is exactly 2 the coalesce path adds non-trivial overhead for marginal benefit** — the spec gates: when `cap == 2` AND `fs.cached.coalesce.always-on=false`, `coalesce.enabled` is treated as `false`. **Practical implication:** caches under ~384 MiB auto-disable coalescing despite the `enabled=true` default — operators who want coalescing on small caches must set `always-on=true`. The Configuration table notes both knobs and the auto-disable threshold.
 
 ### Off-switch
 
-`fs.cached.coalesce.enabled` (default `true`, but auto-disabled when cap==2 per Group sizing). Disabled path reads only 5a-introduced fields (`tracker`, `trackingId`, `ioStats`); the Resolved list and restart counter are method-local in the new code path, absent from the fallback.
+`fs.cached.coalesce.enabled` (default `true`, but auto-disabled when cap==2 per Group sizing — see "Practical implication" above for the cache-size threshold). Disabled path reads only 5a-introduced fields (`tracker`, `trackingId`, `ioStats`); the Resolved list and restart counter are method-local in the new code path, absent from the fallback.
 
 ### Test plumbing (CountingReadFile seam — concrete)
 
