@@ -75,6 +75,37 @@ class AggregatedIoStatisticsTest {
   }
 
   @Test
+  @DisplayName("add(source) merges Phase 5c byte/event counters (prefetchSkipped buckets etc.)")
+  void addMergesPhase5cCounters() {
+    AggregatedIoStatistics agg = new AggregatedIoStatistics();
+    IoStatistics s1 = new IoStatistics();
+    s1.incPrefetchSkipped("queue_full", 100);
+    s1.incPrefetchSkipped("budget", 200);
+    s1.incPrefetchSkipped("heap_pressure", 50);
+    s1.incPrefetchEvictedBeforeUse(40);
+    s1.incPrefetchEligibleSuppressed(80);
+    s1.incSeqHwmRegimeResets();
+    s1.incSeqHwmRegimeResets();
+
+    IoStatistics s2 = new IoStatistics();
+    s2.incPrefetchSkipped("queue_full", 25);
+    s2.incPrefetchSkipped("other", 5);
+
+    agg.add(s1);
+    agg.add(s2);
+
+    assertThat(agg.prefetchSkipped("queue_full")).isEqualTo(125);
+    assertThat(agg.prefetchSkipped("budget")).isEqualTo(200);
+    assertThat(agg.prefetchSkipped("heap_pressure")).isEqualTo(50);
+    assertThat(agg.prefetchSkipped("other")).isEqualTo(5);
+    assertThat(agg.prefetchEvictedBeforeUse()).isEqualTo(40);
+    assertThat(agg.prefetchEligibleSuppressedBytes()).isEqualTo(80);
+    assertThat(agg.seqHwmRegimeResets()).isEqualTo(2);
+    // Bootstrap-only counter remains untouched by stream merges.
+    assertThat(agg.staleScanIdRecoveries()).isZero();
+  }
+
+  @Test
   @DisplayName("NO_OP IoStatistics short-circuits all inc*; getters return 0")
   void noOpStaysAtZero() {
     IoStatistics noop = IoStatistics.NO_OP;

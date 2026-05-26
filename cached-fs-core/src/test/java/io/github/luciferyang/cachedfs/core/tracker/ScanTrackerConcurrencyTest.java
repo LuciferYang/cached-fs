@@ -71,39 +71,46 @@ class ScanTrackerConcurrencyTest {
     ScanTracker tracker = new ScanTracker("scan-snapshot", 8 << 20);
     TrackingId id = TrackingId.of(7, 1);
     int writers = 8;
-    AtomicBoolean stop = new AtomicBoolean();
+    int writeIterations = 50_000;
     AtomicLong negativeObservations = new AtomicLong();
+
+    java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+    java.util.concurrent.CountDownLatch writersDone =
+        new java.util.concurrent.CountDownLatch(writers);
+    AtomicBoolean stopReader = new AtomicBoolean();
 
     ExecutorService pool = Executors.newFixedThreadPool(writers + 1);
     try {
-      // Reader polls adjustedReadPct every ~1ms looking for negative snapshots.
+      // Reader polls adjustedReadPct in a tight loop until all writers complete; deterministic
+      // wall-clock-free.
       pool.submit(
           () -> {
-            while (!stop.get()) {
+            while (!stopReader.get()) {
               if (tracker.data(id).adjustedReadPct() < 0) {
                 negativeObservations.incrementAndGet();
-              }
-              try {
-                Thread.sleep(0, 100_000); // ~100us
-              } catch (InterruptedException ignored) {
-                return;
               }
             }
           });
 
-      // Writers interleave reference + read updates to exercise both record* paths.
       for (int t = 0; t < writers; t++) {
         pool.submit(
             () -> {
-              while (!stop.get()) {
-                tracker.recordReference(id, 1024L);
-                tracker.recordRead(id, 800L);
+              try {
+                start.await();
+                for (int i = 0; i < writeIterations; i++) {
+                  tracker.recordReference(id, 1024L);
+                  tracker.recordRead(id, 800L);
+                }
+              } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+              } finally {
+                writersDone.countDown();
               }
             });
       }
-
-      Thread.sleep(2_000);
-      stop.set(true);
+      start.countDown();
+      assertThat(writersDone.await(60, TimeUnit.SECONDS)).isTrue();
+      stopReader.set(true);
     } finally {
       pool.shutdown();
       assertThat(pool.awaitTermination(10, TimeUnit.SECONDS)).isTrue();

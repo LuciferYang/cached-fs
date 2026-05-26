@@ -540,7 +540,13 @@ public final class CacheBootstrap {
     }
     currentScanId.set(normalized);
     return () -> {
-      currentScanId.remove();
+      // Only clear the ThreadLocal if it still holds OUR scanId. An orphan AutoCloseable from a
+      // crashed-and-recovered prior task that later runs close() would otherwise stomp the
+      // current scope's slot (recovery path replaced it). Tracker eviction is always safe
+      // (removeScanTracker is idempotent on a missing entry).
+      if (normalized.equals(currentScanId.get())) {
+        currentScanId.remove();
+      }
       scanTrackers.remove(normalized);
     };
   }

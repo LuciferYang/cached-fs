@@ -54,6 +54,14 @@ public final class AggregatedIoStatistics {
   private final LongAdder ssdRead = new LongAdder();
   private final LongAdder ssdReadBytes = new LongAdder();
   private final LongAdder rawOverreadBytes = new LongAdder();
+  // Phase 5c merged-from-stream byte/event counters.
+  private final LongAdder prefetchSkippedQueueFull = new LongAdder();
+  private final LongAdder prefetchSkippedBudget = new LongAdder();
+  private final LongAdder prefetchSkippedHeapPressure = new LongAdder();
+  private final LongAdder prefetchSkippedOther = new LongAdder();
+  private final LongAdder prefetchEvictedBeforeUse = new LongAdder();
+  private final LongAdder prefetchEligibleSuppressedBytes = new LongAdder();
+  private final LongAdder seqHwmRegimeResets = new LongAdder();
 
   // Bootstrap-only counters (NOT touched by add(IoStatistics))
   private final LongAdder staleScanIdRecoveries = new LongAdder();
@@ -73,6 +81,15 @@ public final class AggregatedIoStatistics {
     ssdRead.add(source.ssdRead());
     ssdReadBytes.add(source.ssdReadBytes());
     rawOverreadBytes.add(source.rawOverreadBytes());
+    // Phase 5c: merge the new byte/event counters per the class-javadoc partition. The
+    // staleScanIdRecoveries bootstrap-only counter is intentionally NOT merged here.
+    prefetchSkippedQueueFull.add(source.prefetchSkipped("queue_full"));
+    prefetchSkippedBudget.add(source.prefetchSkipped("budget"));
+    prefetchSkippedHeapPressure.add(source.prefetchSkipped("heap_pressure"));
+    prefetchSkippedOther.add(source.prefetchSkipped("other"));
+    prefetchEvictedBeforeUse.add(source.prefetchEvictedBeforeUse());
+    prefetchEligibleSuppressedBytes.add(source.prefetchEligibleSuppressedBytes());
+    seqHwmRegimeResets.add(source.seqHwmRegimeResets());
   }
 
   /**
@@ -121,5 +138,27 @@ public final class AggregatedIoStatistics {
 
   public long staleScanIdRecoveries() {
     return staleScanIdRecoveries.sum();
+  }
+
+  public long prefetchSkipped(String reason) {
+    return switch (reason) {
+      case "queue_full" -> prefetchSkippedQueueFull.sum();
+      case "budget" -> prefetchSkippedBudget.sum();
+      case "heap_pressure" -> prefetchSkippedHeapPressure.sum();
+      case "other" -> prefetchSkippedOther.sum();
+      default -> 0L;
+    };
+  }
+
+  public long prefetchEvictedBeforeUse() {
+    return prefetchEvictedBeforeUse.sum();
+  }
+
+  public long prefetchEligibleSuppressedBytes() {
+    return prefetchEligibleSuppressedBytes.sum();
+  }
+
+  public long seqHwmRegimeResets() {
+    return seqHwmRegimeResets.sum();
   }
 }

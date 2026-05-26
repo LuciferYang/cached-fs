@@ -697,6 +697,11 @@ public final class CachingInputStream extends InputStream
       Thread.currentThread().interrupt();
       throw new java.io.InterruptedIOException(
           "Interrupted waiting for cache fill: " + ex.getMessage());
+    } catch (java.util.concurrent.CancellationException ex) {
+      // Peer cancelled the fill promise (seek/close on the owning stream, Phase 5c prefetch
+      // abandonment, etc.). Treat as an IOException so Hadoop retry harnesses + the coalesce
+      // restart loop see a checked exception rather than an unchecked one bubbling up.
+      throw new IOException("Cache fill cancelled", ex);
     } catch (ExecutionException ex) {
       Throwable cause = ex.getCause();
       if (cause instanceof IOException io) throw io;

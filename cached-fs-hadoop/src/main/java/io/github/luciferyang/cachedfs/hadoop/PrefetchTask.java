@@ -29,12 +29,13 @@ import java.util.concurrent.CompletableFuture;
  * never {@code submit(...)}, which would wrap the Runnable in a {@code FutureTask} and defeat the
  * downcast.
  *
- * <p>Invariants on every exit path (success, exception, discard):
+ * <p>Invariants on every exit path that {@link #run} reaches (i.e. excluding rejected tasks, which
+ * are handled by {@link DiscardAndCountHandler}):
  *
  * <ol>
+ *   <li>{@code cache.incrementPendingPrefetch(chunkSize)} fires at the top of run; paired with the
+ *       decrement in finally — one-to-one regardless of throws.
  *   <li>The {@link #future()} is completed exactly once.
- *   <li>{@link AsyncDataCache#decrementPendingPrefetch(long)} is paired with the increment at
- *       submission.
  *   <li>{@code owner.clearPendingPrefetchIf(future)} releases the CAS slot.
  * </ol>
  *
@@ -90,6 +91,10 @@ final class PrefetchTask implements Runnable {
 
   @Override
   public void run() {
+    // Increment FIRST so the byte-budget counter and the decrement in finally are paired one-to-
+    // one regardless of any throw in the body. The submission site does not pre-increment — see
+    // phase-5c.md §step 4 ("sole site that increments/decrements pendingPrefetchBytes").
+    cache.incrementPendingPrefetch(chunkSize);
     Throwable failure = null;
     try {
       FindResult r = cache.findOrCreate(nextKey, chunkSize, /* contiguous= */ false);
