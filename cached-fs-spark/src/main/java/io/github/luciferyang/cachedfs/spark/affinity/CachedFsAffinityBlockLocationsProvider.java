@@ -85,11 +85,12 @@ public final class CachedFsAffinityBlockLocationsProvider implements BlockLocati
    * hosts.length} parallel-array invariant some Hadoop consumers rely on holds.
    */
   private static BlockLocation hostsOnly(String[] preferred, long offset, long length) {
-    String[] names = new String[preferred.length];
-    for (int i = 0; i < preferred.length; i++) {
-      names[i] = preferred[i];
-    }
-    return new BlockLocation(names, preferred, offset, length);
+    // Clone hosts AND names per BlockLocation: Hadoop's BlockLocation constructor calls
+    // StringInterner.internStringsInArray which MUTATES the input array in place AND retains the
+    // reference. Sharing `preferred` across N BlockLocations would alias their hosts arrays AND
+    // mutate the caller's `preferred` on first interner pass. Defensive copies isolate each
+    // BlockLocation's state.
+    return new BlockLocation(preferred.clone(), preferred.clone(), offset, length);
   }
 
   /** Collects the union of inner-FS hosts. Deduped + null-safe; returns empty when unset. */

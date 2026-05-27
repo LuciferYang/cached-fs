@@ -295,30 +295,103 @@ public final class CachedFileSystem extends FilterFileSystem {
   }
 
   /**
-   * We deliberately do NOT override {@code listLocatedStatus} or {@code listFiles}. Spark 4.0's
-   * {@code HadoopFSUtils.listLeafFiles} routes through {@code listLocatedStatus} only for {@code
-   * DistributedFileSystem | ViewFileSystem} subclasses (verified against
-   * apache/spark@v4.0.0:HadoopFSUtils.scala). {@link CachedFileSystem} extends {@link
-   * FilterFileSystem} which is neither, so Spark's primary path falls through to {@code
-   * fs.listStatus + fs.getFileBlockLocations} — and the latter IS overridden above. Overriding
-   * {@code listLocatedStatus} with a wrapper that rebuilds {@code LocatedFileStatus} via {@code new
-   * LocatedFileStatus(original, rewritten)} would also flatten HDFS-specific subclasses ({@code
-   * HdfsLocatedFileStatus}, dropping {@code FileEncryptionInfo} + erasure-coding policy + fileId),
-   * breaking Spark on HDFS Transparent Encryption clusters. The hook is provided via {@link
-   * #getFileBlockLocations(FileStatus, long, long)} and is sufficient for Spark and for any other
-   * consumer that asks explicitly for block locations.
+   * Spark 4 uses TWO listing entry points that consume locality info from {@link
+   * org.apache.hadoop.fs.LocatedFileStatus} EMBEDDED block-locations directly (never calling our
+   * {@link #getFileBlockLocations(FileStatus, long, long)} override on that path):
    *
-   * <p>Third-party callers that DO route through {@code listLocatedStatus} (some Iceberg /
-   * Hive-on-MR planners) bypass the affinity hint by design — they typically have their own
-   * locality logic. Re-enabling support here would require either preserving subclass identity (via
-   * per-subclass adapters) or cloning each {@link org.apache.hadoop.fs.BlockLocation} in-place with
-   * rewritten hosts; both are deferred to a future iteration.
+   * <ul>
+   *   <li>{@code HadoopFSUtils.listFiles} — Spark 4's default for {@code s3a} (controlled by {@code
+   *       spark.sql.sources.useListFilesFileSystemList="s3a"}). Calls {@code fs.listFiles(path,
+   *       true)} and consumes the {@code BlockLocation[]} on each emitted {@code LocatedFileStatus}
+   *       directly via {@code PartitionedFileUtil.getBlockHosts}.
+   *   <li>{@code HadoopFSUtils.parallelListLeafFiles} for non-HDFS / non-ViewFS schemes — falls
+   *       back to {@code fs.listStatus + getFileBlockLocations} (DOES hit our override).
+   * </ul>
+   *
+   * <p>To cover both paths we override {@link #listLocatedStatus(Path)} and {@link #listFiles(Path,
+   * boolean)} below. Each wraps the inner iterator and rewrites each emitted entry's {@code
+   * BlockLocation[]} through the provider — EXCEPT for HDFS-specific {@code LocatedFileStatus}
+   * subclasses (detected via package-name match to avoid a compile-time dep on hadoop-hdfs-client).
+   * HDFS subclasses carry {@code FileEncryptionInfo} + erasure-coding policy + fileId; copying them
+   * through the {@code (FileStatus, BlockLocation[])} constructor flattens them to a plain {@code
+   * LocatedFileStatus}, breaking Spark on HDFS Transparent Encryption clusters. For HDFS this is
+   * acceptable because Spark uses {@code DistributedFileSystem}'s own locality directly so the
+   * affinity hint isn't lost there.
    */
   private BlockLocationsProvider activeProvider() {
     if (!enabled) return null;
     CacheBootstrap b = CacheBootstrap.get().orElse(null);
     if (b == null) return null;
     return b.blockLocationsProvider();
+  }
+
+  @Override
+  public org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus>
+      listLocatedStatus(Path f) throws IOException {
+    org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus> inner =
+        fs.listLocatedStatus(f);
+    BlockLocationsProvider provider = activeProvider();
+    if (provider == null) return inner;
+    return rewriteLocatedIterator(inner, provider);
+  }
+
+  @Override
+  public org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus> listFiles(
+      Path f, boolean recursive) throws IOException {
+    org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus> inner =
+        fs.listFiles(f, recursive);
+    BlockLocationsProvider provider = activeProvider();
+    if (provider == null) return inner;
+    return rewriteLocatedIterator(inner, provider);
+  }
+
+  /**
+   * Lazy {@link org.apache.hadoop.fs.RemoteIterator} wrapper that rewrites each emitted entry's
+   * block-locations. Per-entry HDFS-subclass detection routes HDFS entries through unchanged;
+   * everything else gets a {@code new LocatedFileStatus(original, rewritten)} copy with the
+   * affinity-aware hosts. Lazy by-element evaluation preserves the inner iterator's streaming
+   * behavior — important for very-large S3A listings where eager materialization would OOM.
+   */
+  private static org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus>
+      rewriteLocatedIterator(
+          org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus> inner,
+          BlockLocationsProvider provider) {
+    return new org.apache.hadoop.fs.RemoteIterator<>() {
+      @Override
+      public boolean hasNext() throws IOException {
+        return inner.hasNext();
+      }
+
+      @Override
+      public org.apache.hadoop.fs.LocatedFileStatus next() throws IOException {
+        org.apache.hadoop.fs.LocatedFileStatus original = inner.next();
+        if (isHdfsLocatedFileStatus(original)) {
+          // Preserve subclass identity: HdfsLocatedFileStatus carries FileEncryptionInfo + EC
+          // policy + fileId that the copy constructor would drop, breaking HDFS reads on
+          // Transparent Encryption clusters.
+          return original;
+        }
+        org.apache.hadoop.fs.BlockLocation[] underlying = original.getBlockLocations();
+        if (underlying == null || underlying.length == 0) {
+          return original;
+        }
+        org.apache.hadoop.fs.BlockLocation[] rewritten =
+            provider.getBlockLocations(original, 0L, original.getLen(), underlying);
+        if (rewritten == null || rewritten == underlying) {
+          return original;
+        }
+        return new org.apache.hadoop.fs.LocatedFileStatus(original, rewritten);
+      }
+    };
+  }
+
+  /**
+   * Reflective check for HDFS-specific {@link org.apache.hadoop.fs.LocatedFileStatus} subclasses —
+   * package-prefix match avoids a compile-time dependency on {@code hadoop-hdfs-client} while still
+   * recognizing {@code HdfsLocatedFileStatus} and its peers.
+   */
+  private static boolean isHdfsLocatedFileStatus(org.apache.hadoop.fs.LocatedFileStatus lfs) {
+    return lfs.getClass().getName().startsWith("org.apache.hadoop.hdfs.");
   }
 
   /**

@@ -123,20 +123,11 @@ object CachedFsSoftAffinityListener extends Logging {
       val listener = new CachedFsSoftAffinityListener(sc)
       val next = Registration(sc, listener)
       if (registration.compareAndSet(prior, next)) {
-        // CAS succeeded — install on the new ctx. Best-effort remove the prior listener from its
-        // ctx in case the prior ctx is still alive (multi-context REPL workflow).
+        // ADD the new listener FIRST. If addSparkListener throws (e.g. listenerBus stopped),
+        // we have NOT touched the prior context yet — rollback restores prior intact. Only after
+        // a successful add do we remove the prior listener from its (possibly still-live) ctx.
         try {
-          if (prior != null) {
-            try prior.ctx.removeSparkListener(prior.listener)
-            catch {
-              case NonFatal(t) =>
-                logWarning(
-                  s"Failed to remove prior listener from SparkContext ${prior.ctx.applicationId}",
-                  t)
-            }
-          }
           sc.addSparkListener(listener)
-          logInfo(s"CachedFsSoftAffinityListener registered on SparkContext ${sc.applicationId}")
         } catch {
           case NonFatal(t) =>
             // CAS-roll back ONLY if we are still the registered party — never clobber a
@@ -146,7 +137,25 @@ object CachedFsSoftAffinityListener extends Logging {
               s"Failed to register CachedFsSoftAffinityListener on SparkContext " +
                 s"${sc.applicationId}",
               t)
+            return
         }
+        // New listener installed; safe to detach prior. Failure here is best-effort — the new
+        // registration is already valid and the prior ctx is presumed stopped (or the prior
+        // listener will get a harmless onApplicationEnd later that no-ops via the identity
+        // guard).
+        if (prior != null) {
+          val priorAppId =
+            try prior.ctx.applicationId
+            catch { case NonFatal(_) => "<stopped-ctx>" }
+          try prior.ctx.removeSparkListener(prior.listener)
+          catch {
+            case NonFatal(t) =>
+              logWarning(
+                s"Failed to remove prior listener from SparkContext $priorAppId (best-effort)",
+                t)
+          }
+        }
+        logInfo(s"CachedFsSoftAffinityListener registered on SparkContext ${sc.applicationId}")
         return
       }
       // CAS lost — another thread registered something; loop and re-check.

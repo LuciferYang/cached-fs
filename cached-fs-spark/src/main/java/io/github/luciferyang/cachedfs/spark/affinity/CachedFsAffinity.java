@@ -171,14 +171,10 @@ public final class CachedFsAffinity {
     CachedFsSoftAffinityManager.initialize(virtualNodes);
   }
 
-  /**
-   * Per-SparkContext reset hook. Called by the listener on {@code SparkApplicationEnd} so the next
-   * SparkContext in the same JVM starts with a fresh ring + observation cache. Knob values are
-   * preserved across the boundary.
-   */
-  public static void notifyApplicationEnd() {
-    CachedFsSoftAffinityManager.getInstance().resetForApplicationEnd();
-  }
+  // notifyApplicationEnd is moved below to the @hidden listener-internal block — it has NO
+  // identity guard of its own and an external caller invoking it would wipe shared state
+  // belonging to whichever SparkContext currently owns the listener registration. Production
+  // callers must let the registered listener fire it via its identity-guarded onApplicationEnd.
 
   // --- listener entry points (called by CachedFsSoftAffinityListener) -------
   //
@@ -222,6 +218,17 @@ public final class CachedFsAffinity {
    */
   public static void onTaskEnd(int stageId, int partitionId, String executorId, String host) {
     CachedFsSoftAffinityManager.getInstance().updateTaskEnd(stageId, partitionId, executorId, host);
+  }
+
+  /**
+   * @hidden listener-internal. Per-SparkContext reset hook. Called by {@code
+   *     CachedFsSoftAffinityListener.onApplicationEnd} AFTER the identity-CAS confirms that the
+   *     calling listener is the registered owner. Direct callers MUST NOT invoke this — there is no
+   *     identity guard here, and wiping shared state when a different SparkContext is the active
+   *     owner corrupts that context's affinity hints.
+   */
+  public static void notifyApplicationEnd() {
+    CachedFsSoftAffinityManager.getInstance().resetForApplicationEnd();
   }
 
   // --- helpers -----------------------------------------------------------

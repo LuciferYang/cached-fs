@@ -220,18 +220,29 @@ class CachedFsSoftAffinityManagerTest {
   }
 
   @Test
-  @DisplayName(
-      "initialize logs a warn but keeps prior ring density when called with a different value")
-  void initializeIdempotent() {
-    // @BeforeEach already constructed the singleton via getInstance(); reset so we can drive the
-    // first-initialize path here.
+  @DisplayName("initialize rebuilds the singleton when state is empty (lossless re-density tuning)")
+  void initializeRebuildsOnEmptyState() {
     CachedFsSoftAffinityManager.resetForTesting();
     CachedFsSoftAffinityManager first = CachedFsSoftAffinityManager.initialize(50);
     assertThat(first.snapshot().virtualNodes()).isEqualTo(50);
-    // Second call with a different value returns the SAME instance with unchanged density.
+    // No executors / observations attached → second initialize with a different density REBUILDS
+    // the singleton with the new value. Lossless because there was no state to drop.
+    CachedFsSoftAffinityManager rebuilt = CachedFsSoftAffinityManager.initialize(200);
+    assertThat(rebuilt.snapshot().virtualNodes()).isEqualTo(200);
+  }
+
+  @Test
+  @DisplayName(
+      "initialize keeps prior density when state is attached (lossy rebuild would be unsafe)")
+  void initializeKeepsDensityWhenStateAttached() {
+    CachedFsSoftAffinityManager.resetForTesting();
+    CachedFsSoftAffinityManager first = CachedFsSoftAffinityManager.initialize(50);
+    first.handleExecutorAdded("e1", "host-1"); // attach state
+    // Second initialize with different density must NOT silently drop the executor.
     CachedFsSoftAffinityManager again = CachedFsSoftAffinityManager.initialize(200);
     assertThat(again).isSameAs(first);
     assertThat(again.snapshot().virtualNodes()).isEqualTo(50);
+    assertThat(again.executorCount()).isEqualTo(1);
   }
 
   @Test
