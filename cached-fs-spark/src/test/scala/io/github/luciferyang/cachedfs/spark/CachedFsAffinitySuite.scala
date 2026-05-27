@@ -172,6 +172,9 @@ class CachedFsAffinitySuite extends AnyFunSuite with BeforeAndAfterEach {
       && System.nanoTime() < deadline) Thread.sleep(20)
     assert(CachedFsSoftAffinityManager.getInstance().executorCount() == 0)
 
+    // Capture sc1's listener BEFORE clearing — we'll assert sc2 gets a fresh instance.
+    val priorListener =
+      CachedFsSoftAffinityListener.currentRegistrationForTesting().map(_._2).orNull
     // sc2 in the same JVM — ensureRegistered must swap to a fresh listener.
     val sc2 = new SparkContext("local[1]", "cached-fs-affinity-suite-ctx2")
     try {
@@ -180,6 +183,14 @@ class CachedFsAffinitySuite extends AnyFunSuite with BeforeAndAfterEach {
       // a coincidence of state being cleared by sc1.stop.
       val reg2 = CachedFsSoftAffinityListener.currentRegistrationForTesting()
       assert(reg2.isDefined && (reg2.get._1 eq sc2))
+      // Listener INSTANCE must be a fresh object (not the prior listener reused) — a future
+      // refactor that mistakenly returned the prior listener would silently route sc1's stale
+      // events into sc2's shared manager state.
+      if (priorListener != null) {
+        assert(
+          reg2.get._2 ne priorListener,
+          "a new listener instance must be constructed for the new SparkContext")
+      }
       CachedFsAffinity.configure(true, 2, 1, false, 10000)
       CachedFsAffinity.onExecutorAdded("e2", "h2")
       assert(CachedFsSoftAffinityManager.getInstance().executorCount() == 1)
@@ -237,6 +248,4 @@ class CachedFsAffinitySuite extends AnyFunSuite with BeforeAndAfterEach {
     }
   }
 
-  // Suppress noisy Spark startup banners during this suite.
-  java.util.logging.Logger.getLogger("org.apache.spark").setLevel(java.util.logging.Level.WARNING)
 }

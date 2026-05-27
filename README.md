@@ -161,6 +161,8 @@ Notes:
 
 The extension installs a SparkListener (executor lifecycle + per-stage task-end events for feedback mode) and a `BlockLocationsProvider` that rewrites `CachedFileSystem.getFileBlockLocations` to return `executor_<host>_<execId>` strings — recognized by Spark as `ExecutorCacheTaskLocation` for PROCESS_LOCAL scheduling. When HDFS native locality already covers `min-target-hosts` matching executors, the hint is suppressed so soft affinity does not stomp better locality.
 
+`CachedFileSystem` also overrides `listLocatedStatus` + `listFiles` so Spark 4's s3a fast-path (default `spark.sql.sources.useListFilesFileSystemList="s3a"` → `HadoopFSUtils.listFiles`) picks up the same hint. S3A's `S3ALocatedFileStatus` and ABFS's `AbfsLocatedFileStatus` are reflectively rebuilt with the rewritten block-locations so the affinity hint AND the `EtagSource` metadata Hadoop's `ManifestCommitter` consumes are both preserved. HDFS `LocatedFileStatus` subclasses pass through unchanged to preserve `FileEncryptionInfo` + erasure-coding policy.
+
 For custom DataSource v2 connectors that own their own scan, the same hint is available as a public API: `CachedFsAffinity.getPreferredLocations(path, nativeHosts)` returns the executor location strings directly.
 
 ## Build

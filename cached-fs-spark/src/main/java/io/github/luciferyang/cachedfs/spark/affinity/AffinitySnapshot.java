@@ -30,6 +30,8 @@ package io.github.luciferyang.cachedfs.spark.affinity;
  * @param executorCount currently-registered executors
  * @param hostCount distinct hosts spanning the registered executors
  * @param duplicateReadingEntries entries currently held in the observed-placement cache
+ * @param stageRddsCount entries in the {@code stageId → rddIds} feedback-state map
+ * @param rddPartitionsCount entries in the {@code rddId → splits} feedback-state map
  */
 public record AffinitySnapshot(
     boolean enabled,
@@ -40,4 +42,6 @@ public record AffinitySnapshot(
     int duplicateReadingMaxCacheItems,
     int executorCount,
     int hostCount,
-    int duplicateReadingEntries) {}
+    int duplicateReadingEntries,
+    int stageRddsCount,
+    int rddPartitionsCount) {}

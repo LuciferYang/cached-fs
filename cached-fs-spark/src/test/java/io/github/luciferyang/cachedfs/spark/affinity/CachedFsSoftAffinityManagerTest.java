@@ -232,6 +232,30 @@ class CachedFsSoftAffinityManagerTest {
   }
 
   @Test
+  @DisplayName("initialize rebuild preserves all five SparkConf-driven knobs across the swap")
+  void initializeRebuildPreservesKnobs() {
+    CachedFsSoftAffinityManager.resetForTesting();
+    CachedFsSoftAffinityManager first = CachedFsSoftAffinityManager.initialize(50);
+    // Mutate every preserved knob to a non-default value via configureAtomic (the production
+    // façade path) so the test exercises the same code path the extension uses.
+    first.configureAtomic(
+        /* enabled */ true,
+        /* replicationNum */ 3,
+        /* minTargetHosts */ 2,
+        /* detectDuplicateReading */ true,
+        /* duplicateReadingMaxCacheItems */ 500);
+    // No executors / observations attached → rebuild is loss-free. Knob values MUST carry over.
+    CachedFsSoftAffinityManager rebuilt = CachedFsSoftAffinityManager.initialize(200);
+    AffinitySnapshot snap = rebuilt.snapshot();
+    assertThat(snap.virtualNodes()).isEqualTo(200);
+    assertThat(snap.enabled()).isTrue();
+    assertThat(snap.replicationNum()).isEqualTo(3);
+    assertThat(snap.minTargetHosts()).isEqualTo(2);
+    assertThat(snap.detectDuplicateReading()).isTrue();
+    assertThat(snap.duplicateReadingMaxCacheItems()).isEqualTo(500);
+  }
+
+  @Test
   @DisplayName(
       "initialize keeps prior density when state is attached (lossy rebuild would be unsafe)")
   void initializeKeepsDensityWhenStateAttached() {
@@ -246,8 +270,8 @@ class CachedFsSoftAffinityManagerTest {
   }
 
   @Test
-  @DisplayName("setDuplicateReadingMaxCacheItems shrinks the existing observations map in-place")
-  void setMaxCacheItemsShrinksMap() {
+  @DisplayName("setDuplicateReadingMaxCacheItems shrinks ALL THREE feedback-state maps in-place")
+  void setMaxCacheItemsShrinksAllThreeMaps() {
     mgr.setDetectDuplicateReading(true);
     mgr.handleExecutorAdded("e1", "h1");
     for (int i = 0; i < 10; i++) {
@@ -256,9 +280,18 @@ class CachedFsSoftAffinityManagerTest {
       mgr.updatePartitionMap(100 + i, List.of(s));
       mgr.updateTaskEnd(i, 0, "e1", "h1");
     }
-    assertThat(mgr.snapshot().duplicateReadingEntries()).isEqualTo(10);
+    AffinitySnapshot before = mgr.snapshot();
+    assertThat(before.duplicateReadingEntries()).isEqualTo(10);
+    assertThat(before.stageRddsCount()).isEqualTo(10);
+    assertThat(before.rddPartitionsCount()).isEqualTo(10);
+
     mgr.setDuplicateReadingMaxCacheItems(4);
-    assertThat(mgr.snapshot().duplicateReadingEntries()).isEqualTo(4);
+
+    AffinitySnapshot after = mgr.snapshot();
+    assertThat(after.duplicateReadingEntries()).isEqualTo(4);
+    assertThat(after.stageRddsCount()).isEqualTo(4);
+    assertThat(after.rddPartitionsCount()).isEqualTo(4);
+    assertThat(after.duplicateReadingMaxCacheItems()).isEqualTo(4);
   }
 
   @Test
