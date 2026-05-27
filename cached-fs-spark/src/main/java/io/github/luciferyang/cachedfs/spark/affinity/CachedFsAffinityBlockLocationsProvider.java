@@ -81,22 +81,23 @@ public final class CachedFsAffinityBlockLocationsProvider implements BlockLocati
 
   /**
    * Builds a fresh {@link BlockLocation} whose {@code hosts} carries the executor-shaped task
-   * locations, with {@code names} aligned to the same length so the informal {@code names.length ==
-   * hosts.length} parallel-array invariant some Hadoop consumers rely on holds.
+   * locations. {@code names} is passed as {@code null} so Hadoop's {@link BlockLocation}
+   * constructor substitutes its private {@code EMPTY_STR_ARRAY} singleton — no per-BlockLocation
+   * allocation for that slot.
+   *
+   * <p>Semantically the {@code names} slot is reserved for {@code "host:port"}-style replica
+   * datanode RPC addresses (HDFS Balancer + audit log analyzers consume it). Stuffing
+   * executor-shaped task locations into {@code names} would corrupt the BlockLocation contract for
+   * those tools, and Spark only consults {@code hosts}, so leaving {@code names} empty is the
+   * strictly safer choice.
+   *
+   * <p>The {@code hosts} array is cloned per-call because Hadoop's BlockLocation constructor calls
+   * {@code StringInterner.internStringsInArray} which MUTATES the input array in place AND retains
+   * the reference — sharing {@code preferred} across N BlockLocations would alias their {@code
+   * hosts} arrays AND mutate the caller's {@code preferred} on the first interner pass.
    */
   private static BlockLocation hostsOnly(String[] preferred, long offset, long length) {
-    // Clone hosts per BlockLocation: Hadoop's BlockLocation constructor calls
-    // StringInterner.internStringsInArray which MUTATES the input array in place AND retains the
-    // reference. Sharing `preferred` across N BlockLocations would alias their hosts arrays AND
-    // mutate the caller's `preferred` on first interner pass. The defensive clone isolates each
-    // BlockLocation's state.
-    //
-    // `names` is empty by design: Hadoop semantically reserves the `names` slot for
-    // "host:port"-style replica datanode RPC addresses. Stuffing executor-shaped task locations
-    // into `names` would corrupt the BlockLocation contract for any downstream tool (HDFS
-    // balancer, audit log analyzers) that reads getNames() — and Spark only consults `hosts`,
-    // so the `names` array is functionally inert from Spark's perspective.
-    return new BlockLocation(new String[0], preferred.clone(), offset, length);
+    return new BlockLocation(/* names= */ null, preferred.clone(), offset, length);
   }
 
   /** Collects the union of inner-FS hosts. Deduped + null-safe; returns empty when unset. */

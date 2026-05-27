@@ -357,12 +357,15 @@ public final class CachedFileSystem extends FilterFileSystem {
   /**
    * Lazy {@link org.apache.hadoop.fs.RemoteIterator} wrapper that rewrites each emitted entry's
    * block-locations. {@link
-   * org.apache.hadoop.util.functional.RemoteIterators#mappingRemoteIterator} preserves {@link
-   * org.apache.hadoop.fs.statistics.IOStatisticsSource} and {@link java.io.Closeable} forwarding —
-   * important so Spark 4's IOStatistics aggregation and Hadoop's S3A streaming-list-result cleanup
-   * keep working through the wrapper. Per-entry preserve-subclass detection routes entries through
-   * unchanged when flattening would drop subclass-specific data (HDFS encryption / EC, S3A / ABFS
-   * {@link org.apache.hadoop.fs.EtagSource} eTag for Hadoop {@code ManifestCommitter} validation).
+   * org.apache.hadoop.util.functional.RemoteIterators#mappingRemoteIterator} forwards {@link
+   * org.apache.hadoop.fs.statistics.IOStatisticsSource} (read from the SOURCE iterator only, not
+   * the mapped element) and {@link java.io.Closeable} from the source — important so Spark 4's
+   * IOStatistics aggregation and Hadoop's S3A streaming-list-result cleanup keep working through
+   * the wrapper. Per-entry handling: HDFS subclasses pass through unchanged; {@link
+   * org.apache.hadoop.fs.EtagSource} subclasses (S3A, ABFS) are reflectively rebuilt to preserve
+   * BOTH the eTag (consumed by Hadoop's {@code ManifestCommitter} via {@code instanceof
+   * EtagSource}) AND the affinity hint; everything else goes through the plain {@link
+   * org.apache.hadoop.fs.LocatedFileStatus} copy constructor.
    */
   private static org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus>
       rewriteLocatedIterator(
@@ -375,16 +378,6 @@ public final class CachedFileSystem extends FilterFileSystem {
   private static org.apache.hadoop.fs.LocatedFileStatus rewriteOne(
       org.apache.hadoop.fs.LocatedFileStatus original, BlockLocationsProvider provider)
       throws IOException {
-    if (shouldPreserveSubclass(original)) {
-      // Preserve subclass identity: HdfsLocatedFileStatus carries FileEncryptionInfo + EC
-      // policy + fileId; S3ALocatedFileStatus / AbfsLocatedFileStatus carry eTag + versionId
-      // consumed by Hadoop ManifestCommitter + Iceberg / Delta change detection via the
-      // EtagSource interface. The (FileStatus, BlockLocation[]) copy constructor flattens these
-      // to a plain LocatedFileStatus, silently dropping the subclass-only fields. Trade-off: for
-      // these files the affinity hint does not propagate, but the connector-specific metadata
-      // survives — which is the strictly safer default.
-      return original;
-    }
     org.apache.hadoop.fs.BlockLocation[] underlying = original.getBlockLocations();
     if (underlying == null || underlying.length == 0) {
       return original;
@@ -394,22 +387,77 @@ public final class CachedFileSystem extends FilterFileSystem {
     if (rewritten == null || rewritten == underlying) {
       return original;
     }
+    // HDFS subclasses (HdfsLocatedFileStatus) carry FileEncryptionInfo + EC policy + fileId that
+    // the generic copy constructor would drop. HDFS also has good native locality already, so
+    // dropping our affinity hint there is acceptable. Preserve original.
+    if (original.getClass().getName().startsWith("org.apache.hadoop.hdfs.")) {
+      return original;
+    }
+    // EtagSource subclasses (S3ALocatedFileStatus, AbfsLocatedFileStatus) carry eTag + versionId
+    // consumed by Hadoop's ManifestCommitter (and any future EtagSource consumer). The generic
+    // copy constructor would silently drop these. Use a subclass-aware reflective rebuild that
+    // preserves BOTH the affinity hint AND the EtagSource metadata. S3A is Spark 4's default
+    // cloud scan path (spark.sql.sources.useListFilesFileSystemList="s3a") — without this
+    // rebuild the affinity feature is largely inert for the primary cloud deployment target.
+    if (original instanceof org.apache.hadoop.fs.EtagSource) {
+      org.apache.hadoop.fs.LocatedFileStatus rebuilt =
+          tryRebuildEtagSourceSubclass(original, rewritten);
+      if (rebuilt != null) {
+        return rebuilt;
+      }
+      // Unknown EtagSource subclass / classloader drift — preserve original so the eTag survives
+      // at the cost of the affinity hint. Strictly safer than the lossy copy.
+      return original;
+    }
     return new org.apache.hadoop.fs.LocatedFileStatus(original, rewritten);
   }
 
   /**
-   * True when {@code lfs} carries subclass-specific data that the {@code new
-   * LocatedFileStatus(original, rewritten)} copy constructor would flatten away. Covers HDFS
-   * subclasses (package-prefix match, no compile-time dep on hadoop-hdfs-client) AND any {@link
-   * org.apache.hadoop.fs.EtagSource} implementer — which catches S3A's {@code S3ALocatedFileStatus}
-   * and ABFS's {@code AbfsLocatedFileStatus} uniformly without requiring a per-connector match
-   * list.
+   * Reflectively constructs a subclass-typed {@link org.apache.hadoop.fs.LocatedFileStatus} with
+   * the rewritten block-locations, preserving the subclass-specific fields (eTag, versionId,
+   * isEmptyDirectory) so the affinity hint AND {@link org.apache.hadoop.fs.EtagSource} metadata
+   * both flow through to Spark + Hadoop ManifestCommitter.
+   *
+   * <p>Currently handles:
+   *
+   * <ul>
+   *   <li>{@code org.apache.hadoop.fs.s3a.S3ALocatedFileStatus} via {@code toS3AFileStatus()} + the
+   *       public {@code (S3AFileStatus, BlockLocation[])} constructor.
+   *   <li>{@code org.apache.hadoop.fs.azurebfs.services.AbfsLocatedFileStatus} via the public
+   *       {@code (FileStatus, BlockLocation[])} constructor which copies the eTag from any {@link
+   *       org.apache.hadoop.fs.EtagSource} input.
+   * </ul>
+   *
+   * <p>Returns {@code null} on any reflective failure — caller falls back to preserve-original.
    */
-  private static boolean shouldPreserveSubclass(org.apache.hadoop.fs.LocatedFileStatus lfs) {
-    if (lfs instanceof org.apache.hadoop.fs.EtagSource) {
-      return true;
+  private static org.apache.hadoop.fs.LocatedFileStatus tryRebuildEtagSourceSubclass(
+      org.apache.hadoop.fs.LocatedFileStatus original,
+      org.apache.hadoop.fs.BlockLocation[] rewritten) {
+    String fqn = original.getClass().getName();
+    try {
+      if ("org.apache.hadoop.fs.s3a.S3ALocatedFileStatus".equals(fqn)) {
+        java.lang.reflect.Method toS3aStatus = original.getClass().getMethod("toS3AFileStatus");
+        Object s3aStatus = toS3aStatus.invoke(original);
+        java.lang.reflect.Constructor<?> ctor =
+            original
+                .getClass()
+                .getConstructor(s3aStatus.getClass(), org.apache.hadoop.fs.BlockLocation[].class);
+        return (org.apache.hadoop.fs.LocatedFileStatus) ctor.newInstance(s3aStatus, rewritten);
+      }
+      if ("org.apache.hadoop.fs.azurebfs.services.AbfsLocatedFileStatus".equals(fqn)) {
+        java.lang.reflect.Constructor<?> ctor =
+            original
+                .getClass()
+                .getConstructor(
+                    org.apache.hadoop.fs.FileStatus.class,
+                    org.apache.hadoop.fs.BlockLocation[].class);
+        return (org.apache.hadoop.fs.LocatedFileStatus) ctor.newInstance(original, rewritten);
+      }
+    } catch (ReflectiveOperationException | RuntimeException ignored) {
+      // Class signature drift, classloader weirdness, or a connector failing inside its own
+      // ctor / getter — caller falls back to preserve-original.
     }
-    return lfs.getClass().getName().startsWith("org.apache.hadoop.hdfs.");
+    return null;
   }
 
   /**
