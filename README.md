@@ -6,6 +6,9 @@ A Java reimplementation of the [velox](https://github.com/facebookincubator/velo
 - **Per-executor**: embedded library, no daemon, no separate cache cluster.
 - **Two-tier**: RAM (clock + sampled-percentile eviction) + local SSD (64 MiB regions, checkpoint+log recovery).
 - **Multi-scheme**: one JVM can transparently cache reads from several Hadoop FileSystems at once — register one decorator per `scheme://authority` (e.g. `hdfs://nn-a`, `s3a://bucket-x`, `bos://bucket-y`) and they share the RAM/SSD tiers without disturbing each other on close.
+- **Coalesced fills**: adjacent missing chunks issued by a single read are merged into one `preadv` call against the inner FS, cutting per-chunk RPC overhead on wide-column scans.
+- **Async prefetch**: dense sequential readers fire an admission-gated background fill for the next chunk while still consuming the current one, hiding inner-FS latency without thrashing the cache (per-stream byte budget + heap-pressure guard + saturation back-off).
+- **IO statistics surface**: every `FSDataInputStream` opens with Hadoop `IOStatisticsSource` wiring (`stream_read_*`, `cachedfs_stream_*`); bootstrap-level aggregates roll up across streams (`cachedfs_aggregate_*`) for Prometheus / dashboard scraping.
 - **JDK 21+**, **Hadoop 3.4.x+**.
 
 See [`velox-file-read-cache.md`](velox-file-read-cache.md) for the design spec.
@@ -59,6 +62,23 @@ All keys live under the `fs.cached.*` namespace; the first `installIfNeeded` cal
 | `fs.cached.ssd.checksum.read-verify` | `false` | Verify checksums on read (requires `checksum.enabled`). |
 | `fs.cached.load-quantum-bytes` | `8388608` | Read granularity on the cached path; supersedes Hadoop's `bufferSize`. |
 | `fs.cached.handle-cache-capacity` | `1024` | Open-handle LRU capacity (per JVM, shared across schemes). |
+| `fs.cached.scan-id` | — | Optional scan identifier used by the per-`(scanId, file)` density tracker; resolved at `open()` time as `withScanId` ThreadLocal → this key → `"default"`. |
+| `fs.cached.scan-tracker.enabled` | `true` | When false, the tracker behaves as a no-op `ScanTracker.DISABLED`; `readPct()` returns 100% and the prefetch admission gate's density predicate always passes. |
+| `fs.cached.metrics.enabled` | `true` | When false, `IoStatistics.NO_OP` is wired into every stream — counter bumps short-circuit and the Hadoop `IOStatistics` surface returns zeros. |
+| `fs.cached.coalesce.enabled` | `true` | Coalesce contiguous missing chunks issued by a single read into one `preadv` call against the inner FS. |
+| `fs.cached.coalesce.always-on` | `false` | Bypass the auto-disable rule (which turns coalesce off on caches smaller than 8×`loadQuantum`). Set to `true` for unit / IT scenarios that use tiny caches. |
+| `fs.cached.coalesce.max-gap-bytes` | `loadQuantum/16` | Maximum gap between two missing chunks that the coalescer may bridge by overreading (counted into `cachedfs_*_raw_overread_bytes`). |
+| `fs.cached.coalesce.max-chunks-per-group` | `16` | Upper bound on chunks coalesced into a single `preadv`. Caps tail-latency from one inner-FS hiccup. |
+| `fs.cached.coalesce.max-restarts` | `3` | How many `Waiting`-driven walk restarts the coalesce path will attempt before falling back to the per-chunk loop. |
+| `fs.cached.prefetch.enabled` | `true` | Master toggle for the async prefetch path. When false, every bump-site is a no-op regardless of state. |
+| `fs.cached.prefetch.threads` | `availableProcessors()` | Worker count for the prefetch thread pool. Daemon threads named `cached-fs-prefetch-N`. |
+| `fs.cached.prefetch.queue` | `64` | Bounded queue capacity. Rejection routes through `DiscardAndCountHandler` (counts `prefetchSkipped("queue_full")` and arms the per-stream back-off). |
+| `fs.cached.prefetch.heap-pressure-check.enabled` | `true` | When true, the admission gate consults `MemoryMXBean.getHeapMemoryUsage()` and rejects new prefetches once heap is at or above the JVM's soft target. |
+| `fs.cached.prefetch.heap-pressure-ttl-ms` | `100` | TTL for the cached heap-pressure bit; single-CAS-winner refresh bounds the MBean call rate under contention. |
+| `fs.cached.prefetch.rejection-backoff-ms` | `100` | Per-stream cooldown after a queue rejection. Cold-start sentinel `Long.MIN_VALUE/2` lets the first attempt fire unconditionally. |
+| `fs.cached.prefetch.trigger-tail-fraction` | `0.5` | Fraction of the current chunk that must be consumed before the next-chunk prefetch is even considered. |
+| `fs.cached.prefetch.density-threshold-pct` | `80` | Minimum `tracker.readPct()` for the prefetch to fire. Lower density bumps `prefetchEligibleSuppressed` instead. |
+| `fs.cached.prefetch.max-pending-bytes` | `loadQuantum × threads × 4` | JVM-wide byte budget for in-flight prefetch tasks. Over-budget admissions bump `prefetchSkipped("budget")`. |
 
 ## TTL (cache aging)
 
@@ -79,6 +99,29 @@ int dropped = ttl.applyTTL(3600);
 Two-tier removal calls RAM and SSD independently with the full set of aged-out files — matching velox, the SSD fan-out is NOT gated on RAM retention so a long-lived shared pin in RAM does not extend the SSD copy's lifetime. Pinned entries (in either tier) are reported back and retried on the next cycle. A reader that re-opens a file mid-TTL refreshes the tracking entry so freshly-loaded cache bytes are not silently lost on the cycle's cleanup. `numAgedOut` in `AsyncDataCache.refreshStats()` is the RAM-tier counter for entries dropped via `removeFileEntries` — applicable to TTL but also any other caller of that API; it does NOT count SSD-side drops.
 
 Call `applyTTL` no more than once per minute in production: each invocation scans every RAM shard under its mutex and every SSD region, so frequent calls starve readers.
+
+## Observability
+
+Every `FSDataInputStream` returned by the decorator is an `IOStatisticsSource`. The bootstrap itself also implements `IOStatisticsSource` via `CacheBootstrap.get().orElseThrow().getIOStatistics()` — aggregate totals merged from each stream's `close()` plus a handful of live registry gauges.
+
+Per-stream counters (subset; full list in the `IoStatisticsAdapter` javadoc):
+
+- `stream_read_operations`, `stream_read_bytes` — Hadoop-standard read counters.
+- `cachedfs_stream_cache_hit{,_bytes}` — RAM cache hits.
+- `stream_read_prefetch_operations`, `cachedfs_stream_prefetched_bytes` — completed prefetch fills.
+- `cachedfs_stream_ssd_read_{operations,bytes}` — SSD-tier reads.
+- `cachedfs_stream_raw_overread_bytes` — gap bytes the coalescer absorbed between non-adjacent misses.
+- `cachedfs_stream_prefetch_skipped_{queue_full,budget,heap_pressure,other}_bytes` — per-reason admission-gate rejections.
+- `cachedfs_stream_prefetch_eligible_suppressed_bytes` — admission would have passed but density was below threshold.
+- `cachedfs_stream_seq_hwm_regime_resets` — sequential trajectory broke and the HWM CAS-loop reset.
+
+Bootstrap aggregate counters mirror these with the `cachedfs_aggregate_*` prefix and `_operations` suffix on event counts (e.g. `cachedfs_aggregate_read_operations`, `cachedfs_aggregate_prefetch_skipped_budget_bytes`). Additional bootstrap-only signals:
+
+- `cachedfs_stale_scan_id_recoveries` — count of `withScanId` calls that found a leftover slot from a crashed prior task.
+- `cachedfs_scan_tracker_count`, `cachedfs_scan_tracker_entries`, `cachedfs_scan_tracker_max_entries` — registry-snapshot gauges.
+- `cachedfs_pending_prefetch_bytes` — live in-flight prefetch byte budget.
+
+Disable the surface entirely with `fs.cached.metrics.enabled=false`; per-stream `IoStatistics` becomes `NO_OP` and every counter reads zero.
 
 ## Modules
 
