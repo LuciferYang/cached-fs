@@ -28,6 +28,7 @@
   <modules>
     <module>cached-fs-core</module>
     <module>cached-fs-hadoop</module>
+    <module>cached-fs-spark</module>
     <module>cached-fs-metrics</module>
     <module>cached-fs-cli</module>
   </modules>

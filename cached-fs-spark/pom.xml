@@ -1,0 +1,189 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.github.luciferyang</groupId>
+    <artifactId>cached-fs-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>cached-fs-spark</artifactId>
+  <name>cached-fs (spark)</name>
+  <description>
+    Spark soft-affinity scheduling for cached-fs. Drives PROCESS_LOCAL task placement so
+    repeat reads of the same file land on the executor whose cached-fs cache likely holds it.
+    Combines a static consistent-hash ring (deterministic, no feedback required) with an
+    optional duplicate-reading detector (feedback-driven, opt-in) modeled on Apache Gluten.
+  </description>
+
+  <properties>
+    <!-- Spark 4.0 ships with Scala 2.13 and supports JDK 21, matching cached-fs's JDK floor.
+         Earlier Spark releases (3.5 and below) do not fully support JDK 21. -->
+    <spark.version>4.0.0</spark.version>
+    <scala.binary.version>2.13</scala.binary.version>
+    <scala.version>2.13.15</scala.version>
+    <scala-maven-plugin.version>4.9.2</scala-maven-plugin.version>
+    <scalatest-maven-plugin.version>2.2.0</scalatest-maven-plugin.version>
+    <scalatest.version>3.2.19</scalatest.version>
+    <commons-codec.version>1.18.0</commons-codec.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>io.github.luciferyang</groupId>
+      <artifactId>cached-fs-hadoop</artifactId>
+    </dependency>
+
+    <!-- Spark is the integration target. Marked provided: the host application already ships
+         Spark; we MUST NOT pull a copy into the runtime classpath. -->
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-core_${scala.binary.version}</artifactId>
+      <version>${spark.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-sql_${scala.binary.version}</artifactId>
+      <version>${spark.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- MurmurHash3 powers the consistent-hash ring. commons-codec is already a transitive
+         dependency of Hadoop, so this adds no new runtime jar. -->
+    <dependency>
+      <groupId>commons-codec</groupId>
+      <artifactId>commons-codec</artifactId>
+      <version>${commons-codec.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+    </dependency>
+
+    <!-- Scala runtime is provided by Spark — marked provided so we don't bundle it. -->
+    <dependency>
+      <groupId>org.scala-lang</groupId>
+      <artifactId>scala-library</artifactId>
+      <version>${scala.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- test -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.mockito</groupId>
+      <artifactId>mockito-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.scalatest</groupId>
+      <artifactId>scalatest_${scala.binary.version}</artifactId>
+      <version>${scalatest.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <!-- Spark test fixtures (LocalSparkContext, etc.) are only needed transitively; we use a
+         plain SparkSession in tests so no spark-core-tests dependency is required. -->
+  </dependencies>
+
+  <build>
+    <sourceDirectory>src/main/java</sourceDirectory>
+    <testSourceDirectory>src/test/java</testSourceDirectory>
+    <plugins>
+      <!-- Scala compilation. scala-maven-plugin runs BEFORE javac so Scala can see Java types
+           (e.g. SparkListener implementation references the manager class), and javac then
+           compiles against both directories. -->
+      <plugin>
+        <groupId>net.alchim31.maven</groupId>
+        <artifactId>scala-maven-plugin</artifactId>
+        <version>${scala-maven-plugin.version}</version>
+        <configuration>
+          <scalaVersion>${scala.version}</scalaVersion>
+          <args>
+            <arg>-deprecation</arg>
+            <arg>-feature</arg>
+            <arg>-unchecked</arg>
+          </args>
+          <jvmArgs>
+            <jvmArg>-Xms256m</jvmArg>
+            <jvmArg>-Xmx768m</jvmArg>
+          </jvmArgs>
+        </configuration>
+        <executions>
+          <execution>
+            <id>scala-compile</id>
+            <phase>process-resources</phase>
+            <goals>
+              <goal>add-source</goal>
+              <goal>compile</goal>
+            </goals>
+            <configuration>
+              <sourceDir>${project.basedir}/src/main/scala</sourceDir>
+            </configuration>
+          </execution>
+          <execution>
+            <id>scala-test-compile</id>
+            <phase>process-test-resources</phase>
+            <goals>
+              <goal>add-source</goal>
+              <goal>testCompile</goal>
+            </goals>
+            <configuration>
+              <sourceDir>${project.basedir}/src/test/scala</sourceDir>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+      </plugin>
+      <plugin>
+        <groupId>org.jacoco</groupId>
+        <artifactId>jacoco-maven-plugin</artifactId>
+      </plugin>
+      <plugin>
+        <groupId>com.diffplug.spotless</groupId>
+        <artifactId>spotless-maven-plugin</artifactId>
+      </plugin>
+
+      <!-- scalatest runner; only runs when *Suite.scala test files exist. -->
+      <plugin>
+        <groupId>org.scalatest</groupId>
+        <artifactId>scalatest-maven-plugin</artifactId>
+        <version>${scalatest-maven-plugin.version}</version>
+        <configuration>
+          <reportsDirectory>${project.build.directory}/scalatest-reports</reportsDirectory>
+          <junitxml>.</junitxml>
+          <filereports>WDF TestSuite.txt</filereports>
+        </configuration>
+        <executions>
+          <execution>
+            <id>test</id>
+            <goals>
+              <goal>test</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

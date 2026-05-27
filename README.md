@@ -129,8 +129,33 @@ Disable the surface entirely with `fs.cached.metrics.enabled=false`; per-stream 
 | --- | --- |
 | `cached-fs-core` | Pure cache library. Mirrors `velox/common/caching/`. No Hadoop dep. |
 | `cached-fs-hadoop` | Transparent Hadoop FileSystem decorator. |
+| `cached-fs-spark` | Spark soft-affinity scheduling (consistent-hash + feedback-driven duplicate-reading detect). Targets Spark 4.0+ / Scala 2.13 / JDK 21. |
 | `cached-fs-metrics` | JMX MBeans + Micrometer/Prometheus exporters. Optional. |
 | `cached-fs-cli` | Operations tooling. |
+
+## Spark soft-affinity (cached-fs-spark)
+
+When the cached-fs decorator is wired into a Spark cluster, repeated reads of the same file ideally land on the executor whose cached-fs cache already holds it. The `cached-fs-spark` module adds a driver-side soft-affinity layer that hints Spark's DAGScheduler with the right executor for each file. Drawn from Apache Gluten + lance-spark-zb.
+
+Two cooperating modes:
+
+- **Static (consistent-hash, default on with `enabled=true`):** the file's qualified path is hashed against a consistent-hash ring of live executors. Deterministic, no feedback required, fires on the first task. Replication > 1 produces N fault-tolerant candidates per file.
+- **Feedback (`duplicate-reading-detect.enabled=true`):** a SparkListener records the actual `(executor, host)` that ran each FilePartition split (keyed by `path_start_length`). Subsequent reads of the same split prefer the observed executor, overriding the consistent-hash result.
+
+Enable via `spark.sql.extensions` + a handful of `spark.cached-fs.affinity.*` keys:
+
+```properties
+spark.sql.extensions=io.github.luciferyang.cachedfs.spark.CachedFsAffinityExtension
+spark.cached-fs.affinity.enabled=true
+spark.cached-fs.affinity.replication-num=2
+spark.cached-fs.affinity.min-target-hosts=1
+spark.cached-fs.affinity.duplicate-reading-detect.enabled=false
+spark.cached-fs.affinity.duplicate-reading.max-cache-items=10000
+```
+
+The extension installs a SparkListener (executor lifecycle + per-stage task-end events for feedback mode) and a `BlockLocationsProvider` that rewrites `CachedFileSystem.getFileBlockLocations` to return `executor_<host>_<execId>` strings — recognized by Spark as `ExecutorCacheTaskLocation` for PROCESS_LOCAL scheduling. When HDFS native locality already covers `min-target-hosts` matching executors, the hint is suppressed so soft affinity does not stomp better locality.
+
+For custom DataSource v2 connectors that own their own scan, the same hint is available as a public API: `CachedFsAffinity.getPreferredLocations(path, nativeHosts)` returns the executor location strings directly.
 
 ## Build
 

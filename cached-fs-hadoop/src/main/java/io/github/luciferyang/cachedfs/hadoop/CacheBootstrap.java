@@ -69,6 +69,15 @@ public final class CacheBootstrap {
   private static volatile CacheBootstrap installed;
 
   /**
+   * Pending {@link BlockLocationsProvider} set by a downstream module BEFORE the bootstrap has been
+   * installed. {@link #installIfNeeded(Configuration)} picks it up at the end of install so the
+   * provider is in place by the time the first {@code getFileBlockLocations} call lands. Volatile
+   * for cross-thread publication (Spark extension typically runs on the driver's session-start
+   * thread; first {@code installIfNeeded} runs on whichever thread first opens a cached file).
+   */
+  private static volatile BlockLocationsProvider pendingBlockLocationsProvider;
+
+  /**
    * Cap on the number of WARN-level stale-slot-recovery log lines per JVM. Beyond this, recoveries
    * are logged at DEBUG (the {@link AggregatedIoStatistics#staleScanIdRecoveries()} counter keeps
    * ticking regardless). 16 is enough to surface a new failure mode in logs without flooding
@@ -138,6 +147,13 @@ public final class CacheBootstrap {
    * {@code @Execution(SAME_THREAD)}.
    */
   private volatile ReadFileFactory readFileFactory = HadoopReadFile::new;
+
+  /**
+   * Optional block-locations override. Defaults to {@code null} (decorator returns the inner FS's
+   * locations verbatim). The {@code cached-fs-spark} module installs an affinity-aware provider
+   * here so Spark's planner sees executor-shaped task locations.
+   */
+  private volatile BlockLocationsProvider blockLocationsProvider;
 
   /**
    * Live opener registry, keyed by {@code scheme://authority}. Each {@link CachedFileSystem}
@@ -256,6 +272,12 @@ public final class CacheBootstrap {
         } catch (RuntimeException | Error setIdsEx) {
           AsyncDataCache.clearInstance();
           throw setIdsEx;
+        }
+        // Pick up a provider staged before the bootstrap came online (typical for Spark
+        // extensions that fire at session start, before any FileSystem.get(...) call).
+        BlockLocationsProvider pending = pendingBlockLocationsProvider;
+        if (pending != null) {
+          b.blockLocationsProvider = pending;
         }
         installed = b;
         return b;
@@ -456,6 +478,9 @@ public final class CacheBootstrap {
         else primary.addSuppressed(ex);
       }
       AsyncDataCache.clearInstance();
+      // Clear any staged BlockLocationsProvider so a subsequent test that does NOT install the
+      // Spark extension doesn't inherit the previous test's affinity wiring.
+      pendingBlockLocationsProvider = null;
       // FileIds has no clear API; the singleton remains but is reusable since StringIdMap holds no
       // OS resources. Test-only path; production never uninstalls.
       if (primary != null) {
@@ -568,6 +593,43 @@ public final class CacheBootstrap {
     ReadFileFactory prior = this.readFileFactory;
     this.readFileFactory = factory;
     return () -> this.readFileFactory = prior;
+  }
+
+  /**
+   * Returns the active {@link BlockLocationsProvider}, or {@code null} when none is installed (the
+   * decorator returns inner-FS locations unchanged).
+   */
+  public BlockLocationsProvider blockLocationsProvider() {
+    return blockLocationsProvider;
+  }
+
+  /**
+   * Installs a {@link BlockLocationsProvider}. Pass {@code null} to revert to the default
+   * passthrough. Called by the {@code cached-fs-spark} module's Spark extension at startup;
+   * production callers should invoke this at most once per JVM.
+   */
+  public void setBlockLocationsProvider(BlockLocationsProvider provider) {
+    this.blockLocationsProvider = provider;
+  }
+
+  /**
+   * Stages a {@link BlockLocationsProvider} for installation by the NEXT {@link
+   * #installIfNeeded(Configuration)} call. Used by the {@code cached-fs-spark} module's Spark
+   * extension when it fires BEFORE any {@code CachedFileSystem.initialize} — the staged provider is
+   * picked up the moment the bootstrap comes online so block-location rewrites apply from the very
+   * first file open.
+   *
+   * <p>If the bootstrap is already installed, this delegates straight to {@link
+   * #setBlockLocationsProvider(BlockLocationsProvider)} on the live instance. Idempotent across
+   * staging-then-install sequences.
+   */
+  public static void stageBlockLocationsProvider(BlockLocationsProvider provider) {
+    CacheBootstrap snapshot = installed;
+    if (snapshot != null) {
+      snapshot.setBlockLocationsProvider(provider);
+      return;
+    }
+    pendingBlockLocationsProvider = provider;
   }
 
   /**

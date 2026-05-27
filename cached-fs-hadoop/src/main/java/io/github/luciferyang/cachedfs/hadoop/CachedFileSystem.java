@@ -269,6 +269,38 @@ public final class CachedFileSystem extends FilterFileSystem {
   }
 
   /**
+   * Override of {@link FilterFileSystem#getFileBlockLocations(FileStatus, long, long)}. Delegates
+   * to the inner FS, then asks the optional {@link BlockLocationsProvider} (installed by the {@code
+   * cached-fs-spark} module's Spark extension) to rewrite the result. When no provider is installed
+   * or {@link #enabled} is false, returns the inner FS result unchanged.
+   *
+   * <p>Spark's planner consults this method on the driver during FileScan planning; the rewritten
+   * locations flow into {@code FilePartition.preferredLocations()} and the DAGScheduler parses
+   * {@code "executor_<host>_<execId>"} strings as {@link
+   * org.apache.spark.scheduler.ExecutorCacheTaskLocation} for PROCESS_LOCAL scheduling.
+   */
+  @Override
+  public org.apache.hadoop.fs.BlockLocation[] getFileBlockLocations(
+      FileStatus file, long start, long len) throws IOException {
+    org.apache.hadoop.fs.BlockLocation[] underlying = fs.getFileBlockLocations(file, start, len);
+    if (!enabled) {
+      return underlying;
+    }
+    CacheBootstrap b = CacheBootstrap.get().orElse(null);
+    if (b == null) {
+      return underlying;
+    }
+    BlockLocationsProvider provider = b.blockLocationsProvider();
+    if (provider == null) {
+      return underlying;
+    }
+    org.apache.hadoop.fs.BlockLocation[] rewritten =
+        provider.getBlockLocations(file, start, len, underlying);
+    // Defensive: a misbehaving provider that returns null falls back to the underlying value.
+    return rewritten != null ? rewritten : underlying;
+  }
+
+  /**
    * Override of {@link FilterFileSystem#openFile(Path)}. The inherited delegation hands the builder
    * to the inner FS, which means a Spark vectorized Parquet/ORC reader using {@code
    * openFile(p).build()} would silently bypass the cache. By returning the default {@link
