@@ -16,7 +16,6 @@
 package io.github.luciferyang.cachedfs.spark.affinity;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 
@@ -35,15 +34,19 @@ import java.util.List;
  *
  * <p>The returned strings follow Spark's {@code TaskLocation.apply} convention: {@code
  * "executor_<host>_<execId>"} ⇒ {@code ExecutorCacheTaskLocation} (PROCESS_LOCAL). When no executor
- * is identified, plain host strings ({@code NODE_LOCAL}) are returned. An empty array means: don't
- * override the native locality.
+ * is identified, an empty array is returned — caller falls back to native locality.
+ *
+ * <p><b>Spark caps preferred-locations at 3 hosts</b> per file (FilePartition.scala uses {@code
+ * take(3)} after grouping by length). Setting {@code replication-num} higher than 3 has no effect
+ * on Spark planning; the upper candidates are silently dropped.
  */
 public final class CachedFsAffinity {
 
   private CachedFsAffinity() {}
 
   /**
-   * Single-path lookup, the form most custom DataSource connectors need.
+   * Single-path lookup. Suitable for custom DataSource connectors operating on one file per
+   * partition.
    *
    * @param filePath qualified file URI as it appears in the underlying {@code FileStatus}
    * @param nativeHosts Hadoop-derived hosts from {@code BlockLocation.getHosts()} — used by the
@@ -56,41 +59,107 @@ public final class CachedFsAffinity {
     CachedFsSoftAffinityManager mgr = CachedFsSoftAffinityManager.getInstance();
     if (!mgr.isEnabled() || filePath == null || filePath.isEmpty()) return new String[0];
     if (mgr.shouldDeferToNativeLocality(nativeHosts)) return new String[0];
-    List<ExecutorNode> nodes = mgr.askExecutorsForPath(filePath, mgr.getReplicationNum());
-    return toTaskLocations(nodes);
+    return toTaskLocations(mgr.askExecutorsForPath(filePath, mgr.getReplicationNum()));
   }
 
   /**
-   * Multi-split lookup with feedback override. Used by Spark's FileScan path where one
-   * InputPartition groups multiple file splits. When {@code detectDuplicateReading} is on, the
-   * observed (executor, host) recorded by prior runs of the SAME split-set wins over the
-   * consistent-hash result.
+   * Multi-split lookup with feedback override. When {@code detectDuplicateReading} is enabled and a
+   * prior task placement for the same split-set was recorded via {@link #recordPartitionMap}, the
+   * observed executor wins over the consistent-hash result.
+   *
+   * <p>When no observation exists yet, falls back to the consistent-hash lookup keyed on the first
+   * split's path (Gluten makes the same choice). Acceptable proxy because multi-split
+   * FilePartitions usually pack files from the same dataset.
    *
    * @param splits ordered file-split fingerprints for this partition
    * @param nativeHosts Hadoop-derived hosts; same contract as the single-path overload
    */
-  public static String[] getPreferredLocations(
-      List<CachedFsSoftAffinityManager.SplitKey> splits, String[] nativeHosts) {
+  public static String[] getPreferredLocations(List<SplitKey> splits, String[] nativeHosts) {
     CachedFsSoftAffinityManager mgr = CachedFsSoftAffinityManager.getInstance();
     if (!mgr.isEnabled() || splits == null || splits.isEmpty()) return new String[0];
     if (mgr.shouldDeferToNativeLocality(nativeHosts)) return new String[0];
-    List<ExecutorNode> observed =
-        mgr.isDetectDuplicateReading() ? mgr.askExecutorsForSplit(splits) : Collections.emptyList();
-    if (!observed.isEmpty()) {
-      return toTaskLocations(observed);
+    if (mgr.isDetectDuplicateReading()) {
+      List<ExecutorNode> observed = mgr.askExecutorsForSplit(splits);
+      if (!observed.isEmpty()) {
+        return toTaskLocations(observed);
+      }
     }
-    // No feedback yet — fall back to the consistent-hash result keyed on the FIRST split's path.
-    // Multi-split FilePartitions usually pack files from the same dataset, so the first-path key
-    // is a stable proxy. (Gluten makes the same choice.)
-    List<ExecutorNode> ring =
-        mgr.askExecutorsForPath(splits.get(0).path(), mgr.getReplicationNum());
-    return toTaskLocations(ring);
+    return toTaskLocations(mgr.askExecutorsForPath(splits.get(0).path(), mgr.getReplicationNum()));
   }
 
   /** Whether the affinity feature is enabled and the ring has executors registered. */
   public static boolean isActive() {
     CachedFsSoftAffinityManager mgr = CachedFsSoftAffinityManager.getInstance();
     return mgr.isEnabled() && mgr.executorCount() > 0;
+  }
+
+  /**
+   * Records the (rddId, splits) mapping that feedback mode needs to attribute task-end placements
+   * back to the file region that drove the read. Integrators with custom DataSource v2 scans should
+   * call this from their {@code Scan.planInputPartitions()} so the listener's {@code onTaskEnd} can
+   * lookup the partition's file-splits when it fires.
+   *
+   * <p>Calling this when feedback mode is disabled is a no-op. Calling it from Spark's built-in
+   * {@code FileSourceScanExec} path is not possible (Spark does not expose its planned mapping to
+   * external code) — only static-mode affinity applies in that case.
+   */
+  public static void recordPartitionMap(int rddId, List<SplitKey> splits) {
+    CachedFsSoftAffinityManager.getInstance().updatePartitionMap(rddId, splits);
+  }
+
+  // --- configuration façade (used by the Scala extension) ----------------
+
+  /**
+   * Configures the manager's knobs from already-parsed SparkConf values. Bundles all five
+   * SparkConf-driven settings into one atomic call so the extension can't observe a half-applied
+   * state. Validates inputs and rethrows clear messages naming the SparkConf key.
+   */
+  public static void configure(
+      boolean enabled,
+      int replicationNum,
+      int minTargetHosts,
+      boolean detectDuplicateReading,
+      int duplicateReadingMaxCacheItems) {
+    CachedFsSoftAffinityManager mgr = CachedFsSoftAffinityManager.getInstance();
+    if (replicationNum <= 0) {
+      throw new IllegalArgumentException(
+          CachedFsAffinityConfig.REPLICATION_NUM + " must be positive, got " + replicationNum);
+    }
+    if (minTargetHosts < 0) {
+      throw new IllegalArgumentException(
+          CachedFsAffinityConfig.MIN_TARGET_HOSTS + " must be non-negative, got " + minTargetHosts);
+    }
+    if (duplicateReadingMaxCacheItems <= 0) {
+      throw new IllegalArgumentException(
+          CachedFsAffinityConfig.DUPLICATE_READING_MAX_CACHE_ITEMS
+              + " must be positive, got "
+              + duplicateReadingMaxCacheItems);
+    }
+    mgr.setReplicationNum(replicationNum);
+    mgr.setMinTargetHosts(minTargetHosts);
+    mgr.setDetectDuplicateReading(detectDuplicateReading);
+    mgr.setDuplicateReadingMaxCacheItems(duplicateReadingMaxCacheItems);
+    // Set enabled LAST so a partially-initialized manager can never be observed as enabled.
+    mgr.setEnabled(enabled);
+  }
+
+  /**
+   * Initializes the manager singleton with the requested ring density. Idempotent: if the singleton
+   * already exists with a different value, the existing density is preserved (and a WARN is logged
+   * by the manager). Callers MUST invoke this BEFORE any code path causes the singleton to
+   * materialize via {@link CachedFsSoftAffinityManager#getInstance}.
+   */
+  public static void initializeWithVirtualNodes(int virtualNodes) {
+    CachedFsSoftAffinityManager.initialize(virtualNodes);
+  }
+
+  /**
+   * Per-SparkContext reset hook. Called by the listener on {@code SparkApplicationEnd} so the next
+   * SparkContext in the same JVM starts with a fresh ring + observation cache. Knob values are
+   * preserved across the boundary.
+   */
+  public static void notifyApplicationEnd() {
+    CachedFsSoftAffinityManager.getInstance().resetForApplicationEnd();
   }
 
   // --- helpers -----------------------------------------------------------
@@ -101,7 +170,6 @@ public final class CachedFsAffinity {
     for (ExecutorNode n : nodes) {
       out.add(n.toCacheTaskLocation());
     }
-    List<String> list = new ArrayList<>(out);
-    return list.toArray(new String[0]);
+    return new ArrayList<>(out).toArray(new String[0]);
   }
 }

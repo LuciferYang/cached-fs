@@ -17,7 +17,6 @@ package io.github.luciferyang.cachedfs.spark.affinity;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import io.github.luciferyang.cachedfs.spark.affinity.CachedFsSoftAffinityManager.SplitKey;
 import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;

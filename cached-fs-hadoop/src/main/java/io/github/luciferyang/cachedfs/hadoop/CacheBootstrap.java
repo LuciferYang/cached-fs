@@ -624,12 +624,22 @@ public final class CacheBootstrap {
    * staging-then-install sequences.
    */
   public static void stageBlockLocationsProvider(BlockLocationsProvider provider) {
-    CacheBootstrap snapshot = installed;
-    if (snapshot != null) {
-      snapshot.setBlockLocationsProvider(provider);
-      return;
+    // Take LOCK around the stage-vs-install branch so installIfNeeded cannot publish the
+    // bootstrap between our `installed` read and our pendingBlockLocationsProvider write. Without
+    // the lock, a stage that interleaves with the very first installIfNeeded loses the provider
+    // permanently — the bootstrap installs without a provider AND every subsequent stage call
+    // takes the early-return branch since `installed` is now non-null.
+    LOCK.lock();
+    try {
+      CacheBootstrap snapshot = installed;
+      if (snapshot != null) {
+        snapshot.setBlockLocationsProvider(provider);
+        return;
+      }
+      pendingBlockLocationsProvider = provider;
+    } finally {
+      LOCK.unlock();
     }
-    pendingBlockLocationsProvider = provider;
   }
 
   /**

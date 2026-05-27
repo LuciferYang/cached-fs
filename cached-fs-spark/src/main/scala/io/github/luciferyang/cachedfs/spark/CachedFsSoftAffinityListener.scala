@@ -15,12 +15,13 @@
  */
 package io.github.luciferyang.cachedfs.spark
 
-import io.github.luciferyang.cachedfs.spark.affinity.CachedFsSoftAffinityManager
+import io.github.luciferyang.cachedfs.spark.affinity.{CachedFsAffinity, CachedFsSoftAffinityManager}
 
 import org.apache.spark.SparkContext
 import org.apache.spark.internal.Logging
 import org.apache.spark.scheduler.{
   SparkListener,
+  SparkListenerApplicationEnd,
   SparkListenerExecutorAdded,
   SparkListenerExecutorRemoved,
   SparkListenerStageCompleted,
@@ -28,6 +29,7 @@ import org.apache.spark.scheduler.{
   SparkListenerTaskEnd
 }
 
+import java.util.concurrent.atomic.AtomicReference
 import scala.util.control.NonFatal
 
 /**
@@ -35,9 +37,12 @@ import scala.util.control.NonFatal
  * [[CachedFsSoftAffinityManager]]. Registered once per SparkContext via
  * [[CachedFsSoftAffinityListener.ensureRegistered]].
  *
- * Two responsibilities:
+ * Three responsibilities:
  *   1. Static-mode upkeep: executor add/remove → ring add/remove.
  *   2. Feedback-mode upkeep: stage submit/complete + task end → split-key observations.
+ *   3. Per-SparkContext reset: on `SparkApplicationEnd`, drop ring + observation state so the
+ *      next SparkContext in the same JVM (REPL / notebook / Spark Connect) doesn't inherit
+ *      stale executor IDs.
  *
  * Feedback-mode hooks short-circuit cheaply when {@code detectDuplicateReading} is off, so we
  * register a single listener regardless of mode.
@@ -47,7 +52,15 @@ class CachedFsSoftAffinityListener extends SparkListener with Logging {
   private def mgr: CachedFsSoftAffinityManager = CachedFsSoftAffinityManager.getInstance()
 
   override def onExecutorAdded(event: SparkListenerExecutorAdded): Unit = {
-    val host = Option(event.executorInfo.executorHost).getOrElse("")
+    val host = event.executorInfo.executorHost
+    // ExecutorInfo.executorHost is a non-null val per Spark's source, but be defensive against
+    // future field renames; reject empty hosts at the manager boundary anyway.
+    if (host == null || host.isEmpty) {
+      logWarning(
+        s"Ignoring executor ${event.executorId} with null/empty host — would corrupt " +
+          "TaskLocation parsing")
+      return
+    }
     mgr.handleExecutorAdded(event.executorId, host)
   }
 
@@ -76,49 +89,64 @@ class CachedFsSoftAffinityListener extends SparkListener with Logging {
       case _ => // skip failed tasks; we only learn from successful placements
     }
   }
+
+  override def onApplicationEnd(event: SparkListenerApplicationEnd): Unit = {
+    // Per-SparkContext reset so a sequential SparkContext in the same JVM (REPL workflow,
+    // SparkSession.builder().getOrCreate() after stop, Spark Connect, etc.) starts fresh
+    // without inheriting stale executor IDs from the previous context.
+    CachedFsAffinity.notifyApplicationEnd()
+    CachedFsSoftAffinityListener.clearRegistered()
+  }
 }
 
 object CachedFsSoftAffinityListener extends Logging {
 
-  @volatile private var registered: Boolean = false
+  // Tracks the SparkContext we have a listener registered against, so a NEW SparkContext in the
+  // same JVM triggers a fresh registration. Using AtomicReference rather than a plain @volatile
+  // Boolean so the (compare-and-swap to the new context) operation is atomic.
+  private val registeredCtx = new AtomicReference[SparkContext]()
 
   /**
-   * Idempotent: registers exactly one listener per JVM. Also seeds the ring from the current
-   * executor set so a listener attached AFTER executors came up still has a populated ring.
+   * Idempotent: registers exactly one listener per (JVM, SparkContext). A new SparkContext
+   * registers a fresh listener.
    */
   def ensureRegistered(sc: SparkContext): Unit = {
-    if (registered) return
-    synchronized {
-      if (registered) return
+    if (registeredCtx.get() eq sc) return
+    if (registeredCtx.compareAndSet(null, sc) || registeredCtx.compareAndSet(other(sc), sc)) {
       try {
-        // We do NOT seed the ring from sc's existing executor set: Spark's public API does not
+        // We do NOT seed the ring from the existing executor set: Spark's public API does not
         // expose an (id, host) tuple for already-running executors (statusStore is
-        // package-private under org.apache.spark; statusTracker.getExecutorInfos lacks the id
-        // field). The listener instead relies on incremental SparkListenerExecutorAdded events
-        // from registration time forward. Register the extension early — ideally in
-        // spark.sql.extensions at session start — so executors come up AFTER the listener is in
-        // place. Dynamic-allocation churn is handled cleanly because each new executor fires its
-        // own onExecutorAdded.
+        // package-private; statusTracker.getExecutorInfos lacks the id field). The listener
+        // instead relies on incremental SparkListenerExecutorAdded events from registration time
+        // forward. Spark's SparkSessionExtensions fires very early — before executors come up on
+        // typical cluster deployments — so this is sufficient. Dynamic-allocation churn is
+        // handled cleanly because each new executor fires its own onExecutorAdded.
         sc.addSparkListener(new CachedFsSoftAffinityListener())
-        registered = true
-        logInfo("CachedFsSoftAffinityListener registered")
+        logInfo(s"CachedFsSoftAffinityListener registered on SparkContext ${sc.applicationId}")
       } catch {
         case NonFatal(t) =>
-          logWarning(s"Failed to register CachedFsSoftAffinityListener: ${t.getMessage}")
+          // Roll back the CAS so a subsequent caller can retry.
+          registeredCtx.set(null)
+          logWarning(
+            s"Failed to register CachedFsSoftAffinityListener on SparkContext ${sc.applicationId}",
+            t)
       }
     }
   }
 
-  private def extractHost(hostPort: String): String = {
-    if (hostPort == null || hostPort.isEmpty) "unknown"
-    else {
-      val lastColon = hostPort.lastIndexOf(':')
-      if (lastColon <= 0) hostPort else hostPort.substring(0, lastColon)
-    }
+  /** Returns the captured-context reference IF different from sc — used by the second CAS branch. */
+  private def other(sc: SparkContext): SparkContext = {
+    val prior = registeredCtx.get()
+    if (prior eq sc) sc else prior
+  }
+
+  /** Called by the listener instance on `SparkApplicationEnd` so the next ctx re-registers. */
+  private[spark] def clearRegistered(): Unit = {
+    registeredCtx.set(null)
   }
 
   /** Test-only. Clears the registered flag so a fresh SparkContext can re-register. */
-  private[spark] def resetForTesting(): Unit = synchronized {
-    registered = false
+  private[spark] def resetForTesting(): Unit = {
+    registeredCtx.set(null)
   }
 }

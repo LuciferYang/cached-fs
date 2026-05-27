@@ -16,8 +16,8 @@
 package io.github.luciferyang.cachedfs.spark.affinity;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import io.github.luciferyang.cachedfs.spark.affinity.CachedFsSoftAffinityManager.SplitKey;
 import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -182,13 +182,79 @@ class CachedFsSoftAffinityManagerTest {
   }
 
   @Test
-  @DisplayName("composeKey produces a stable, sorted, comma-joined fingerprint")
+  @DisplayName("composeKey produces a stable, sorted, separator-joined fingerprint")
   void composeKeyDeterministic() {
     SplitKey a = new SplitKey(0, "hdfs://a", 0, 100);
     SplitKey b = new SplitKey(0, "hdfs://b", 0, 200);
     // Order of input list doesn't affect the result.
     String k1 = CachedFsSoftAffinityManager.composeKey(List.of(a, b));
     String k2 = CachedFsSoftAffinityManager.composeKey(List.of(b, a));
-    assertThat(k1).isEqualTo(k2).isEqualTo("hdfs://a_0_100,hdfs://b_0_200");
+    String expected =
+        "hdfs://a"
+            + CachedFsSoftAffinityManager.KEY_FIELD_SEPARATOR
+            + "0"
+            + CachedFsSoftAffinityManager.KEY_FIELD_SEPARATOR
+            + "100"
+            + CachedFsSoftAffinityManager.KEY_SPLIT_SEPARATOR
+            + "hdfs://b"
+            + CachedFsSoftAffinityManager.KEY_FIELD_SEPARATOR
+            + "0"
+            + CachedFsSoftAffinityManager.KEY_FIELD_SEPARATOR
+            + "200";
+    assertThat(k1).isEqualTo(k2).isEqualTo(expected);
+  }
+
+  @Test
+  @DisplayName("handleExecutorAdded rejects empty/null host (would corrupt TaskLocation)")
+  void rejectsEmptyHost() {
+    mgr.handleExecutorAdded("e-empty", "");
+    mgr.handleExecutorAdded("e-null", null);
+    assertThat(mgr.executorCount()).isZero();
+  }
+
+  @Test
+  @DisplayName("handleExecutorAdded rejects host containing '_' (would corrupt TaskLocation)")
+  void rejectsUnderscoreHost() {
+    mgr.handleExecutorAdded("e-bad", "host_with_underscore");
+    assertThat(mgr.executorCount()).isZero();
+  }
+
+  @Test
+  @DisplayName(
+      "initialize logs a warn but keeps prior ring density when called with a different value")
+  void initializeIdempotent() {
+    // @BeforeEach already constructed the singleton via getInstance(); reset so we can drive the
+    // first-initialize path here.
+    CachedFsSoftAffinityManager.resetForTesting();
+    CachedFsSoftAffinityManager first = CachedFsSoftAffinityManager.initialize(50);
+    assertThat(first.snapshot().virtualNodes()).isEqualTo(50);
+    // Second call with a different value returns the SAME instance with unchanged density.
+    CachedFsSoftAffinityManager again = CachedFsSoftAffinityManager.initialize(200);
+    assertThat(again).isSameAs(first);
+    assertThat(again.snapshot().virtualNodes()).isEqualTo(50);
+  }
+
+  @Test
+  @DisplayName("setDuplicateReadingMaxCacheItems shrinks the existing observations map in-place")
+  void setMaxCacheItemsShrinksMap() {
+    mgr.setDetectDuplicateReading(true);
+    mgr.handleExecutorAdded("e1", "h1");
+    for (int i = 0; i < 10; i++) {
+      mgr.updateStageSubmitted(i, new int[] {100 + i});
+      SplitKey s = new SplitKey(0, "hdfs://tbl/p" + i, 0, 1024);
+      mgr.updatePartitionMap(100 + i, List.of(s));
+      mgr.updateTaskEnd(i, 0, "e1", "h1");
+    }
+    assertThat(mgr.snapshot().duplicateReadingEntries()).isEqualTo(10);
+    mgr.setDuplicateReadingMaxCacheItems(4);
+    assertThat(mgr.snapshot().duplicateReadingEntries()).isEqualTo(4);
+  }
+
+  @Test
+  @DisplayName("setReplicationNum rejects non-positive values with a clear exception")
+  void setReplicationNumValidates() {
+    assertThatThrownBy(() -> mgr.setReplicationNum(0))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("replicationNum");
   }
 }

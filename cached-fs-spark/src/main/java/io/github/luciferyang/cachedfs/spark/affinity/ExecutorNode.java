@@ -38,17 +38,14 @@ public record ExecutorNode(String executorId, String host) implements Consistent
   /**
    * Spark's {@code TaskLocation.apply} parses any {@code "executor_<host>_<execId>"} string into an
    * {@code ExecutorCacheTaskLocation}, which the DAGScheduler treats as PROCESS_LOCAL preferred
-   * placement. Host-only locations (used by {@link #toHostTaskLocation()}) produce NODE_LOCAL.
+   * placement.
+   *
+   * <p>Spark recovers {@code host} and {@code execId} by stripping the {@code "executor_"} prefix
+   * and {@code split("_", 2)} on the remainder, so any underscore in {@code host} silently corrupts
+   * the parse. {@link CachedFsSoftAffinityManager#handleExecutorAdded} rejects underscore-bearing
+   * hosts at the listener boundary — this method does NOT re-validate.
    */
   public String toCacheTaskLocation() {
-    if (host.isEmpty()) {
-      return executorId;
-    }
     return "executor_" + host + "_" + executorId;
-  }
-
-  /** Plain host string — caller asks for NODE_LOCAL placement instead of PROCESS_LOCAL. */
-  public String toHostTaskLocation() {
-    return host;
   }
 }

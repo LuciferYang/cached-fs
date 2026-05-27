@@ -149,9 +149,15 @@ spark.sql.extensions=io.github.luciferyang.cachedfs.spark.CachedFsAffinityExtens
 spark.cached-fs.affinity.enabled=true
 spark.cached-fs.affinity.replication-num=2
 spark.cached-fs.affinity.min-target-hosts=1
+spark.cached-fs.affinity.virtual-nodes=100
 spark.cached-fs.affinity.duplicate-reading-detect.enabled=false
 spark.cached-fs.affinity.duplicate-reading.max-cache-items=10000
 ```
+
+Notes:
+
+- `replication-num` larger than 3 has no effect — Spark caps `FilePartition.preferredLocations` at 3 entries per file.
+- Feedback mode (`duplicate-reading-detect.enabled=true`) requires a custom DataSource v2 connector to call `CachedFsAffinity.recordPartitionMap(rddId, splits)` from its scan-planning code. Spark's built-in `FileSourceScanExec` does not expose its planned partition mapping to listeners, so the static (consistent-hash) mode is what runs with Spark's stock Parquet/ORC readers.
 
 The extension installs a SparkListener (executor lifecycle + per-stage task-end events for feedback mode) and a `BlockLocationsProvider` that rewrites `CachedFileSystem.getFileBlockLocations` to return `executor_<host>_<execId>` strings — recognized by Spark as `ExecutorCacheTaskLocation` for PROCESS_LOCAL scheduling. When HDFS native locality already covers `min-target-hosts` matching executors, the hint is suppressed so soft affinity does not stomp better locality.
 

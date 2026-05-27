@@ -17,83 +17,133 @@ package io.github.luciferyang.cachedfs.spark
 
 import io.github.luciferyang.cachedfs.hadoop.CacheBootstrap
 import io.github.luciferyang.cachedfs.spark.affinity.{
+  CachedFsAffinity,
   CachedFsAffinityBlockLocationsProvider,
-  CachedFsAffinityConfig,
-  CachedFsSoftAffinityManager
+  CachedFsAffinityConfig
 }
 
-import org.apache.spark.SparkContext
+import org.apache.spark.{SparkContext, SparkEnv}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSessionExtensions
 
 /**
- * Entry point for {@code spark.sql.extensions=io.github.luciferyang.cachedfs.spark.CachedFsAffinityExtension}.
+ * Entry point for `spark.sql.extensions=io.github.luciferyang.cachedfs.spark.CachedFsAffinityExtension`.
  *
  * On apply this:
- *   - Reads the cached-fs.affinity.* SparkConf keys and configures
- *     [[CachedFsSoftAffinityManager]]'s singleton with them.
- *   - Registers a [[CachedFsSoftAffinityListener]] on the active SparkContext to track executor
- *     lifecycle + (when feedback mode is on) per-stage task-end events.
+ *   1. Initializes the affinity manager singleton with the configured ring density (virtual-nodes).
+ *      MUST happen first so the singleton materializes with the right density before any other
+ *      code touches it.
+ *   2. Applies the SparkConf-driven knobs to the manager via [[CachedFsAffinity.configure]]. The
+ *      `enabled` flag is set LAST so a partially-configured manager can never be observed as on.
+ *   3. Registers the [[CachedFsSoftAffinityListener]] on the active SparkContext to track executor
+ *      lifecycle + (when feedback mode is on) per-stage task-end events.
+ *   4. Stages the [[CachedFsAffinityBlockLocationsProvider]] onto the cached-fs bootstrap so
+ *      `CachedFileSystem.getFileBlockLocations` (and the listLocatedStatus / listFiles overrides)
+ *      surface affinity-aware preferred locations to Spark's planner.
  *
- * Future work: also inject a Catalyst rule that overrides {@code FilePartition.preferredLocations}
- * for the V1 FileScan path. For now the per-file hint flows through the FileSystem decorator's
- * {@code getFileBlockLocations} override, which Spark consults to compute preferred locations on
- * the driver during planning.
+ * Invalid SparkConf values are caught and logged WITHOUT failing session startup — the affinity
+ * feature defaults to disabled, so a misconfigured key should not take down the whole driver.
  */
 class CachedFsAffinityExtension extends (SparkSessionExtensions => Unit) with Logging {
 
   override def apply(ext: SparkSessionExtensions): Unit = {
-    val sc = SparkContext.getOrCreate()
-    configureFromConf(sc)
+    // We can't use SparkContext.getActive (package-private to org.apache.spark) and the
+    // SparkSession itself isn't yet constructed when apply() fires — Spark's
+    // SparkSession.applyExtensions runs BEFORE the session is registered as active. The safe
+    // alternative: SparkEnv.get returns the active SparkEnv iff a SparkContext is initialized;
+    // when it's non-null, SparkContext.getOrCreate() is guaranteed to return the existing
+    // context rather than spawn a default one. Bail out (without creating any context) when no
+    // SparkEnv exists — that's the non-standard caller case (unit test instantiating the
+    // extension class directly).
+    if (SparkEnv.get == null) {
+      logWarning(
+        "CachedFsAffinityExtension.apply invoked without an initialized SparkContext — " +
+          "skipping. If you see this in production, your extension wiring is non-standard.")
+      return
+    }
+    val sc: SparkContext = SparkContext.getOrCreate()
+
+    // Step 1: ring density must be locked in BEFORE the singleton materializes from any other
+    // code path. initializeWithVirtualNodes is idempotent and logs a WARN if the manager was
+    // already constructed with a different value.
+    val virtualNodes = readPositiveInt(
+      sc,
+      CachedFsAffinityConfig.VIRTUAL_NODES,
+      CachedFsAffinityConfig.DEFAULT_VIRTUAL_NODES)
+    try {
+      CachedFsAffinity.initializeWithVirtualNodes(virtualNodes)
+    } catch {
+      case ex: IllegalArgumentException =>
+        logError(
+          s"Invalid ${CachedFsAffinityConfig.VIRTUAL_NODES}: $virtualNodes (${ex.getMessage}). " +
+            "Affinity feature is disabled for this session.",
+          ex)
+        return
+    }
+
+    // Step 2: apply knobs. CachedFsAffinity.configure validates inputs and rethrows with messages
+    // that name the offending SparkConf key. We catch + log + disable on failure rather than
+    // throwing up into the SparkSession startup.
+    val enabled = sc.getConf
+      .getBoolean(CachedFsAffinityConfig.ENABLED, CachedFsAffinityConfig.DEFAULT_ENABLED)
+    val replicationNum = readPositiveInt(
+      sc,
+      CachedFsAffinityConfig.REPLICATION_NUM,
+      CachedFsAffinityConfig.DEFAULT_REPLICATION_NUM)
+    val minTargetHosts = readNonNegativeInt(
+      sc,
+      CachedFsAffinityConfig.MIN_TARGET_HOSTS,
+      CachedFsAffinityConfig.DEFAULT_MIN_TARGET_HOSTS)
+    val detectDuplicateReading = sc.getConf.getBoolean(
+      CachedFsAffinityConfig.DUPLICATE_READING_DETECT_ENABLED,
+      CachedFsAffinityConfig.DEFAULT_DUPLICATE_READING_DETECT_ENABLED)
+    val duplicateReadingMaxCacheItems = readPositiveInt(
+      sc,
+      CachedFsAffinityConfig.DUPLICATE_READING_MAX_CACHE_ITEMS,
+      CachedFsAffinityConfig.DEFAULT_DUPLICATE_READING_MAX_CACHE_ITEMS)
+    try {
+      CachedFsAffinity.configure(
+        enabled,
+        replicationNum,
+        minTargetHosts,
+        detectDuplicateReading,
+        duplicateReadingMaxCacheItems)
+    } catch {
+      case ex: IllegalArgumentException =>
+        logError(
+          s"Invalid SparkConf for cached-fs affinity (${ex.getMessage}). Feature disabled.",
+          ex)
+        return
+    }
+
+    // Step 3: register the listener AFTER the manager is fully configured. Order matters because
+    // SparkListenerExecutorAdded events arriving between addSparkListener and the manager being
+    // enabled would be recorded in the ring with enabled=false — harmless but wasteful.
     CachedFsSoftAffinityListener.ensureRegistered(sc)
-    installBlockLocationsProvider()
-    logInfo(
-      "CachedFsAffinityExtension applied (manager configured, listener registered," +
-        " block-locations provider installed)")
-  }
 
-  /**
-   * Wires the affinity-aware {@link CachedFsAffinityBlockLocationsProvider} into the cached-fs
-   * bootstrap, but only if it is already installed. The bootstrap installs on the first
-   * {@code CachedFileSystem.initialize} call, which may not have happened yet when the Spark
-   * extension fires; in that case the provider is installed lazily via {@link
-   * CacheBootstrap#setBlockLocationsProvider} on the next bootstrap install (see follow-up).
-   *
-   * <p>Idempotent: re-applying the extension over an already-installed provider is a no-op
-   * (instance is replaced with an equivalent one).
-   */
-  private[spark] def installBlockLocationsProvider(): Unit = {
-    // stageBlockLocationsProvider handles both cases: bootstrap already installed → install
-    // directly on the live instance; bootstrap not yet installed → stage so the next
-    // installIfNeeded call picks it up.
+    // Step 4: stage the block-locations provider. stageBlockLocationsProvider takes the bootstrap
+    // LOCK so this is race-free against a concurrent installIfNeeded (Hadoop-side fix).
     CacheBootstrap.stageBlockLocationsProvider(new CachedFsAffinityBlockLocationsProvider())
+
+    logInfo(
+      s"CachedFsAffinityExtension applied to SparkContext ${sc.applicationId}: enabled=$enabled, " +
+        s"replicationNum=$replicationNum, minTargetHosts=$minTargetHosts, " +
+        s"detectDuplicateReading=$detectDuplicateReading, virtualNodes=$virtualNodes")
   }
 
-  /**
-   * Pulls the cached-fs.affinity.* SparkConf keys onto the manager. Called from {@link #apply} but
-   * exposed package-private so a unit test can drive it without spinning a full SparkSession.
-   */
-  private[spark] def configureFromConf(sc: SparkContext): Unit = {
-    val conf = sc.getConf
-    val mgr = CachedFsSoftAffinityManager.getInstance()
+  private def readPositiveInt(sc: SparkContext, key: String, default: Int): Int = {
+    val raw = sc.getConf.getInt(key, default)
+    if (raw <= 0) {
+      logWarning(s"$key=$raw is not positive; falling back to default $default")
+      default
+    } else raw
+  }
 
-    mgr.setEnabled(
-      conf.getBoolean(CachedFsAffinityConfig.ENABLED, CachedFsAffinityConfig.DEFAULT_ENABLED))
-    mgr.setReplicationNum(
-      conf.getInt(
-        CachedFsAffinityConfig.REPLICATION_NUM,
-        CachedFsAffinityConfig.DEFAULT_REPLICATION_NUM))
-    mgr.setMinTargetHosts(
-      conf.getInt(
-        CachedFsAffinityConfig.MIN_TARGET_HOSTS,
-        CachedFsAffinityConfig.DEFAULT_MIN_TARGET_HOSTS))
-    mgr.setDetectDuplicateReading(
-      conf.getBoolean(
-        CachedFsAffinityConfig.DUPLICATE_READING_DETECT_ENABLED,
-        CachedFsAffinityConfig.DEFAULT_DUPLICATE_READING_DETECT_ENABLED))
-    mgr.setDuplicateReadingMaxCacheItems(
-      conf.getInt(
-        CachedFsAffinityConfig.DUPLICATE_READING_MAX_CACHE_ITEMS,
-        CachedFsAffinityConfig.DEFAULT_DUPLICATE_READING_MAX_CACHE_ITEMS))
+  private def readNonNegativeInt(sc: SparkContext, key: String, default: Int): Int = {
+    val raw = sc.getConf.getInt(key, default)
+    if (raw < 0) {
+      logWarning(s"$key=$raw is negative; falling back to default $default")
+      default
+    } else raw
   }
 }

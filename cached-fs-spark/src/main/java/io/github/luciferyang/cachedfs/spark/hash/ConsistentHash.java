@@ -15,6 +15,7 @@
  */
 package io.github.luciferyang.cachedfs.spark.hash;
 
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -67,7 +68,10 @@ public final class ConsistentHash<T extends ConsistentHash.Node> {
   }
 
   private static long defaultHash(String key, int seed) {
-    byte[] data = key.getBytes();
+    // Force UTF-8 so the same path string hashes identically regardless of JVM default charset
+    // (otherwise a JVM started with -Dfile.encoding=ISO-8859-1 would land on different ring
+    // slots than the default UTF-8 deployment).
+    byte[] data = key.getBytes(StandardCharsets.UTF_8);
     return MurmurHash3.hash32x86(data, 0, data.length, seed);
   }
 
@@ -149,7 +153,12 @@ public final class ConsistentHash<T extends ConsistentHash.Node> {
     }
   }
 
-  /** Slot-iterator that wraps around the ring tail → head until exhausted. */
+  /**
+   * Slot-iterator that wraps around the ring tail → head until exhausted. MUST be consumed while
+   * the enclosing read lock is held — the underlying {@link SortedMap#tailMap}/{@link
+   * SortedMap#headMap} are live views that become invalid the instant a concurrent writer
+   * structurally modifies the ring.
+   */
   private final class AllocateIterator implements Iterator<Partition<T>> {
     private final Iterator<Partition<T>> tail;
     private final Iterator<Partition<T>> head;
