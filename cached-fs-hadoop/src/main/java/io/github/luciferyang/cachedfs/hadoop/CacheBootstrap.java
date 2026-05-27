@@ -85,6 +85,14 @@ public final class CacheBootstrap {
   private final CacheTTLController ttlController;
 
   /**
+   * Phase 5c prefetch executor. Null when {@code fs.cached.prefetch.enabled=false} (the consumer
+   * checks for null before submitting). Built once at {@link #installIfNeeded} and shut down in
+   * {@link #uninstallForTesting} with a bounded await + {@code shutdownNow} fallback to bound the
+   * pin-leak window per phase-5c.md §step 1.
+   */
+  private final java.util.concurrent.ThreadPoolExecutor prefetchExecutor;
+
+  /**
    * Per-scan {@link ScanTracker} registry. Lifetime entries are inserted lazily by {@link
    * #trackerFor(String)} and evicted by {@link #withScanId(String)} close or explicit {@link
    * #removeScanTracker(String)}. See phase-5a doc for the long-lived-JVM eviction rationale.
@@ -125,7 +133,8 @@ public final class CacheBootstrap {
       SsdCache ssdCache,
       StringIdMap stringIds,
       int loadQuantumBytes,
-      int handleCapacity) {
+      int handleCapacity,
+      java.util.concurrent.ThreadPoolExecutor prefetchExecutor) {
     this.ramCache = ramCache;
     this.ssdCache = ssdCache;
     this.stringIds = stringIds;
@@ -135,6 +144,7 @@ public final class CacheBootstrap {
     // TTL controller is always constructed; embedders opt in by calling applyTTL externally.
     // Cheap to construct (empty map) and harmless when no applyTTL caller exists.
     this.ttlController = new CacheTTLController(ramCache, ssdCache, Clock.systemUTC());
+    this.prefetchExecutor = prefetchExecutor;
   }
 
   /**
@@ -186,7 +196,15 @@ public final class CacheBootstrap {
         }
         int handleCap = CachedFsConfig.handleCacheCapacity(conf);
         int quantum = CachedFsConfig.loadQuantumBytes(conf);
-        CacheBootstrap b = new CacheBootstrap(ram, ssd, ids, quantum, handleCap);
+        // Phase 5c executor: built only when the master toggle is on. Null when disabled — the
+        // hot read path checks for null before submitting a prefetch task.
+        java.util.concurrent.ThreadPoolExecutor prefetchExec = null;
+        if (CachedFsConfig.prefetchEnabled(conf)) {
+          prefetchExec =
+              PrefetchExecutorFactory.create(
+                  CachedFsConfig.prefetchThreads(conf), CachedFsConfig.prefetchQueue(conf));
+        }
+        CacheBootstrap b = new CacheBootstrap(ram, ssd, ids, quantum, handleCap, prefetchExec);
         // All pieces ready — now publish singletons atomically (w.r.t. LOCK) and commit.
         // Order matters because FileIds has no clearInstance API (test-only singleton):
         // publish AsyncDataCache FIRST so that if FileIds.setInstance somehow throws (it can
@@ -333,9 +351,29 @@ public final class CacheBootstrap {
         return;
       }
       IOException primary = null;
-      // Drain handle factory FIRST — each FileHandle owns a lazily-opened inner-FS input stream
-      // that the LRU would otherwise leak when the bootstrap reference is dropped. Run before tier
-      // shutdown so handle close-paths still see a live RAM/SSD cache if they touch it.
+      // Phase 5c executor shutdown — happens BEFORE handle drain so any in-flight prefetch task
+      // finishes its run-finally (decrementPendingPrefetch + clearPendingPrefetchIf) against a
+      // still-live RAM cache. Bounded await: 5s then shutdownNow + another 5s; persistent
+      // stragglers are logged at ERROR. Bounds the pin-leak window per phase-5c.md §step 1.
+      if (b.prefetchExecutor != null) {
+        b.prefetchExecutor.shutdown();
+        try {
+          if (!b.prefetchExecutor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
+            b.prefetchExecutor.shutdownNow();
+            if (!b.prefetchExecutor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
+              LOG.error(
+                  "prefetch executor failed to terminate within 10s after uninstall; some"
+                      + " in-flight tasks may leak pins until the JVM exits");
+            }
+          }
+        } catch (InterruptedException ex) {
+          Thread.currentThread().interrupt();
+          b.prefetchExecutor.shutdownNow();
+        }
+      }
+      // Drain handle factory — each FileHandle owns a lazily-opened inner-FS input stream that
+      // the LRU would otherwise leak when the bootstrap reference is dropped. Runs AFTER the
+      // prefetch executor settles so handle close-paths can't race in-flight prefetch tasks.
       try {
         b.handleFactory.closeAll();
       } catch (IOException ex) {
@@ -399,6 +437,15 @@ public final class CacheBootstrap {
 
   public int loadQuantumBytes() {
     return loadQuantumBytes;
+  }
+
+  /**
+   * Phase 5c prefetch executor, or {@code null} when {@code fs.cached.prefetch.enabled=false}.
+   * Callers MUST null-check before submitting; the {@code CachingInputStream} admission gate does
+   * this and falls back to the synchronous per-chunk path when null.
+   */
+  public java.util.concurrent.ThreadPoolExecutor prefetchExecutor() {
+    return prefetchExecutor;
   }
 
   /**

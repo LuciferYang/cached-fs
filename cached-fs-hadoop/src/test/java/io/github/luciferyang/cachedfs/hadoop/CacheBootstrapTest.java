@@ -275,6 +275,43 @@ class CacheBootstrapTest {
     assertThat(b.scanTrackerMaxEntries()).isEqualTo(2); // max(2, 1)
   }
 
+  // --- Phase 5c: prefetch executor lifecycle ---------------------------
+
+  @Test
+  @DisplayName("prefetchExecutor() returns a live executor when fs.cached.prefetch.enabled=true")
+  void prefetchExecutorPresentByDefault() throws IOException {
+    CacheBootstrap.installIfNeeded(minimalConf());
+    CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+    java.util.concurrent.ThreadPoolExecutor exec = b.prefetchExecutor();
+    assertThat(exec).isNotNull();
+    assertThat(exec.isShutdown()).isFalse();
+    assertThat(exec.getMaximumPoolSize()).isPositive();
+  }
+
+  @Test
+  @DisplayName("prefetchExecutor() returns null when fs.cached.prefetch.enabled=false")
+  void prefetchExecutorNullWhenDisabled() throws IOException {
+    Configuration conf = minimalConf();
+    conf.setBoolean(CachedFsConfig.PREFETCH_ENABLED, false);
+    CacheBootstrap.installIfNeeded(conf);
+    CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+    assertThat(b.prefetchExecutor()).isNull();
+  }
+
+  @Test
+  @DisplayName("uninstallForTesting shuts the prefetch executor down")
+  void uninstallShutsExecutor() throws IOException {
+    CacheBootstrap.installIfNeeded(minimalConf());
+    java.util.concurrent.ThreadPoolExecutor exec =
+        CacheBootstrap.get().orElseThrow().prefetchExecutor();
+    assertThat(exec.isShutdown()).isFalse();
+
+    CacheBootstrap.uninstallForTesting();
+
+    assertThat(exec.isShutdown()).isTrue();
+    assertThat(exec.isTerminated()).isTrue();
+  }
+
   private static Configuration minimalConf() {
     Configuration conf = new Configuration(false);
     conf.setBoolean(CachedFsConfig.ENABLED, true);

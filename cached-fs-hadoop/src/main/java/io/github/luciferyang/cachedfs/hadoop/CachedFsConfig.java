@@ -206,6 +206,32 @@ public final class CachedFsConfig {
 
   public static final int DEFAULT_COALESCE_MAX_RESTARTS = 3;
 
+  // --- prefetch (Phase 5c) -------------------------------------------------
+
+  /**
+   * {@code fs.cached.prefetch.enabled} — master toggle for the Phase 5c async prefetch path.
+   * Default {@code true}. When false, the prefetch executor is never built and the admission gate
+   * is a no-op; consumers fall back to the synchronous per-chunk path.
+   */
+  public static final String PREFETCH_ENABLED = "fs.cached.prefetch.enabled";
+
+  public static final boolean DEFAULT_PREFETCH_ENABLED = true;
+
+  /**
+   * {@code fs.cached.prefetch.threads} — fixed-size prefetch thread pool. Default {@code
+   * Runtime.getRuntime().availableProcessors()}.
+   */
+  public static final String PREFETCH_THREADS = "fs.cached.prefetch.threads";
+
+  /**
+   * {@code fs.cached.prefetch.queue} — bounded {@code ArrayBlockingQueue} capacity backing the
+   * prefetch executor. Default {@code 64}. Sized for backpressure, not throughput — {@link
+   * DiscardAndCountHandler} is the steady-state safety valve.
+   */
+  public static final String PREFETCH_QUEUE = "fs.cached.prefetch.queue";
+
+  public static final int DEFAULT_PREFETCH_QUEUE = 64;
+
   // --- parsers -------------------------------------------------------------
 
   /** True if {@link #ENABLED} is set to {@code true}. */
@@ -316,6 +342,28 @@ public final class CachedFsConfig {
     }
     int cap = coalesceMaxChunksPerGroup(conf, totalRamBytes, loadQuantumBytes);
     return cap > 2;
+  }
+
+  // --- prefetch parsers ----------------------------------------------------
+
+  public static boolean prefetchEnabled(Configuration conf) {
+    return conf.getBoolean(PREFETCH_ENABLED, DEFAULT_PREFETCH_ENABLED);
+  }
+
+  public static int prefetchThreads(Configuration conf) {
+    int v = conf.getInt(PREFETCH_THREADS, Runtime.getRuntime().availableProcessors());
+    if (v <= 0) {
+      throw new IllegalArgumentException(PREFETCH_THREADS + " must be > 0: " + v);
+    }
+    return v;
+  }
+
+  public static int prefetchQueue(Configuration conf) {
+    int v = conf.getInt(PREFETCH_QUEUE, DEFAULT_PREFETCH_QUEUE);
+    if (v <= 0) {
+      throw new IllegalArgumentException(PREFETCH_QUEUE + " must be > 0: " + v);
+    }
+    return v;
   }
 
   public static int handleCacheCapacity(Configuration conf) {
