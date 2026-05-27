@@ -85,12 +85,18 @@ public final class CachedFsAffinityBlockLocationsProvider implements BlockLocati
    * hosts.length} parallel-array invariant some Hadoop consumers rely on holds.
    */
   private static BlockLocation hostsOnly(String[] preferred, long offset, long length) {
-    // Clone hosts AND names per BlockLocation: Hadoop's BlockLocation constructor calls
+    // Clone hosts per BlockLocation: Hadoop's BlockLocation constructor calls
     // StringInterner.internStringsInArray which MUTATES the input array in place AND retains the
     // reference. Sharing `preferred` across N BlockLocations would alias their hosts arrays AND
-    // mutate the caller's `preferred` on first interner pass. Defensive copies isolate each
+    // mutate the caller's `preferred` on first interner pass. The defensive clone isolates each
     // BlockLocation's state.
-    return new BlockLocation(preferred.clone(), preferred.clone(), offset, length);
+    //
+    // `names` is empty by design: Hadoop semantically reserves the `names` slot for
+    // "host:port"-style replica datanode RPC addresses. Stuffing executor-shaped task locations
+    // into `names` would corrupt the BlockLocation contract for any downstream tool (HDFS
+    // balancer, audit log analyzers) that reads getNames() — and Spark only consults `hosts`,
+    // so the `names` array is functionally inert from Spark's perspective.
+    return new BlockLocation(new String[0], preferred.clone(), offset, length);
   }
 
   /** Collects the union of inner-FS hosts. Deduped + null-safe; returns empty when unset. */

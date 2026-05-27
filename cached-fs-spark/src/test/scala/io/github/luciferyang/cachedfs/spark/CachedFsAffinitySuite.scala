@@ -139,9 +139,10 @@ class CachedFsAffinitySuite extends AnyFunSuite with BeforeAndAfterEach {
 
       // sc.stop fires SparkApplicationEnd → registered listener triggers reset. Poll on the
       // observable side-effect (executor count) rather than Thread.sleep'ing on a fixed
-      // wall-clock interval that's flaky on a busy CI runner.
+      // wall-clock interval that's flaky on a busy CI runner. 10 s is generous for a local-mode
+      // listener-bus drain and only consumes wall time if the side-effect didn't happen.
       sc.stop()
-      val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5)
+      val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10)
       while (mgr.executorCount() != 0 && System.nanoTime() < deadline) {
         Thread.sleep(20)
       }
@@ -155,6 +156,9 @@ class CachedFsAffinitySuite extends AnyFunSuite with BeforeAndAfterEach {
     val sc1 = new SparkContext("local[1]", "cached-fs-affinity-suite-ctx1")
     try {
       CachedFsSoftAffinityListener.ensureRegistered(sc1)
+      // Registration slot must point at sc1's listener.
+      val reg1 = CachedFsSoftAffinityListener.currentRegistrationForTesting()
+      assert(reg1.isDefined && (reg1.get._1 eq sc1))
       CachedFsAffinity.configure(true, 2, 1, false, 10000)
       CachedFsAffinity.onExecutorAdded("e1", "h1")
       assert(CachedFsSoftAffinityManager.getInstance().executorCount() == 1)
@@ -162,8 +166,8 @@ class CachedFsAffinitySuite extends AnyFunSuite with BeforeAndAfterEach {
     } finally {
       if (!sc1.isStopped) sc1.stop()
     }
-    // Wait for listener bus to drain (sc1.stop → onApplicationEnd → state wipe).
-    val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5)
+    // Wait for listener bus to drain (sc1.stop → onApplicationEnd → state wipe + clearRegistered).
+    val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10)
     while (CachedFsSoftAffinityManager.getInstance().executorCount() != 0
       && System.nanoTime() < deadline) Thread.sleep(20)
     assert(CachedFsSoftAffinityManager.getInstance().executorCount() == 0)
@@ -172,6 +176,10 @@ class CachedFsAffinitySuite extends AnyFunSuite with BeforeAndAfterEach {
     val sc2 = new SparkContext("local[1]", "cached-fs-affinity-suite-ctx2")
     try {
       CachedFsSoftAffinityListener.ensureRegistered(sc2)
+      // Registration slot must now point at sc2's listener — proves the swap took effect, not
+      // a coincidence of state being cleared by sc1.stop.
+      val reg2 = CachedFsSoftAffinityListener.currentRegistrationForTesting()
+      assert(reg2.isDefined && (reg2.get._1 eq sc2))
       CachedFsAffinity.configure(true, 2, 1, false, 10000)
       CachedFsAffinity.onExecutorAdded("e2", "h2")
       assert(CachedFsSoftAffinityManager.getInstance().executorCount() == 1)

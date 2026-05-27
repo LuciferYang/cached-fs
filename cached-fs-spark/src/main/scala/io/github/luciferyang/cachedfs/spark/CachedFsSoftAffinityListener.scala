@@ -187,4 +187,10 @@ object CachedFsSoftAffinityListener extends Logging {
       catch { case NonFatal(_) => /* best-effort */ }
     }
   }
+
+  /** Test-only. Returns the currently-registered (ctx, listener) pair, if any. */
+  private[spark] def currentRegistrationForTesting(): Option[(SparkContext, AnyRef)] = {
+    val r = registration.get()
+    if (r == null) None else Some((r.ctx, r.listener))
+  }
 }

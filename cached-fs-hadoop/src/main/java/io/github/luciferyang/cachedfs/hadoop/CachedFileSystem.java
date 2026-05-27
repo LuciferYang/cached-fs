@@ -335,6 +335,15 @@ public final class CachedFileSystem extends FilterFileSystem {
     return rewriteLocatedIterator(inner, provider);
   }
 
+  // Note: the protected {@code listLocatedStatus(Path, PathFilter)} overload is NOT overridden.
+  // It would require calling {@code fs.listLocatedStatus(Path, PathFilter)} on the inner FS, but
+  // that method is package-private to {@code org.apache.hadoop.fs} and inaccessible from this
+  // package. {@link FilterFileSystem}'s default override (same package as {@code FileSystem}) does
+  // delegate to the inner — so the unrewritten inner iterator is returned, bypassing the affinity
+  // rewrite. In Spark 4 production paths nothing reaches the 2-arg variant (public 1-arg form is
+  // what HadoopFSUtils + InMemoryFileIndex consume), so this is a documented future-caller gap.
+  // Closing it would require a reflective invocation of the inner FS's protected method.
+
   @Override
   public org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus> listFiles(
       Path f, boolean recursive) throws IOException {
@@ -347,50 +356,59 @@ public final class CachedFileSystem extends FilterFileSystem {
 
   /**
    * Lazy {@link org.apache.hadoop.fs.RemoteIterator} wrapper that rewrites each emitted entry's
-   * block-locations. Per-entry HDFS-subclass detection routes HDFS entries through unchanged;
-   * everything else gets a {@code new LocatedFileStatus(original, rewritten)} copy with the
-   * affinity-aware hosts. Lazy by-element evaluation preserves the inner iterator's streaming
-   * behavior — important for very-large S3A listings where eager materialization would OOM.
+   * block-locations. {@link
+   * org.apache.hadoop.util.functional.RemoteIterators#mappingRemoteIterator} preserves {@link
+   * org.apache.hadoop.fs.statistics.IOStatisticsSource} and {@link java.io.Closeable} forwarding —
+   * important so Spark 4's IOStatistics aggregation and Hadoop's S3A streaming-list-result cleanup
+   * keep working through the wrapper. Per-entry preserve-subclass detection routes entries through
+   * unchanged when flattening would drop subclass-specific data (HDFS encryption / EC, S3A / ABFS
+   * {@link org.apache.hadoop.fs.EtagSource} eTag for Hadoop {@code ManifestCommitter} validation).
    */
   private static org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus>
       rewriteLocatedIterator(
           org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus> inner,
           BlockLocationsProvider provider) {
-    return new org.apache.hadoop.fs.RemoteIterator<>() {
-      @Override
-      public boolean hasNext() throws IOException {
-        return inner.hasNext();
-      }
+    return org.apache.hadoop.util.functional.RemoteIterators.mappingRemoteIterator(
+        inner, original -> rewriteOne(original, provider));
+  }
 
-      @Override
-      public org.apache.hadoop.fs.LocatedFileStatus next() throws IOException {
-        org.apache.hadoop.fs.LocatedFileStatus original = inner.next();
-        if (isHdfsLocatedFileStatus(original)) {
-          // Preserve subclass identity: HdfsLocatedFileStatus carries FileEncryptionInfo + EC
-          // policy + fileId that the copy constructor would drop, breaking HDFS reads on
-          // Transparent Encryption clusters.
-          return original;
-        }
-        org.apache.hadoop.fs.BlockLocation[] underlying = original.getBlockLocations();
-        if (underlying == null || underlying.length == 0) {
-          return original;
-        }
-        org.apache.hadoop.fs.BlockLocation[] rewritten =
-            provider.getBlockLocations(original, 0L, original.getLen(), underlying);
-        if (rewritten == null || rewritten == underlying) {
-          return original;
-        }
-        return new org.apache.hadoop.fs.LocatedFileStatus(original, rewritten);
-      }
-    };
+  private static org.apache.hadoop.fs.LocatedFileStatus rewriteOne(
+      org.apache.hadoop.fs.LocatedFileStatus original, BlockLocationsProvider provider)
+      throws IOException {
+    if (shouldPreserveSubclass(original)) {
+      // Preserve subclass identity: HdfsLocatedFileStatus carries FileEncryptionInfo + EC
+      // policy + fileId; S3ALocatedFileStatus / AbfsLocatedFileStatus carry eTag + versionId
+      // consumed by Hadoop ManifestCommitter + Iceberg / Delta change detection via the
+      // EtagSource interface. The (FileStatus, BlockLocation[]) copy constructor flattens these
+      // to a plain LocatedFileStatus, silently dropping the subclass-only fields. Trade-off: for
+      // these files the affinity hint does not propagate, but the connector-specific metadata
+      // survives — which is the strictly safer default.
+      return original;
+    }
+    org.apache.hadoop.fs.BlockLocation[] underlying = original.getBlockLocations();
+    if (underlying == null || underlying.length == 0) {
+      return original;
+    }
+    org.apache.hadoop.fs.BlockLocation[] rewritten =
+        provider.getBlockLocations(original, 0L, original.getLen(), underlying);
+    if (rewritten == null || rewritten == underlying) {
+      return original;
+    }
+    return new org.apache.hadoop.fs.LocatedFileStatus(original, rewritten);
   }
 
   /**
-   * Reflective check for HDFS-specific {@link org.apache.hadoop.fs.LocatedFileStatus} subclasses —
-   * package-prefix match avoids a compile-time dependency on {@code hadoop-hdfs-client} while still
-   * recognizing {@code HdfsLocatedFileStatus} and its peers.
+   * True when {@code lfs} carries subclass-specific data that the {@code new
+   * LocatedFileStatus(original, rewritten)} copy constructor would flatten away. Covers HDFS
+   * subclasses (package-prefix match, no compile-time dep on hadoop-hdfs-client) AND any {@link
+   * org.apache.hadoop.fs.EtagSource} implementer — which catches S3A's {@code S3ALocatedFileStatus}
+   * and ABFS's {@code AbfsLocatedFileStatus} uniformly without requiring a per-connector match
+   * list.
    */
-  private static boolean isHdfsLocatedFileStatus(org.apache.hadoop.fs.LocatedFileStatus lfs) {
+  private static boolean shouldPreserveSubclass(org.apache.hadoop.fs.LocatedFileStatus lfs) {
+    if (lfs instanceof org.apache.hadoop.fs.EtagSource) {
+      return true;
+    }
     return lfs.getClass().getName().startsWith("org.apache.hadoop.hdfs.");
   }
 
