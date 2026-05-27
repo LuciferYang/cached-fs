@@ -177,6 +177,108 @@ public final class CachingInputStream extends InputStream
     this.lastRejectionNanos = nanos;
   }
 
+  // --- Phase 5c step 2: seqHWM state machine ------------------------------
+
+  /**
+   * Sentinel value for {@link #seqHWM} meaning "no read observed yet; prefetch arming disabled".
+   * Picked as {@code -1L} because the smallest legitimate HWM is {@code 0 + chunkSize > 0}.
+   */
+  static final long SEQ_HWM_SENTINEL = -1L;
+
+  /**
+   * Sequential read high-water mark. Driven by three update paths:
+   *
+   * <ul>
+   *   <li>Sequential reads ({@link #read(byte[], int, int)} via the per-chunk-completed cursor) use
+   *       an explicit CAS loop with three branches: sentinel→bootstrap, regime-change reset (|prev
+   *       − candidate| &gt; 2 × chunkSize), monotone advance via Math.max.
+   *   <li>Positional reads ({@link #read(long, byte[], int, int)} / {@link #readFully(long, byte[],
+   *       int, int)}) use {@link AtomicLong#updateAndGet} with a lambda that bootstraps from {@code
+   *       -1L} or advances on strict contiguity (pos == prev); scattered calls are no-ops.
+   *   <li>{@link #seek(long)} resets via {@code seqHWM.set(-1L)} — single-threaded per the Hadoop
+   *       Seekable non-thread-safety contract; valid because the read paths use CAS so a concurrent
+   *       positional CAS at most loses one round-trip vs the reset.
+   * </ul>
+   *
+   * <p>{@link IoStatistics#incSeqHwmRegimeResets} is bumped EXACTLY ONCE per logical regime-change
+   * event (derived from the same {@code prev} value the winning {@link AtomicLong#compareAndSet}
+   * observes — see {@link #advanceSeqHwmSequential(long, int)}).
+   */
+  private final java.util.concurrent.atomic.AtomicLong seqHWM =
+      new java.util.concurrent.atomic.AtomicLong(SEQ_HWM_SENTINEL);
+
+  /**
+   * Bumps {@link #seqHWM} for the sequential read path via an explicit CAS loop. Returns the new
+   * HWM value on success. The {@code wasReset} flag — derived from the SAME {@code prev} the
+   * winning CAS observes — drives the exactly-once {@code seqHwmRegimeResets} counter bump.
+   *
+   * @param newReadEnd offset one past the last byte of the just-completed sequential chunk ({@code
+   *     position + chunkSize})
+   * @param chunkSize chunk size of the just-completed read; the 2-chunk regime-change threshold is
+   *     computed from this value
+   */
+  long advanceSeqHwmSequential(long newReadEnd, int chunkSize) {
+    long regimeChangeThreshold = 2L * chunkSize;
+    while (true) {
+      long prev = seqHWM.get();
+      long next;
+      boolean wasReset;
+      if (prev == SEQ_HWM_SENTINEL) {
+        next = newReadEnd;
+        wasReset = false; // bootstrap, not a reset
+      } else if (Math.abs(prev - newReadEnd) > regimeChangeThreshold) {
+        next = newReadEnd;
+        wasReset = true; // regime change — breaks the positional-first dead-zone
+      } else {
+        next = Math.max(prev, newReadEnd);
+        wasReset = false;
+      }
+      if (seqHWM.compareAndSet(prev, next)) {
+        if (wasReset) {
+          ioStats.incSeqHwmRegimeResets();
+        }
+        return next;
+      }
+      // CAS lost the race — peer thread advanced or reset HWM; retry with fresh prev.
+    }
+  }
+
+  /**
+   * Bumps {@link #seqHWM} for the positional read path. Uses {@link AtomicLong#updateAndGet}
+   * because positional reads can run concurrently with sequential reads on the same stream
+   * (Hadoop's {@code PositionedReadable} contract is multi-reader thread-safe).
+   *
+   * <p>Three lambda outcomes:
+   *
+   * <ul>
+   *   <li>Sentinel → bootstrap to {@code pos + len}.
+   *   <li>{@code pos == prev} → contiguous-positional advance to {@code pos + len}.
+   *   <li>Otherwise → no change (scattered positional; intentionally does NOT update HWM).
+   * </ul>
+   */
+  long advanceSeqHwmPositional(long pos, int len) {
+    return seqHWM.updateAndGet(
+        prev -> {
+          if (prev == SEQ_HWM_SENTINEL) {
+            return pos + len; // bootstrap from any starting offset
+          }
+          if (pos == prev) {
+            return pos + len; // contiguous extend
+          }
+          return prev; // scattered read — leave HWM untouched
+        });
+  }
+
+  /** Test-only accessor for the {@link #seqHWM} value. */
+  long seqHwmForTesting() {
+    return seqHWM.get();
+  }
+
+  /** Test-only accessor for {@link #ioStats} so tests can observe per-stream counters directly. */
+  IoStatistics ioStatsForTesting() {
+    return ioStats;
+  }
+
   /**
    * Package-private static extracted from the original instance {@code fillExclusive} so {@link
    * PrefetchTask} can fill cache entries without duplicating the preadv logic. The instance method
@@ -223,6 +325,13 @@ public final class CachingInputStream extends InputStream
     int n = (int) Math.min(len, fileSize - position);
     readFullyFromCache(position, b, off, n);
     position += n;
+    // Phase 5c step 2: advance the sequential HWM via the explicit CAS loop. Uses chunkSize as
+    // the regime-change threshold computed from the just-completed read's natural quantum (n vs.
+    // loadQuantum). Picking `n` keeps the threshold semantically aligned to the actual stride;
+    // sequential consumers reading less than loadQuantum (e.g. small reads spanning multiple
+    // calls) get a finer threshold than the per-chunk plan describes but still satisfy the
+    // dead-zone-breaking property.
+    advanceSeqHwmSequential(position, Math.max(n, 1));
     return n;
   }
 
@@ -274,6 +383,11 @@ public final class CachingInputStream extends InputStream
     }
     // Hadoop convention: seeking past EOF is allowed; subsequent reads return -1.
     position = pos;
+    // Phase 5c step 2: a seek invalidates the sequential trajectory; reset the HWM to the
+    // sentinel so the next read on the new region re-bootstraps. Seekable.seek is single-thread
+    // per Hadoop contract (incompatible with concurrent reads on the same stream), so a plain
+    // set is sufficient — the CAS-based read paths cannot race with seek by contract.
+    seqHWM.set(SEQ_HWM_SENTINEL);
   }
 
   @Override
@@ -299,6 +413,10 @@ public final class CachingInputStream extends InputStream
     if (pos >= fileSize) return -1;
     int n = (int) Math.min(length, fileSize - pos);
     readFullyFromCache(pos, buffer, offset, n);
+    // Phase 5c step 2: positional path uses updateAndGet — bootstrap from -1L on first call,
+    // contiguous-extend on pos == prev, otherwise leave HWM unchanged (scattered reads do not
+    // perturb the sequential trajectory).
+    advanceSeqHwmPositional(pos, n);
     return n;
   }
 
@@ -318,6 +436,7 @@ public final class CachingInputStream extends InputStream
           "readFully past EOF: pos=" + pos + " len=" + length + " size=" + fileSize);
     }
     readFullyFromCache(pos, buffer, offset, length);
+    advanceSeqHwmPositional(pos, length);
   }
 
   @Override
