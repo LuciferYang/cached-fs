@@ -30,9 +30,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Phase 5c step 3 — end-to-end admission gate + submission. Drives a contiguous sequential read
- * through {@link CachingInputStream} and asserts the bump-site's three branches surface via the
- * per-stream {@link io.github.luciferyang.cachedfs.core.stats.IoStatistics} counters.
+ * end-to-end admission gate + submission. Drives a contiguous sequential read through {@link
+ * CachingInputStream} and asserts the bump-site's three branches surface via the per-stream {@link
+ * io.github.luciferyang.cachedfs.core.stats.IoStatistics} counters.
  */
 class PrefetchAdmissionTest {
 

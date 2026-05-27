@@ -25,8 +25,8 @@ import org.apache.hadoop.fs.Path;
  * {@link CacheBootstrap#setReadFileFactoryForTesting(ReadFileFactory)} to observe IO patterns
  * without standing up a full file-system fixture.
  *
- * <p>The seam was introduced for Phase 5b coalescing tests (preadv-call counting), but it is a pure
- * refactor of the prior {@code new HadoopReadFile(fs, p, key, size)} call site in {@code
+ * <p>The seam was introduced for coalescing tests (preadv-call counting), but it is a pure refactor
+ * of the prior {@code new HadoopReadFile(fs, p, key, size)} call site in {@code
  * CachedFileSystem.openHandleForKey} — no behavior change in the default path.
  */
 @FunctionalInterface

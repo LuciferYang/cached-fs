@@ -25,9 +25,9 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 /**
- * Phase 5c.0 precondition: prefetch byte-budget counter (no callers yet, wired by Phase 5c). Tests
- * the WARN-not-throw integrity guard semantics: legitimate concurrent inc/dec pairs never trip the
- * guard; a bug path (dec without paired inc) drives the counter negative but does NOT throw.
+ * precondition: prefetch byte-budget counter (no callers yet, wired by ). Tests the WARN-not-throw
+ * integrity guard semantics: legitimate concurrent inc/dec pairs never trip the guard; a bug path
+ * (dec without paired inc) drives the counter negative but does NOT throw.
  */
 class PendingPrefetchBytesTest {
 

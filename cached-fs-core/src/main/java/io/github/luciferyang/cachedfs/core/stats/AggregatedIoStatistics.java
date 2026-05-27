@@ -35,8 +35,8 @@ import java.util.concurrent.atomic.LongAdder;
  *
  * <p><b>{@link #add(IoStatistics)} contract:</b> the source MUST be quiescent during the call —
  * each public counter is read via a separate {@code AtomicLong.get()}, so a concurrent writer can
- * tear the snapshot across counters. The Phase 5a use-site (per-stream close) satisfies this:
- * Hadoop's {@code FSDataInputStream.close} contract is non-thread-safe vs. reads.
+ * tear the snapshot across counters. The use-site (per-stream close) satisfies this: Hadoop's
+ * {@code FSDataInputStream.close} contract is non-thread-safe vs. reads.
  *
  * <p>Per-counter storage is {@link LongAdder} so concurrent {@code add(...)} calls from different
  * streams scale; the bootstrap-only {@code incStaleScanIdRecoveries} bump is also on the same
@@ -54,7 +54,7 @@ public final class AggregatedIoStatistics {
   private final LongAdder ssdRead = new LongAdder();
   private final LongAdder ssdReadBytes = new LongAdder();
   private final LongAdder rawOverreadBytes = new LongAdder();
-  // Phase 5c merged-from-stream byte/event counters.
+  // merged-from-stream byte/event counters.
   private final LongAdder prefetchSkippedQueueFull = new LongAdder();
   private final LongAdder prefetchSkippedBudget = new LongAdder();
   private final LongAdder prefetchSkippedHeapPressure = new LongAdder();
@@ -81,7 +81,7 @@ public final class AggregatedIoStatistics {
     ssdRead.add(source.ssdRead());
     ssdReadBytes.add(source.ssdReadBytes());
     rawOverreadBytes.add(source.rawOverreadBytes());
-    // Phase 5c: merge the new byte/event counters per the class-javadoc partition. The
+    // merge the new byte/event counters per the class-javadoc partition. The
     // staleScanIdRecoveries bootstrap-only counter is intentionally NOT merged here.
     prefetchSkippedQueueFull.add(source.prefetchSkipped("queue_full"));
     prefetchSkippedBudget.add(source.prefetchSkipped("budget"));
@@ -94,7 +94,7 @@ public final class AggregatedIoStatistics {
 
   /**
    * Bootstrap-only bump. Called when {@code CacheBootstrap.withScanId} enters with a stale
-   * ThreadLocal slot and auto-recovers — see Phase 5a wiring §2.
+   * ThreadLocal slot and auto-recovers — see the close-merge wiring.
    */
   public void incStaleScanIdRecoveries() {
     staleScanIdRecoveries.increment();

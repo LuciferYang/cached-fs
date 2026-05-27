@@ -201,7 +201,7 @@ public final class CachedFileSystem extends FilterFileSystem {
       // installs (or refreshes a remove-in-progress) entry; false when an existing entry was
       // preserved. The return value is dropped — the hook is fire-and-forget on this path.
       b.ttlController().recordOpen(ptr.value().fileNum());
-      // Phase 5a wiring: resolve scanId via ThreadLocal → Configuration → "default", then look up
+      // the wiring: resolve scanId via ThreadLocal → Configuration → "default", then look up
       // the tracker. When fs.cached.scan-tracker.enabled=false, substitute ScanTracker.DISABLED so
       // recordReference/recordRead are no-ops with zero map traffic. metricsEnabled likewise gates
       // between a fresh per-stream IoStatistics and the shared NO_OP sentinel.
@@ -219,7 +219,7 @@ public final class CachedFileSystem extends FilterFileSystem {
       // ids exceed 2^29).
       int fileNumNode = Murmur3.fmix32((int) ptr.value().fileNum()) & ((1 << 29) - 1);
       TrackingId trackingId = TrackingId.of(fileNumNode, 0);
-      // Phase 5b: capture coalesce knobs at open time. Auto-disable on small caches per the
+      // capture coalesce knobs at open time. Auto-disable on small caches per the
       // coalesce.enabled resolver (cap==2 AND always-on=false → off). totalRamBytes proxies via
       // the JVM heap budget — AsyncDataCache has no fixed capacity getter today; for the
       // auto-disable rule, heap-budget is a reasonable upper bound on what the cache can hold.
@@ -230,7 +230,7 @@ public final class CachedFileSystem extends FilterFileSystem {
       int maxChunksPerGroup =
           CachedFsConfig.coalesceMaxChunksPerGroup(conf, totalRamBytes, b.loadQuantumBytes());
       int maxRestarts = CachedFsConfig.coalesceMaxRestarts(conf);
-      // Phase 5c: admission knobs.
+      // admission knobs.
       boolean prefetchEnabled = CachedFsConfig.prefetchEnabled(conf);
       boolean heapPressureCheck = CachedFsConfig.prefetchHeapPressureCheckEnabled(conf);
       double triggerTail = CachedFsConfig.prefetchTriggerTailFraction(conf);
@@ -403,7 +403,7 @@ public final class CachedFileSystem extends FilterFileSystem {
     Path p = new Path(fileUri);
     FileStatus status = fs.getFileStatus(p);
     long size = status.getLen();
-    // Phase 5b: route through the bootstrap's ReadFileFactory so tests can swap in a counting
+    // route through the bootstrap's ReadFileFactory so tests can swap in a counting
     // wrapper via setReadFileFactoryForTesting without subclassing CachedFileSystem. Production
     // path: HadoopReadFile::new, unchanged behavior from prior `new HadoopReadFile(fs, p, key,
     // size)`.

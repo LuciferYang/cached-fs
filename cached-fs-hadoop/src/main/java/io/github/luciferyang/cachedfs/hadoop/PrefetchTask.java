@@ -25,8 +25,8 @@ import java.util.concurrent.CompletableFuture;
 
 /**
  * Named class (NOT a lambda) so the rejection handler can downcast a queued Runnable and recover
- * state. Phase 5c submission ALWAYS goes through {@code prefetchExecutor.execute(prefetchTask)} —
- * never {@code submit(...)}, which would wrap the Runnable in a {@code FutureTask} and defeat the
+ * state. submission ALWAYS goes through {@code prefetchExecutor.execute(prefetchTask)} — never
+ * {@code submit(...)}, which would wrap the Runnable in a {@code FutureTask} and defeat the
  * downcast.
  *
  * <p>Invariants on every exit path that {@link #run} reaches (i.e. excluding rejected tasks, which

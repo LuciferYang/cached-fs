@@ -16,8 +16,8 @@
 package io.github.luciferyang.cachedfs.hadoop;
 
 /**
- * Typed result of the Phase 5c prefetch admission gate. Three static-final singletons cover all
- * cases; the gate ALWAYS returns one of them so no allocation happens in the hot read path.
+ * Typed result of the prefetch admission gate. Three static-final singletons cover all cases; the
+ * gate ALWAYS returns one of them so no allocation happens in the hot read path.
  *
  * <p>Reason strings line up with the {@code prefetchSkipped(reason)} reason map: {@code "budget"},
  * {@code "heap_pressure"}. {@code ADMIT.reason()} is the empty string by convention.

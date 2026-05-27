@@ -75,7 +75,7 @@ class AggregatedIoStatisticsTest {
   }
 
   @Test
-  @DisplayName("add(source) merges Phase 5c byte/event counters (prefetchSkipped buckets etc.)")
+  @DisplayName("add(source) merges byte/event counters (prefetchSkipped buckets etc.)")
   void addMergesPhase5cCounters() {
     AggregatedIoStatistics agg = new AggregatedIoStatistics();
     IoStatistics s1 = new IoStatistics();

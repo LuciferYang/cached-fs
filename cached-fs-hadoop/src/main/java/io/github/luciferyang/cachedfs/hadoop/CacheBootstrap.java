@@ -85,14 +85,14 @@ public final class CacheBootstrap {
   private final CacheTTLController ttlController;
 
   /**
-   * Phase 5c prefetch executor. Null when {@code fs.cached.prefetch.enabled=false} (the consumer
-   * checks for null before submitting). Built once at {@link #installIfNeeded} and shut down in
-   * {@link #uninstallForTesting} with a bounded await + {@code shutdownNow} fallback to bound the
-   * pin-leak window per phase-5c.md §step 1.
+   * prefetch executor. Null when {@code fs.cached.prefetch.enabled=false} (the consumer checks for
+   * null before submitting). Built once at {@link #installIfNeeded} and shut down in {@link
+   * #uninstallForTesting} with a bounded await + {@code shutdownNow} fallback to bound the pin-leak
+   * window per phase-5c.md §step 1.
    */
   private final java.util.concurrent.ThreadPoolExecutor prefetchExecutor;
 
-  /** Phase 5c admission gate — JVM-wide byte budget for in-flight prefetch. */
+  /** admission gate — JVM-wide byte budget for in-flight prefetch. */
   private final long maxPendingPrefetchBytes;
 
   /**
@@ -131,8 +131,8 @@ public final class CacheBootstrap {
   private final AtomicInteger staleSlotWarnCount = new AtomicInteger();
 
   /**
-   * Phase 5b seam — production default is {@code HadoopReadFile::new}. Volatile so a test-only swap
-   * via {@link #setReadFileFactoryForTesting(ReadFileFactory)} is visible to the next {@code
+   * seam — production default is {@code HadoopReadFile::new}. Volatile so a test-only swap via
+   * {@link #setReadFileFactoryForTesting(ReadFileFactory)} is visible to the next {@code
    * openHandleForKey} on any thread. Single-writer-at-a-time in practice (Surefire default
    * forkCount=1, reuseForks=true); tests with parallel execution should serialize on this slot via
    * {@code @Execution(SAME_THREAD)}.
@@ -221,7 +221,7 @@ public final class CacheBootstrap {
         }
         int handleCap = CachedFsConfig.handleCacheCapacity(conf);
         int quantum = CachedFsConfig.loadQuantumBytes(conf);
-        // Phase 5c executor: built only when the master toggle is on. Null when disabled — the
+        // executor: built only when the master toggle is on. Null when disabled — the
         // hot read path checks for null before submitting a prefetch task.
         java.util.concurrent.ThreadPoolExecutor prefetchExec = null;
         long maxPendingBytes = 0L;
@@ -390,7 +390,7 @@ public final class CacheBootstrap {
         return;
       }
       IOException primary = null;
-      // Phase 5c executor shutdown — happens BEFORE handle drain so any in-flight prefetch task
+      // executor shutdown — happens BEFORE handle drain so any in-flight prefetch task
       // finishes its run-finally (decrementPendingPrefetch + clearPendingPrefetchIf) against a
       // still-live RAM cache. Bounded await: 5s then shutdownNow + another 5s; persistent
       // stragglers are logged at ERROR. Bounds the pin-leak window per phase-5c.md §step 1.
@@ -408,6 +408,21 @@ public final class CacheBootstrap {
         } catch (InterruptedException ex) {
           Thread.currentThread().interrupt();
           b.prefetchExecutor.shutdownNow();
+          // Re-await after shutdownNow so in-flight prefetch workers run their run-finally
+          // (decrement + clearPendingPrefetchIf) BEFORE we close the RAM cache below. Skipping
+          // this allowed a post-interrupt PrefetchTask to call cache.findOrCreate on a closed
+          // shard, producing NPEs in ITs that reuse the JVM (MiniDFSCluster suite). The
+          // interrupt flag was already restored, so suppress further interrupts here — we are
+          // bounded by 5s regardless.
+          try {
+            if (!b.prefetchExecutor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
+              LOG.error(
+                  "prefetch executor failed to terminate within 5s after interrupted uninstall;"
+                      + " in-flight tasks may race ramCache.close()");
+            }
+          } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+          }
         }
       }
       // Drain handle factory — each FileHandle owns a lazily-opened inner-FS input stream that
@@ -479,9 +494,9 @@ public final class CacheBootstrap {
   }
 
   /**
-   * Phase 5c prefetch executor, or {@code null} when {@code fs.cached.prefetch.enabled=false}.
-   * Callers MUST null-check before submitting; the {@code CachingInputStream} admission gate does
-   * this and falls back to the synchronous per-chunk path when null.
+   * prefetch executor, or {@code null} when {@code fs.cached.prefetch.enabled=false}. Callers MUST
+   * null-check before submitting; the {@code CachingInputStream} admission gate does this and falls
+   * back to the synchronous per-chunk path when null.
    */
   public java.util.concurrent.ThreadPoolExecutor prefetchExecutor() {
     return prefetchExecutor;
@@ -557,14 +572,14 @@ public final class CacheBootstrap {
 
   /**
    * Bootstrap-level aggregate IO stats. Per-stream {@code IoStatistics} snapshots are merged here
-   * on {@code CachingInputStream.close()} (Phase 5a wiring §6). The aggregate is intentionally
+   * on {@code CachingInputStream.close()} (the close-merge wiring). The aggregate is intentionally
    * lossy under crashes — streams that never close don't contribute, matching velox parity.
    */
   public AggregatedIoStatistics aggregateIoStats() {
     return aggregateIoStats;
   }
 
-  // --- scan-tracker registry (Phase 5a) ----------------------------------
+  // --- scan-tracker registry ----------------------------------
 
   /**
    * Returns the (possibly newly-created) {@link ScanTracker} for {@code scanId}. {@code null},
@@ -616,7 +631,7 @@ public final class CacheBootstrap {
     return max;
   }
 
-  // --- scanId ThreadLocal (Phase 5a) -------------------------------------
+  // --- scanId ThreadLocal -------------------------------------
 
   /**
    * Returns the scanId currently set on this thread (via {@link #withScanId(String)}), or {@code
@@ -665,11 +680,18 @@ public final class CacheBootstrap {
       aggregateIoStats.incStaleScanIdRecoveries();
     }
     currentScanId.set(normalized);
+    Thread owner = Thread.currentThread();
     return () -> {
-      // Only clear the ThreadLocal if it still holds OUR scanId. An orphan AutoCloseable from a
-      // crashed-and-recovered prior task that later runs close() would otherwise stomp the
-      // current scope's slot (recovery path replaced it). Tracker eviction is always safe
-      // (removeScanTracker is idempotent on a missing entry).
+      // Single-thread close contract: wrong-thread close is a benign no-op. An orphan close on a
+      // different thread (caller wired the AutoCloseable into Spark TaskCompletionListener
+      // despite the javadoc warning) would otherwise evict a tracker that the owner thread is
+      // still actively using via currentScanId.get() → trackerFor(); the owner thread would
+      // silently get a fresh tracker and lose all density/readPct state. Same-thread close still
+      // evicts the tracker unconditionally, preserving the releaseCurrentScanId nesting workflow
+      // (which clears the ThreadLocal but expects scope close to evict the tracker).
+      if (Thread.currentThread() != owner) {
+        return;
+      }
       if (normalized.equals(currentScanId.get())) {
         currentScanId.remove();
       }

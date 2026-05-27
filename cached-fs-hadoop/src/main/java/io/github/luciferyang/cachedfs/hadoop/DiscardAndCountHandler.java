@@ -20,14 +20,14 @@ import java.util.concurrent.RejectedExecutionHandler;
 import java.util.concurrent.ThreadPoolExecutor;
 
 /**
- * Phase 5c rejection policy: discard the rejected task, bump {@code prefetchSkipped("queue_full")},
- * complete the task's future exceptionally so the consumer's {@code pendingPrefetch.await} does NOT
+ * rejection policy: discard the rejected task, bump {@code prefetchSkipped("queue_full")}, complete
+ * the task's future exceptionally so the consumer's {@code pendingPrefetch.await} does NOT
  * deadlock, and CAS-clear the owner's pendingPrefetch slot.
  *
  * <p>Sibling top-level class (not nested) so {@code DiscardAndCountHandlerTest} can exercise the
  * handler in isolation against a mock {@code CachingInputStream}. This requires {@code
  * CachingInputStream.PENDING_VH} / {@code clearPendingPrefetchIf} / {@code lastRejectionNanos} to
- * be package-private — see the §Class layout decision in the Phase 5c plan.
+ * be package-private — see the §Class layout decision in the plan.
  *
  * <p><b>Synchronous-on-submit-thread invariant:</b> per {@link ThreadPoolExecutor}'s JDK contract,
  * the handler runs on the SUBMITTING thread (the consumer's read thread). The handler writes {@code

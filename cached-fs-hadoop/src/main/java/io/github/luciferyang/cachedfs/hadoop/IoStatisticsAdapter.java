@@ -50,22 +50,32 @@ import org.apache.hadoop.fs.statistics.impl.IOStatisticsBinding;
  *   <li>{@code cachedfs_stream_ssd_read_operations} ← {@code ssdRead()} count
  *   <li>{@code cachedfs_stream_ssd_read_bytes} ← {@code ssdReadBytes()}
  *   <li>{@code cachedfs_stream_raw_overread_bytes} ← {@code rawOverreadBytes()}
- *   <li>{@code cachedfs_stream_prefetch_skipped_queue_full_bytes} ← Phase 5c
- *   <li>{@code cachedfs_stream_prefetch_skipped_budget_bytes} ← Phase 5c
- *   <li>{@code cachedfs_stream_prefetch_skipped_heap_pressure_bytes} ← Phase 5c
- *   <li>{@code cachedfs_stream_prefetch_skipped_other_bytes} ← Phase 5c
- *   <li>{@code cachedfs_stream_prefetch_evicted_before_use_bytes} ← Phase 5c
- *   <li>{@code cachedfs_stream_prefetch_eligible_suppressed_bytes} ← Phase 5c
- *   <li>{@code cachedfs_stream_seq_hwm_regime_resets} ← Phase 5c
+ *   <li>{@code cachedfs_stream_prefetch_skipped_queue_full_bytes}
+ *   <li>{@code cachedfs_stream_prefetch_skipped_budget_bytes}
+ *   <li>{@code cachedfs_stream_prefetch_skipped_heap_pressure_bytes}
+ *   <li>{@code cachedfs_stream_prefetch_skipped_other_bytes}
+ *   <li>{@code cachedfs_stream_prefetch_evicted_before_use_bytes}
+ *   <li>{@code cachedfs_stream_prefetch_eligible_suppressed_bytes}
+ *   <li>{@code cachedfs_stream_seq_hwm_regime_resets}
  * </ul>
  *
- * <p><b>Bootstrap-level</b>:
+ * <p><b>Bootstrap-level</b> (each {@code *_operations} key counts events; {@code *_bytes} counts
+ * bytes — suffix is uniform with the per-stream surface so dashboards can templatize):
  *
  * <ul>
- *   <li>{@code cachedfs_aggregate_read_bytes}, {@code cachedfs_aggregate_cache_hit_bytes}, {@code
- *       cachedfs_aggregate_prefetched_bytes}, etc. — sum of per-stream counters from {@code
- *       bootstrap.aggregateIoStats()} (populated on stream close).
- *   <li>{@code cachedfs_stale_scan_id_recoveries} (Phase 5a) ← bootstrap-only counter.
+ *   <li>{@code cachedfs_aggregate_read_operations}, {@code cachedfs_aggregate_read_bytes}
+ *   <li>{@code cachedfs_aggregate_cache_hit_operations}, {@code cachedfs_aggregate_cache_hit_bytes}
+ *   <li>{@code cachedfs_aggregate_prefetch_operations}, {@code cachedfs_aggregate_prefetched_bytes}
+ *   <li>{@code cachedfs_aggregate_ssd_read_operations}, {@code cachedfs_aggregate_ssd_read_bytes}
+ *   <li>{@code cachedfs_aggregate_raw_overread_bytes}
+ *   <li>{@code cachedfs_aggregate_prefetch_skipped_queue_full_bytes}
+ *   <li>{@code cachedfs_aggregate_prefetch_skipped_budget_bytes}
+ *   <li>{@code cachedfs_aggregate_prefetch_skipped_heap_pressure_bytes}
+ *   <li>{@code cachedfs_aggregate_prefetch_skipped_other_bytes}
+ *   <li>{@code cachedfs_aggregate_prefetch_evicted_before_use_bytes}
+ *   <li>{@code cachedfs_aggregate_prefetch_eligible_suppressed_bytes}
+ *   <li>{@code cachedfs_aggregate_seq_hwm_regime_resets}
+ *   <li>{@code cachedfs_stale_scan_id_recoveries} ← bootstrap-only counter.
  *   <li>{@code cachedfs_scan_tracker_count} ← gauge, current map size.
  *   <li>{@code cachedfs_scan_tracker_entries} ← gauge, sum of size() across all trackers.
  *   <li>{@code cachedfs_scan_tracker_max_entries} ← gauge, max of size() across all trackers.
@@ -94,7 +104,7 @@ final class IoStatisticsAdapter {
         .withLongFunctionCounter("cachedfs_stream_ssd_read_operations", k -> src.ssdRead())
         .withLongFunctionCounter("cachedfs_stream_ssd_read_bytes", k -> src.ssdReadBytes())
         .withLongFunctionCounter("cachedfs_stream_raw_overread_bytes", k -> src.rawOverreadBytes())
-        // Phase 5c per-stream counters.
+        // per-stream counters.
         .withLongFunctionCounter(
             "cachedfs_stream_prefetch_skipped_queue_full_bytes",
             k -> src.prefetchSkipped("queue_full"))
@@ -126,14 +136,16 @@ final class IoStatisticsAdapter {
     io.github.luciferyang.cachedfs.core.stats.AggregatedIoStatistics agg =
         bootstrap.aggregateIoStats();
     return IOStatisticsBinding.dynamicIOStatistics()
-        // Aggregated per-stream byte/event totals.
-        .withLongFunctionCounter("cachedfs_aggregate_read", k -> agg.read())
+        // Aggregated per-stream byte/event totals. Event counters use the `_operations` suffix so
+        // the surface is uniform with the per-stream forStream() side (which inherits Hadoop's
+        // STREAM_READ_OPERATIONS naming convention).
+        .withLongFunctionCounter("cachedfs_aggregate_read_operations", k -> agg.read())
         .withLongFunctionCounter("cachedfs_aggregate_read_bytes", k -> agg.readBytes())
-        .withLongFunctionCounter("cachedfs_aggregate_cache_hit", k -> agg.ramHit())
+        .withLongFunctionCounter("cachedfs_aggregate_cache_hit_operations", k -> agg.ramHit())
         .withLongFunctionCounter("cachedfs_aggregate_cache_hit_bytes", k -> agg.ramHitBytes())
-        .withLongFunctionCounter("cachedfs_aggregate_prefetch", k -> agg.prefetch())
+        .withLongFunctionCounter("cachedfs_aggregate_prefetch_operations", k -> agg.prefetch())
         .withLongFunctionCounter("cachedfs_aggregate_prefetched_bytes", k -> agg.prefetchBytes())
-        .withLongFunctionCounter("cachedfs_aggregate_ssd_read", k -> agg.ssdRead())
+        .withLongFunctionCounter("cachedfs_aggregate_ssd_read_operations", k -> agg.ssdRead())
         .withLongFunctionCounter("cachedfs_aggregate_ssd_read_bytes", k -> agg.ssdReadBytes())
         .withLongFunctionCounter(
             "cachedfs_aggregate_raw_overread_bytes", k -> agg.rawOverreadBytes())

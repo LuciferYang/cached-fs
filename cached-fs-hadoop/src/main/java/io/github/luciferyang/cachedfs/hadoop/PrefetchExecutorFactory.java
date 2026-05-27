@@ -27,7 +27,7 @@ import org.slf4j.LoggerFactory;
  * Builds the shared prefetch executor owned by {@link CacheBootstrap}. Single fixed-size {@link
  * ThreadPoolExecutor} backed by an {@link ArrayBlockingQueue} of bounded size, daemon threads,
  * named {@code cached-fs-prefetch-N}, and {@link DiscardAndCountHandler} as the rejection policy
- * (Phase 5c discard-and-count semantics, NOT CallerRunsPolicy).
+ * (discard-and-count semantics, NOT CallerRunsPolicy).
  *
  * <p>Threads are daemon so a JVM that omits {@code CacheBootstrap.uninstallForTesting()} on exit
  * does not block shutdown — at the cost that an OOMError on a prefetch worker silently kills the

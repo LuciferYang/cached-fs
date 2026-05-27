@@ -31,8 +31,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Phase 5b coalescing tests. Counts {@code preadv} invocations via {@link CountingReadFile} swapped
- * in through {@link CacheBootstrap#setReadFileFactoryForTesting(ReadFileFactory)}. The default
+ * coalescing tests. Counts {@code preadv} invocations via {@link CountingReadFile} swapped in
+ * through {@link CacheBootstrap#setReadFileFactoryForTesting(ReadFileFactory)}. The default
  * coalesce config (always-on, max-gap-bytes=loadQuantum/16, max-chunks-per-group=16) makes a cold
  * read of N adjacent chunks produce exactly one preadv call when the group fits under the cap.
  */
@@ -240,7 +240,7 @@ class CoalesceTest {
     // Force coalesce on regardless of cache size (these tests run with a tiny in-memory cache
     // and would otherwise trip the auto-disable rule).
     conf.setBoolean(CachedFsConfig.COALESCE_ALWAYS_ON, true);
-    // Phase 5c: disable prefetch so the preadv-counting tests stay deterministic. With prefetch
+    // disable prefetch so the preadv-counting tests stay deterministic. With prefetch
     // on, the bump-site fires after every chunk read and the task may absorb subsequent misses
     // out-of-band, breaking the "N preadv for N missed chunks" invariant. Coalesce + prefetch
     // interaction is exercised by PrefetchAdmissionTest separately.

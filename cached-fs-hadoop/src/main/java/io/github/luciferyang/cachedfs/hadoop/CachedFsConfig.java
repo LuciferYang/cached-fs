@@ -133,7 +133,7 @@ public final class CachedFsConfig {
 
   public static final int DEFAULT_HANDLE_CACHE_CAPACITY = 1024;
 
-  // --- scan tracking + IO stats (Phase 5a) ---------------------------------
+  // --- scan tracking + IO stats ---------------------------------
 
   /**
    * {@code fs.cached.scan-id} — per-file scan identifier. Resolved at {@link
@@ -160,7 +160,7 @@ public final class CachedFsConfig {
 
   public static final boolean DEFAULT_METRICS_ENABLED = true;
 
-  // --- coalescing (Phase 5b) -----------------------------------------------
+  // --- coalescing -----------------------------------------------
 
   /**
    * {@code fs.cached.coalesce.enabled} — master toggle for multi-chunk coalescing. Default {@code
@@ -206,12 +206,12 @@ public final class CachedFsConfig {
 
   public static final int DEFAULT_COALESCE_MAX_RESTARTS = 3;
 
-  // --- prefetch (Phase 5c) -------------------------------------------------
+  // --- prefetch -------------------------------------------------
 
   /**
-   * {@code fs.cached.prefetch.enabled} — master toggle for the Phase 5c async prefetch path.
-   * Default {@code true}. When false, the prefetch executor is never built and the admission gate
-   * is a no-op; consumers fall back to the synchronous per-chunk path.
+   * {@code fs.cached.prefetch.enabled} — master toggle for the async prefetch path. Default {@code
+   * true}. When false, the prefetch executor is never built and the admission gate is a no-op;
+   * consumers fall back to the synchronous per-chunk path.
    */
   public static final String PREFETCH_ENABLED = "fs.cached.prefetch.enabled";
 

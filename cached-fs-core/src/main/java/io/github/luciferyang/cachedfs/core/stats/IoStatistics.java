@@ -34,10 +34,10 @@ public final class IoStatistics {
   private static final Logger LOG = LoggerFactory.getLogger(IoStatistics.class);
 
   /**
-   * Phase 5c prefetch-skipped reason buckets. Fixed set so the metrics surface has bounded
-   * cardinality. Unknown reasons silently route to {@code "other"} AND log a deduped WARN once per
-   * unknown key (via {@link #seenUnknownReasons}) so contributor bugs (new rejection mode lacking a
-   * registered reason) surface rather than getting silently absorbed.
+   * prefetch-skipped reason buckets. Fixed set so the metrics surface has bounded cardinality.
+   * Unknown reasons silently route to {@code "other"} AND log a deduped WARN once per unknown key
+   * (via {@link #seenUnknownReasons}) so contributor bugs (new rejection mode lacking a registered
+   * reason) surface rather than getting silently absorbed.
    */
   private static final String[] PREFETCH_SKIPPED_REASONS = {
     "queue_full", "budget", "heap_pressure", "other"
@@ -77,7 +77,7 @@ public final class IoStatistics {
   private final AtomicLong coalescedSsdLoadLatencyUs = new AtomicLong();
   private final AtomicLong coalescedStorageLoadLatencyUs = new AtomicLong();
 
-  // --- Phase 5c counters -------------------------------------------------
+  // --- counters -------------------------------------------------
 
   /**
    * Bytes skipped by reason. Reason set is fixed at construction (see {@link
@@ -100,8 +100,8 @@ public final class IoStatistics {
   private final AtomicLong prefetchEligibleSuppressedBytes = new AtomicLong();
 
   /**
-   * Count of regime-change resets on the sequential read path's HWM CAS loop (Phase 5c). Bumped
-   * exactly once per logical regime-change event regardless of CAS retries.
+   * Count of regime-change resets on the sequential read path's HWM CAS loop. Bumped exactly once
+   * per logical regime-change event regardless of CAS retries.
    */
   private final AtomicLong seqHwmRegimeResets = new AtomicLong();
 
@@ -178,7 +178,7 @@ public final class IoStatistics {
     coalescedStorageLoadLatencyUs.addAndGet(us);
   }
 
-  // --- Phase 5c inc methods ----------------------------------------------
+  // --- inc methods ----------------------------------------------
 
   /**
    * Bumps the prefetch-skipped counter for {@code reason} by {@code bytes}. Unknown reasons

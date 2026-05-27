@@ -66,7 +66,7 @@ public final class CachingInputStream extends InputStream
   private final long fileSize;
   private final long fileNum;
 
-  // Phase 5a: per-(scanId, file) density tracker + packed TrackingId + per-stream IO counters.
+  // per-(scanId, file) density tracker + packed TrackingId + per-stream IO counters.
   // Aggregate sink is the bootstrap-level AggregatedIoStatistics; merged exactly once on close()
   // via the `aggregated` AtomicBoolean to keep close() idempotent.
   private final ScanTracker tracker;
@@ -75,13 +75,13 @@ public final class CachingInputStream extends InputStream
   private final AggregatedIoStatistics aggregateIoStats;
   private final AtomicBoolean aggregated = new AtomicBoolean();
 
-  // Phase 5b coalescing knobs — captured at open time from the Configuration.
+  // coalescing knobs — captured at open time from the Configuration.
   private final boolean coalesceEnabled;
   private final int coalesceMaxGapBytes;
   private final int coalesceMaxChunksPerGroup;
   private final int coalesceMaxRestarts;
 
-  // --- Phase 5c admission knobs (captured at open time) -------------------
+  // --- admission knobs (captured at open time) -------------------
 
   /** Bootstrap reference for the heap-pressure check + executor handle. */
   private final CacheBootstrap bootstrap;
@@ -94,11 +94,11 @@ public final class CachingInputStream extends InputStream
   private final int densityThresholdPct;
   private final long rejectionBackoffNs;
 
-  // --- Phase 5c prefetch state (no callers in this commit; wired in next) -
+  // --- prefetch state (no callers in this commit; wired in next) -
 
   /**
-   * In-flight prefetch handle (key, not pin — Phase 5c key-not-pin design). VarHandle CAS is used
-   * to coordinate submission vs rejection-handler reset; the helper {@link
+   * In-flight prefetch handle (key, not pin — key-not-pin design). VarHandle CAS is used to
+   * coordinate submission vs rejection-handler reset; the helper {@link
    * #clearPendingPrefetchIf(CompletableFuture)} is the single mutation surface from sibling classes
    * ({@link PrefetchTask}, {@link DiscardAndCountHandler}).
    */
@@ -180,12 +180,16 @@ public final class CachingInputStream extends InputStream
     this.triggerTailFraction = triggerTailFraction;
     this.densityThresholdPct = densityThresholdPct;
     this.rejectionBackoffNs = rejectionBackoffNs;
-    // Place lastRejectionNanos far enough in the past that the very first prefetch attempt is
-    // never back-pressured. Subtracting twice the backoff is sufficient regardless of the knob.
-    this.lastRejectionNanos = System.nanoTime() - 2L * Math.max(rejectionBackoffNs, 1_000_000_000L);
+    // Place lastRejectionNanos in the "far past" so the very first prefetch attempt is never
+    // back-pressured. Long.MIN_VALUE/2 makes `now - lastRejectionNanos = now + |MIN/2|`, which is
+    // a large positive value regardless of the configured backoff — robust even if a future
+    // deployment sets rejectionBackoffNs near Long.MAX_VALUE/2 where the prior `now - 2*backoff`
+    // formula would have signed-overflowed back into a small positive and inadvertently gated the
+    // cold start.
+    this.lastRejectionNanos = Long.MIN_VALUE / 2;
   }
 
-  // --- Phase 5c sibling helpers (package-private; called by PrefetchTask + Handler) -
+  // --- sibling helpers (package-private; called by PrefetchTask + Handler) -
 
   /**
    * CAS-resets the {@link #pendingPrefetch} slot to null iff its current value is {@code expected}.
@@ -202,7 +206,7 @@ public final class CachingInputStream extends InputStream
     this.lastRejectionNanos = nanos;
   }
 
-  // --- Phase 5c step 2: seqHWM state machine ------------------------------
+  // --- seqHWM state machine ------------------------------
 
   /**
    * Sentinel value for {@link #seqHWM} meaning "no read observed yet; prefetch arming disabled".
@@ -313,16 +317,19 @@ public final class CachingInputStream extends InputStream
   /**
    * Debug counter incremented every time {@link #submitPrefetch} successfully CAS-installed the
    * future into the {@code pendingPrefetch} slot AND submitted the task (whether the task later
-   * runs to completion or gets rejected). Single-writer (consumer thread per the read-path
-   * non-thread-safety contract); plain {@code long} is sufficient.
+   * runs to completion or gets rejected). Hadoop's {@code PositionedReadable} contract is
+   * multi-reader thread-safe, so two concurrent positional readers can both reach {@code
+   * submitPrefetch}; we use a {@link java.util.concurrent.atomic.LongAdder} so neither's bump is
+   * lost. (Used by tests; production code does not read this.)
    */
-  private long prefetchSubmissions;
+  private final java.util.concurrent.atomic.LongAdder prefetchSubmissions =
+      new java.util.concurrent.atomic.LongAdder();
 
   long prefetchSubmissionsForTesting() {
-    return prefetchSubmissions;
+    return prefetchSubmissions.sum();
   }
 
-  // --- Phase 5c step 3: admission gate + submission ----------------------
+  // --- admission gate + submission ----------------------
 
   /**
    * Evaluates the admission gate's resource predicates and returns the appropriate flyweight {@link
@@ -341,9 +348,9 @@ public final class CachingInputStream extends InputStream
   }
 
   /**
-   * Trigger predicate + 3-branch bump-site for the Phase 5c prefetch admission gate. Called from
-   * {@link #read(byte[], int, int)} and the positional read paths after each completed read so the
-   * gate fires once per "logical chunk advance".
+   * Trigger predicate + 3-branch bump-site for the prefetch admission gate. Called from {@link
+   * #read(byte[], int, int)} and the positional read paths after each completed read so the gate
+   * fires once per "logical chunk advance".
    *
    * <p>Trigger guards (all must hold):
    *
@@ -358,16 +365,18 @@ public final class CachingInputStream extends InputStream
    *       rejectionBackoffNs}).
    * </ol>
    *
-   * <p>When the guards pass, three branches:
+   * <p>When the guards pass, the gate evaluates {@code adm} (resource gate) and density
+   * INDEPENDENTLY, then accumulates observability counters per failed predicate:
    *
    * <ul>
-   *   <li>{@code readPct &gt;= densityThresholdPct} AND {@code admissionGate().admit()} → submit
-   *       the prefetch.
-   *   <li>{@code readPct &lt; densityThresholdPct} → bump {@code
-   *       incPrefetchEligibleSuppressed(chunkSize)} (the lower-tail observability counter).
-   *   <li>density passes but admission rejects → bump {@code incPrefetchSkipped(adm.reason(),
-   *       chunkSize)}.
+   *   <li>Both pass → submit the prefetch.
+   *   <li>Admission rejects → bump {@code incPrefetchSkipped(adm.reason(), chunkSize)}.
+   *   <li>Density fails → bump {@code incPrefetchEligibleSuppressed(chunkSize)}.
    * </ul>
+   *
+   * <p>When BOTH predicates fail, BOTH counters are bumped — they are independent observability
+   * signals. Operators investigating capacity-driven prefetch loss must not see only the density
+   * bucket when the cache is also over-budget.
    */
   private void maybeTriggerPrefetch(long currentPos) {
     if (!prefetchEnabled) return;
@@ -375,7 +384,7 @@ public final class CachingInputStream extends InputStream
     if (exec == null) return;
     if (pendingPrefetch != null) return;
 
-    long hwm = seqHwmForTesting();
+    long hwm = seqHWM.get();
     if (hwm <= 0L) return; // state machine not armed yet
 
     // Use the LAST byte read (currentPos - 1) to identify the chunk we just touched. Avoids the
@@ -396,18 +405,20 @@ public final class CachingInputStream extends InputStream
     long now = System.nanoTime();
     if (now - lastRejectionNanos < rejectionBackoffNs) return;
 
-    // Resolve resource gate + density predicate. Branch on the 3-tuple.
+    // Resolve resource gate + density predicate independently and accumulate observability
+    // counters per failed predicate. Submitting requires BOTH to pass.
     AdmissionResult adm = admissionGate(nextChunkSize);
-    int readPct = tracker.data(trackingId).readPct();
+    boolean densityPass = tracker.data(trackingId).readPct() >= densityThresholdPct;
 
-    if (readPct >= densityThresholdPct && adm.admit()) {
+    if (adm.admit() && densityPass) {
       submitPrefetch(nextChunkStart, nextChunkSize);
-    } else if (readPct < densityThresholdPct) {
-      // Density predicate was the SOLE reason we dropped (we already verified all other guards).
-      ioStats.incPrefetchEligibleSuppressed(nextChunkSize);
-    } else {
-      // Density passed but resource gate rejected — bump the per-reason skip bucket.
+      return;
+    }
+    if (!adm.admit()) {
       ioStats.incPrefetchSkipped(adm.reason(), nextChunkSize);
+    }
+    if (!densityPass) {
+      ioStats.incPrefetchEligibleSuppressed(nextChunkSize);
     }
   }
 
@@ -434,7 +445,7 @@ public final class CachingInputStream extends InputStream
             this, ioStats, cache, handle.readFile(), nextChunkSize, key, nextChunkStart, future);
     try {
       bootstrap.prefetchExecutor().execute(task);
-      prefetchSubmissions++;
+      prefetchSubmissions.increment();
     } catch (java.util.concurrent.RejectedExecutionException ex) {
       // Mirror DiscardAndCountHandler recovery for the post-shutdown race.
       ioStats.incPrefetchSkipped("queue_full", nextChunkSize);
@@ -490,14 +501,14 @@ public final class CachingInputStream extends InputStream
     int n = (int) Math.min(len, fileSize - position);
     readFullyFromCache(position, b, off, n);
     position += n;
-    // Phase 5c step 2: advance the sequential HWM via the explicit CAS loop. Uses chunkSize as
+    // advance the sequential HWM via the explicit CAS loop. Uses chunkSize as
     // the regime-change threshold computed from the just-completed read's natural quantum (n vs.
     // loadQuantum). Picking `n` keeps the threshold semantically aligned to the actual stride;
     // sequential consumers reading less than loadQuantum (e.g. small reads spanning multiple
     // calls) get a finer threshold than the per-chunk plan describes but still satisfy the
     // dead-zone-breaking property.
     advanceSeqHwmSequential(position, Math.max(n, 1));
-    // Phase 5c step 3: after each completed sequential read, consider firing a prefetch for the
+    // after each completed sequential read, consider firing a prefetch for the
     // next chunk if all trigger guards + density + resource gates pass.
     maybeTriggerPrefetch(position);
     return n;
@@ -523,7 +534,7 @@ public final class CachingInputStream extends InputStream
     if (!closed.compareAndSet(false, true)) {
       return;
     }
-    // Phase 5c: cancel any in-flight prefetch promise. PrefetchTask's run-finally will detect the
+    // cancel any in-flight prefetch promise. PrefetchTask's run-finally will detect the
     // cancellation (cancel(false) marks the future as CANCELLED) and skip the future.complete
     // calls; the decrementPendingPrefetch + clearPendingPrefetchIf still fire so the byte-budget
     // stays balanced. cancel(false) does NOT interrupt the worker thread — that would race the
@@ -533,10 +544,28 @@ public final class CachingInputStream extends InputStream
         pending = pendingPrefetch;
     if (pending != null) {
       pending.cancel(false);
+      // Bounded drain so an in-flight PrefetchTask running on the executor thread finishes its
+      // run-finally (decrement + clearPendingPrefetchIf + any final ioStats bumps) BEFORE we
+      // merge ioStats into the bootstrap aggregate. The slot-clear is the canonical "task done"
+      // signal — PrefetchTask null's pendingPrefetch in its finally AFTER the ioStats inc calls.
+      // If the drain times out, the post-deadline counter bumps land in this stream's ioStats
+      // unobserved; that's the documented soft-loss trade-off (the alternative — blocking close
+      // indefinitely on a stuck preadv — is worse than slight counter imprecision).
+      long deadlineNanos =
+          System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(500);
+      while (pendingPrefetch != null && System.nanoTime() < deadlineNanos) {
+        try {
+          Thread.sleep(1);
+        } catch (InterruptedException ex) {
+          Thread.currentThread().interrupt();
+          break;
+        }
+      }
     }
     // Merge per-stream stats into the bootstrap aggregate exactly once. The merge contract
     // requires `ioStats` to be quiescent here — Hadoop's FSDataInputStream.close is non-thread-
-    // safe vs reads, so callers that follow the contract satisfy this. NO_OP merges as zeros.
+    // safe vs reads; the prefetch drain above covers the executor-thread bumps. NO_OP merges as
+    // zeros.
     if (aggregated.compareAndSet(false, true)) {
       aggregateIoStats.add(ioStats);
     }
@@ -562,7 +591,7 @@ public final class CachingInputStream extends InputStream
     }
     // Hadoop convention: seeking past EOF is allowed; subsequent reads return -1.
     position = pos;
-    // Phase 5c step 2: a seek invalidates the sequential trajectory; reset the HWM to the
+    // a seek invalidates the sequential trajectory; reset the HWM to the
     // sentinel so the next read on the new region re-bootstraps. Seekable.seek is single-thread
     // per Hadoop contract (incompatible with concurrent reads on the same stream), so a plain
     // set is sufficient — the CAS-based read paths cannot race with seek by contract.
@@ -592,7 +621,7 @@ public final class CachingInputStream extends InputStream
     if (pos >= fileSize) return -1;
     int n = (int) Math.min(length, fileSize - pos);
     readFullyFromCache(pos, buffer, offset, n);
-    // Phase 5c step 2: positional path uses updateAndGet — bootstrap from -1L on first call,
+    // positional path uses updateAndGet — bootstrap from -1L on first call,
     // contiguous-extend on pos == prev, otherwise leave HWM unchanged (scattered reads do not
     // perturb the sequential trajectory).
     advanceSeqHwmPositional(pos, n);
@@ -633,13 +662,13 @@ public final class CachingInputStream extends InputStream
    * AsyncDataCache#findOrCreate}.
    */
   private void readFullyFromCache(long pos, byte[] dst, int off, int length) throws IOException {
-    // Phase 5a: record top-of-call signals BEFORE issuing IO so a throw mid-read still reflects
+    // record top-of-call signals BEFORE issuing IO so a throw mid-read still reflects
     // the planned reference. recordReference is a no-op on ScanTracker.DISABLED and on
     // TrackingId.EMPTY; incRead is a no-op on IoStatistics.NO_OP.
     tracker.recordReference(trackingId, length);
     ioStats.incRead(length);
 
-    // Phase 5b: if the read crosses 2+ chunks AND coalescing is enabled, attempt the coalesce
+    // if the read crosses 2+ chunks AND coalescing is enabled, attempt the coalesce
     // path. Falls back to per-chunk on Waiting-driven restart exhaustion.
     long firstChunkStart = (pos / loadQuantum) * (long) loadQuantum;
     long endExclusive = pos + length;
@@ -676,11 +705,11 @@ public final class CachingInputStream extends InputStream
     }
     // Bottom-of-call: bytes actually consumed equal `length` (we always satisfy the whole
     // request via the loop or throw). recordRead drives readPct() / adjustedReadPct() in the
-    // tracker; the prefetch admission gate (Phase 5c) reads those values to gate prefetch.
+    // tracker; the prefetch admission gate reads those values to gate prefetch.
     tracker.recordRead(trackingId, length);
   }
 
-  // --- coalesce path (Phase 5b) -------------------------------------------
+  // --- coalesce path -------------------------------------------
 
   /** Outcome of a single coalesce attempt — caller decides whether to retry or move on. */
   private enum CoalesceOutcome {
@@ -998,7 +1027,7 @@ public final class CachingInputStream extends InputStream
       throw new java.io.InterruptedIOException(
           "Interrupted waiting for cache fill: " + ex.getMessage());
     } catch (java.util.concurrent.CancellationException ex) {
-      // Peer cancelled the fill promise (seek/close on the owning stream, Phase 5c prefetch
+      // Peer cancelled the fill promise (seek/close on the owning stream, prefetch
       // abandonment, etc.). Treat as an IOException so Hadoop retry harnesses + the coalesce
       // restart loop see a checked exception rather than an unchecked one bubbling up.
       throw new IOException("Cache fill cancelled", ex);

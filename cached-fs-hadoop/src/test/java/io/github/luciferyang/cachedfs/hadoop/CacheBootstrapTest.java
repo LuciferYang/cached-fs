@@ -150,7 +150,7 @@ class CacheBootstrapTest {
     assertThat(fresh.hasOpener("s3a://bucket-x")).isFalse();
   }
 
-  // --- Phase 5a: scanId / ScanTracker / aggregateIoStats ----------------
+  // --- scanId / ScanTracker / aggregateIoStats ----------------
 
   @Test
   @DisplayName("trackerFor normalizes null/empty/whitespace to 'default' and caches by scanId")
@@ -275,7 +275,7 @@ class CacheBootstrapTest {
     assertThat(b.scanTrackerMaxEntries()).isEqualTo(2); // max(2, 1)
   }
 
-  // --- Phase 5c: prefetch executor lifecycle ---------------------------
+  // --- prefetch executor lifecycle ---------------------------
 
   @Test
   @DisplayName("prefetchExecutor() returns a live executor when fs.cached.prefetch.enabled=true")

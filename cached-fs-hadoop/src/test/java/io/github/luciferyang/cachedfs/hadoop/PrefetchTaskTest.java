@@ -29,8 +29,8 @@ import org.junit.jupiter.api.Test;
 
 /**
  * Targeted tests for {@link PrefetchTask} and {@link DiscardAndCountHandler} surface behavior. The
- * actual run-path is exercised end-to-end once Phase 5c wires the admission gate; these tests cover
- * the rejection path + future-completion accessors so the sibling-class invariants are locked in
+ * actual run-path is exercised end-to-end once wires the admission gate; these tests cover the
+ * rejection path + future-completion accessors so the sibling-class invariants are locked in
  * independently.
  */
 class PrefetchTaskTest {

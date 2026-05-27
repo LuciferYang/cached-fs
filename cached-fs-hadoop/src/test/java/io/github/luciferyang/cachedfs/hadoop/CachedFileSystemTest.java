@@ -255,7 +255,7 @@ class CachedFileSystemTest {
     }
   }
 
-  // --- Phase 5a: tracker + IoStatistics + IOStatisticsSource wiring -----
+  // --- tracker + IoStatistics + IOStatisticsSource wiring -----
 
   @Test
   @DisplayName("reads bump ScanTracker (referencedBytes + readBytes) and IoStatistics (read+bytes)")

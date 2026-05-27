@@ -67,7 +67,7 @@ class IoStatisticsAdapterTest {
     assertThat(c).containsEntry("cachedfs_stream_ssd_read_operations", 1L);
     assertThat(c).containsEntry("cachedfs_stream_ssd_read_bytes", 30L);
     assertThat(c).containsEntry("cachedfs_stream_raw_overread_bytes", 10L);
-    // Phase 5c.
+    //
     assertThat(c).containsEntry("cachedfs_stream_prefetch_skipped_queue_full_bytes", 0L);
     assertThat(c).containsEntry("cachedfs_stream_prefetch_skipped_budget_bytes", 200L);
     assertThat(c).containsEntry("cachedfs_stream_prefetch_skipped_heap_pressure_bytes", 0L);
@@ -90,7 +90,7 @@ class IoStatisticsAdapterTest {
   }
 
   @Test
-  @DisplayName("bootstrap adapter exposes the aggregate counters + registry gauges")
+  @DisplayName("bootstrap adapter exposes EVERY aggregate counter + gauge name documented")
   void bootstrapNamesAndGauges() throws IOException {
     Configuration conf = minimalConf();
     CacheBootstrap.installIfNeeded(conf);
@@ -101,15 +101,47 @@ class IoStatisticsAdapterTest {
     b.trackerFor("scan-A")
         .recordReference(io.github.luciferyang.cachedfs.core.tracker.TrackingId.of(1, 0), 4096);
 
+    // Merge a stream that exercises every per-stream counter so the aggregate side has non-zero
+    // values to scrape — verifies both the name AND the wiring through AggregatedIoStatistics.add.
+    IoStatistics src = new IoStatistics();
+    src.incRead(100);
+    src.incRamHit(80);
+    src.incPrefetch(50);
+    src.incSsdRead(30);
+    src.incRawOverreadBytes(10);
+    src.incPrefetchSkipped("queue_full", 11);
+    src.incPrefetchSkipped("budget", 12);
+    src.incPrefetchSkipped("heap_pressure", 13);
+    src.incPrefetchSkipped("other", 14);
+    src.incPrefetchEvictedBeforeUse(7);
+    src.incPrefetchEligibleSuppressed(15);
+    src.incSeqHwmRegimeResets();
+    b.aggregateIoStats().add(src);
+
     IOStatistics out = b.getIOStatistics();
     java.util.Map<String, Long> c = out.counters();
     java.util.Map<String, Long> g = out.gauges();
 
-    // Bootstrap counter.
+    // Bootstrap-only counter.
     assertThat(c).containsEntry("cachedfs_stale_scan_id_recoveries", 1L);
-    // Aggregate counters seeded by tracker recording (referencedBytes only — read/prefetch
-    // counters are still zero since no stream merged yet).
-    assertThat(c).containsEntry("cachedfs_aggregate_read_bytes", 0L);
+    // Aggregated event + byte totals — pin every name in the documented contract.
+    assertThat(c).containsEntry("cachedfs_aggregate_read_operations", 1L);
+    assertThat(c).containsEntry("cachedfs_aggregate_read_bytes", 100L);
+    assertThat(c).containsEntry("cachedfs_aggregate_cache_hit_operations", 1L);
+    assertThat(c).containsEntry("cachedfs_aggregate_cache_hit_bytes", 80L);
+    assertThat(c).containsEntry("cachedfs_aggregate_prefetch_operations", 1L);
+    assertThat(c).containsEntry("cachedfs_aggregate_prefetched_bytes", 50L);
+    assertThat(c).containsEntry("cachedfs_aggregate_ssd_read_operations", 1L);
+    assertThat(c).containsEntry("cachedfs_aggregate_ssd_read_bytes", 30L);
+    assertThat(c).containsEntry("cachedfs_aggregate_raw_overread_bytes", 10L);
+    // aggregate counters.
+    assertThat(c).containsEntry("cachedfs_aggregate_prefetch_skipped_queue_full_bytes", 11L);
+    assertThat(c).containsEntry("cachedfs_aggregate_prefetch_skipped_budget_bytes", 12L);
+    assertThat(c).containsEntry("cachedfs_aggregate_prefetch_skipped_heap_pressure_bytes", 13L);
+    assertThat(c).containsEntry("cachedfs_aggregate_prefetch_skipped_other_bytes", 14L);
+    assertThat(c).containsEntry("cachedfs_aggregate_prefetch_evicted_before_use_bytes", 7L);
+    assertThat(c).containsEntry("cachedfs_aggregate_prefetch_eligible_suppressed_bytes", 15L);
+    assertThat(c).containsEntry("cachedfs_aggregate_seq_hwm_regime_resets", 1L);
     // Registry-snapshot gauges.
     assertThat(g).containsEntry("cachedfs_scan_tracker_count", 1L);
     assertThat(g).containsEntry("cachedfs_scan_tracker_entries", 1L);

@@ -24,8 +24,8 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Test-only {@link ReadFile} that counts {@code preadv} invocations and total bytes served. Used by
- * Phase 5b coalesce tests to assert "exactly N preadv calls for M chunks" without standing up a
- * remote filesystem.
+ * coalesce tests to assert "exactly N preadv calls for M chunks" without standing up a remote
+ * filesystem.
  */
 final class CountingReadFile implements ReadFile {
 

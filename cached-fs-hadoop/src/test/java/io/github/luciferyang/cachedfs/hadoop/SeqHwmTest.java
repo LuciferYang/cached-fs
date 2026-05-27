@@ -30,9 +30,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Phase 5c step 2 — verifies the sequential CAS-loop and positional updateAndGet state machine on
- * {@code CachingInputStream.seqHWM}. Uses package-private accessors {@code seqHwmForTesting} and
- * inspects {@code IoStatistics.seqHwmRegimeResets} via the bootstrap aggregate.
+ * verifies the sequential CAS-loop and positional updateAndGet state machine on {@code
+ * CachingInputStream.seqHWM}. Uses package-private accessors {@code seqHwmForTesting} and inspects
+ * {@code IoStatistics.seqHwmRegimeResets} via the bootstrap aggregate.
  */
 class SeqHwmTest {
 

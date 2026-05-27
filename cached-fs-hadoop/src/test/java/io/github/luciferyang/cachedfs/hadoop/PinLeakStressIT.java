@@ -37,12 +37,11 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Phase 5b pin-leak stress test (Failsafe IT, ~30 s wall-clock budget). Many threads issue random
- * positional reads against a shared file with coalesce + prefetch both enabled. Forces:
+ * pin-leak stress test (Failsafe IT, ~30 s wall-clock budget). Many threads issue random positional
+ * reads against a shared file with coalesce + prefetch both enabled. Forces:
  *
  * <ul>
- *   <li>Multi-pin acquisition + abort-and-restart (Phase 5b) when a Waiting result fires
- *       mid-classification.
+ *   <li>Multi-pin acquisition + abort-and-restart when a Waiting result fires mid-classification.
  *   <li>PrefetchTask + consumer races on the same chunk (Hit / Waiting / Exclusive triangle).
  *   <li>Stream close while prefetch is in-flight.
  * </ul>
@@ -155,9 +154,9 @@ class PinLeakStressIT {
     conf.setBoolean(CachedFsConfig.ENABLED, true);
     conf.set(CachedFsConfig.INNER_IMPL, LocalFileSystem.class.getName());
     conf.setInt(CachedFsConfig.LOAD_QUANTUM_BYTES, loadQuantumBytes);
-    // Force-on coalesce to exercise the Phase 5b path (small cache would otherwise auto-disable).
+    // Force-on coalesce to exercise the path (small cache would otherwise auto-disable).
     conf.setBoolean(CachedFsConfig.COALESCE_ALWAYS_ON, true);
-    // Phase 5c prefetch on — explicit so a future default flip doesn't silently change coverage.
+    // prefetch on — explicit so a future default flip doesn't silently change coverage.
     conf.setBoolean(CachedFsConfig.PREFETCH_ENABLED, true);
     return conf;
   }

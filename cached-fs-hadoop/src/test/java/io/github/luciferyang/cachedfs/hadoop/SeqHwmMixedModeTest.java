@@ -30,9 +30,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Phase 5c seqHWM interleaved-access tests. Single-mode behavior (pure sequential, pure positional)
- * is pinned by {@link SeqHwmTest}; this file targets the cross-mode boundary where regime resets
- * fire (or don't) and the contiguous-positional rule meets the bootstrap branch.
+ * seqHWM interleaved-access tests. Single-mode behavior (pure sequential, pure positional) is
+ * pinned by {@link SeqHwmTest}; this file targets the cross-mode boundary where regime resets fire
+ * (or don't) and the contiguous-positional rule meets the bootstrap branch.
  *
  * <p>These tests don't spawn threads — the Hadoop {@code FSDataInputStream} contract forbids
  * cross-thread reads against a single stream, so the production CAS loops on {@code seqHWM} only

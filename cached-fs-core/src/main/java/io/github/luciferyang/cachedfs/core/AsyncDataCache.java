@@ -143,11 +143,11 @@ public final class AsyncDataCache implements AutoCloseable {
   private final CacheShard[] shards;
   private final AtomicBoolean closed = new AtomicBoolean();
 
-  // --- Phase 5c.0: prefetch byte-budget counter --------------------------
+  // --- prefetch byte-budget counter --------------------------
 
   /**
-   * Sum of bytes pinned by in-flight prefetch tasks. PrefetchTask (Phase 5c) increments at start
-   * and decrements in the run() finally; the admission gate reads this to bound concurrent prefetch
+   * Sum of bytes pinned by in-flight prefetch tasks. PrefetchTask increments at start and
+   * decrements in the run() finally; the admission gate reads this to bound concurrent prefetch
    * volume. LongAdder is non-atomic vs concurrent reads — see decrement guard below.
    */
   private final java.util.concurrent.atomic.LongAdder pendingPrefetchBytes =
@@ -259,10 +259,10 @@ public final class AsyncDataCache implements AutoCloseable {
    * best-effort, not strict. Use {@link #removeFileEntries} or {@link
    * io.github.luciferyang.cachedfs.core.ttl.CacheTTLController#applyTTL} for targeted removal.
    */
-  // --- Phase 5c.0 byte-budget API (no callers yet; wired by Phase 5c) ---
+  // --- byte-budget API (no callers yet; wired by ) ---
 
   /**
-   * Sum of bytes pinned by in-flight prefetch tasks. Used by the Phase 5c admission gate. Returns a
+   * Sum of bytes pinned by in-flight prefetch tasks. Used by the admission gate. Returns a
    * non-atomic snapshot; transient values may briefly differ from the global invariant under
    * concurrent inc/dec — the guard in {@link #decrementPendingPrefetch(long)} accommodates this.
    */
