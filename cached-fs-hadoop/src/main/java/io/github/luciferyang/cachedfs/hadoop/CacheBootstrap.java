@@ -493,6 +493,17 @@ public final class CacheBootstrap {
   }
 
   /**
+   * Live-view bootstrap-level {@link org.apache.hadoop.fs.statistics.IOStatistics} surface
+   * aggregating the merged-from-stream {@code aggregateIoStats} totals AND registry-snapshot gauges
+   * ({@code scanTrackerEntries}, {@code scanTrackerMaxEntries}, {@code pendingPrefetchBytes}).
+   * Operators wire this into a JMX / Prometheus exporter for the cache-wide observability surface;
+   * per-stream stats remain on {@code FSDataInputStream .getIOStatistics()}.
+   */
+  public org.apache.hadoop.fs.statistics.IOStatistics getIOStatistics() {
+    return IoStatisticsAdapter.forBootstrap(this);
+  }
+
+  /**
    * Returns the cached heap-pressure bit (true ⇔ heap is &gt;90% full). Refreshes at most once per
    * {@link CachedFsConfig#PREFETCH_HEAP_PRESSURE_TTL_MS} via a single-CAS-winner pattern: only one
    * thread per TTL window calls {@link java.lang.management.MemoryMXBean#getHeapMemoryUsage};
