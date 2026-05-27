@@ -445,6 +445,53 @@ class CachedFileSystemTest {
   }
 
   @Test
+  @DisplayName(
+      "openFile builder falls back to the FS's default bufferSize when the standard opt is unset")
+  void openFileBuilderFallsBackToDefaultBufferSize(@TempDir java.nio.file.Path dir)
+      throws Exception {
+    // Guards the opt-unset branch of getOptions().getInt(FS_OPTION_OPENFILE_BUFFER_SIZE,
+    // getBufferSize()): when the standard option is absent, the FS's IO_FILE_BUFFER_SIZE-derived
+    // default must flow through. A regression that read 0 / different fallback would silently
+    // break callers that don't set the standard option (the most common case).
+    byte[] payload = bytes(64);
+    java.nio.file.Path file = dir.resolve("default-buffer.bin");
+    Files.write(file, payload);
+
+    int[] capturedBufferSize = new int[] {-1};
+    CachedFileSystem cfs =
+        new CachedFileSystem() {
+          @Override
+          protected java.util.concurrent.CompletableFuture<FSDataInputStream> openFileWithOptions(
+              Path path, org.apache.hadoop.fs.impl.OpenFileParameters parameters)
+              throws IOException {
+            capturedBufferSize[0] = parameters.getBufferSize();
+            return super.openFileWithOptions(path, parameters);
+          }
+        };
+    cfs.initialize(URI.create("file:///"), defaultConf());
+    try {
+      Path p = new Path(file.toUri());
+      try (FSDataInputStream in = cfs.openFile(p).build().get()) {
+        byte[] read = new byte[payload.length];
+        in.readFully(read);
+        assertThat(read).isEqualTo(payload);
+      }
+      // With no opt, the captured size is the FS default (io.file.buffer.size, ~4096 in
+      // Hadoop 3.4 default conf). The exact value isn't load-bearing — what matters is that
+      // it is positive AND it doesn't coincide with our opt-path sentinel (8192) so an opt vs.
+      // fallback mix-up could be diagnosed.
+      assertThat(capturedBufferSize[0])
+          .as("fallback bufferSize must be positive when the standard opt is unset")
+          .isPositive();
+      assertThat(capturedBufferSize[0])
+          .as("fallback bufferSize must NOT coincide with the opt-path sentinel (8192)")
+          .isNotEqualTo(8192);
+    } finally {
+      cfs.close();
+    }
+  }
+
+  @Test
   @DisplayName("openFile(PathHandle) builder comes from the inner FS (documented bypass)")
   void openFilePathHandlePassesThrough(@TempDir java.nio.file.Path dir) throws Exception {
     // PathHandle's opaque content tag prevents reliable cache keying, so we delegate to the inner

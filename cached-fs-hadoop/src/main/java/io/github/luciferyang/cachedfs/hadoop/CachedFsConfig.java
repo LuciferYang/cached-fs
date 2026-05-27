@@ -464,7 +464,10 @@ public final class CachedFsConfig {
     return v;
   }
 
-  /** Default {@code loadQuantum × threads × 4}; chosen heuristic per phase-5c.md §step 6. */
+  /**
+   * Default {@code loadQuantum × threads × 4}: a heuristic that gives each prefetch thread enough
+   * in-flight budget to keep 4 chunks queued before back-pressure kicks in.
+   */
   public static long defaultPrefetchMaxPendingBytes(int loadQuantumBytes, int prefetchThreads) {
     return (long) loadQuantumBytes * prefetchThreads * 4L;
   }

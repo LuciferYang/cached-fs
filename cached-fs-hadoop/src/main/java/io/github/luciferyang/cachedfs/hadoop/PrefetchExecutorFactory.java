@@ -47,15 +47,28 @@ final class PrefetchExecutorFactory {
     if (queueSize <= 0) {
       throw new IllegalArgumentException("prefetch queue size must be > 0: " + queueSize);
     }
-    return new ThreadPoolExecutor(
-        /* core= */ threads,
-        /* max= */ threads,
-        /* keepAlive= */ 0L,
-        TimeUnit.MILLISECONDS,
-        new ArrayBlockingQueue<>(queueSize),
-        new DaemonThreadFactory(),
-        new DiscardAndCountHandler());
+    ThreadPoolExecutor exec =
+        new ThreadPoolExecutor(
+            /* core= */ threads,
+            /* max= */ threads,
+            /* keepAlive= */ 0L,
+            TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<>(queueSize),
+            new DaemonThreadFactory(),
+            new DiscardAndCountHandler());
+    lastCreatedForTesting = exec;
+    return exec;
   }
+
+  /**
+   * Test-only handle to the most recently constructed prefetch executor. Lets a test that
+   * deliberately triggers a late-stage install failure assert {@code isShutdown()} on the
+   * orphaned executor — which is otherwise unreachable because the failed-install local goes
+   * out of scope inside the rollback catch. Production code MUST NOT read this — there is no
+   * memory-coherence contract beyond the volatile write, and the field is overwritten on every
+   * subsequent {@link #create} call. Reset to {@code null} between tests.
+   */
+  static volatile ThreadPoolExecutor lastCreatedForTesting;
 
   /** Daemon thread factory naming threads {@code cached-fs-prefetch-N}; WARN-logs uncaughts. */
   private static final class DaemonThreadFactory implements ThreadFactory {

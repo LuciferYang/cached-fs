@@ -326,15 +326,26 @@ class CacheBootstrapTest {
 
     // Snapshot the names of any pre-existing prefetch threads so we can detect new leaks only.
     java.util.Set<String> before = liveCachedFsPrefetchThreadNames();
+    // Clear the test-only handle so we capture only the executor this install attempt creates.
+    PrefetchExecutorFactory.lastCreatedForTesting = null;
 
     assertThatThrownBy(() -> CacheBootstrap.installIfNeeded(conf))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining(CachedFsConfig.PREFETCH_HEAP_PRESSURE_TTL_MS);
 
-    // No new cached-fs-prefetch-* threads survive the rollback. ThreadPoolExecutor spawns
-    // workers lazily on the first execute(), so under normal conditions there is nothing to
-    // shut down here — but shutdownNow() is also the only guarantee against a future code
-    // path that prestarts core threads or warms the pool prior to the failure point.
+    // Load-bearing: the orphaned executor MUST be shutdown. Without the rollback's
+    // shutdownNow() call this would be false — proving the fix is exercised by this test.
+    java.util.concurrent.ThreadPoolExecutor orphan = PrefetchExecutorFactory.lastCreatedForTesting;
+    assertThat(orphan)
+        .as("PrefetchExecutorFactory must have been called before the IAE fired")
+        .isNotNull();
+    assertThat(orphan.isShutdown())
+        .as("installIfNeeded rollback must shutdownNow() the orphaned prefetch executor")
+        .isTrue();
+
+    // Secondary defense: no new cached-fs-prefetch-* threads survive the rollback. Lazy worker
+    // spawn means there usually isn't anything to count here, but the assertion guards against
+    // a future code path that prestarts core threads prior to the failure point.
     java.util.Set<String> after = liveCachedFsPrefetchThreadNames();
     after.removeAll(before);
     assertThat(after).as("no cached-fs-prefetch-* threads should leak across the rollback")

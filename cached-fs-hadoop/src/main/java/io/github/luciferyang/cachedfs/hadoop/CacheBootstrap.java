@@ -96,8 +96,8 @@ public final class CacheBootstrap {
   /**
    * prefetch executor. Null when {@code fs.cached.prefetch.enabled=false} (the consumer checks for
    * null before submitting). Built once at {@link #installIfNeeded} and shut down in {@link
-   * #uninstallForTesting} with a bounded await + {@code shutdownNow} fallback to bound the pin-leak
-   * window per phase-5c.md §step 1.
+   * #uninstallForTesting} with a bounded await + {@code shutdownNow} fallback so any in-flight
+   * prefetch task has a chance to release its pin before the cache is torn down.
    */
   private final java.util.concurrent.ThreadPoolExecutor prefetchExecutor;
 
@@ -122,7 +122,8 @@ public final class CacheBootstrap {
   /**
    * Per-scan {@link ScanTracker} registry. Lifetime entries are inserted lazily by {@link
    * #trackerFor(String)} and evicted by {@link #withScanId(String)} close or explicit {@link
-   * #removeScanTracker(String)}. See phase-5a doc for the long-lived-JVM eviction rationale.
+   * #removeScanTracker(String)} — explicit eviction prevents unbounded growth in long-lived JVMs
+   * (driver / worker hosts that serve many independent scans).
    */
   private final ConcurrentMap<String, ScanTracker> scanTrackers = new ConcurrentHashMap<>();
 
@@ -427,7 +428,8 @@ public final class CacheBootstrap {
       // executor shutdown — happens BEFORE handle drain so any in-flight prefetch task
       // finishes its run-finally (decrementPendingPrefetch + clearPendingPrefetchIf) against a
       // still-live RAM cache. Bounded await: 5s then shutdownNow + another 5s; persistent
-      // stragglers are logged at ERROR. Bounds the pin-leak window per phase-5c.md §step 1.
+      // stragglers are logged at ERROR. Bounds the pin-leak window so tests don't carry pinned
+      // entries forward into the next install.
       if (b.prefetchExecutor != null) {
         b.prefetchExecutor.shutdown();
         try {

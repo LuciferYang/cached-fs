@@ -92,8 +92,9 @@ final class PrefetchTask implements Runnable {
   @Override
   public void run() {
     // Increment FIRST so the byte-budget counter and the decrement in finally are paired one-to-
-    // one regardless of any throw in the body. The submission site does not pre-increment — see
-    // phase-5c.md §step 4 ("sole site that increments/decrements pendingPrefetchBytes").
+    // one regardless of any throw in the body. This run() is the SOLE site that
+    // increments / decrements pendingPrefetchBytes — the submission site deliberately does not
+    // pre-increment, so the increment/decrement pair is always co-located here.
     cache.incrementPendingPrefetch(chunkSize);
     Throwable failure = null;
     try {
