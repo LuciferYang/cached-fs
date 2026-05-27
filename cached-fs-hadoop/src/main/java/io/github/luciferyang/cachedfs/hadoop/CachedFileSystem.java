@@ -54,13 +54,13 @@ import org.apache.hadoop.util.ReflectionUtils;
  * FileSystem} side by side. Closing one decorator unregisters its endpoint and drains only its own
  * handles; sibling decorators keep their entries.
  *
- * <p><b>Cached vs passthrough APIs:</b> only the legacy {@code open(Path)} / {@code open(Path,
- * int)} entry points route through the cache. The modern builder API ({@link
- * FilterFileSystem#openFile(Path)}, {@code openFile(PathHandle)}) and {@code open(PathHandle, int)}
- * delegate to the inner FS unchanged — they bypass the cache. Readers that prefer the builder API
- * (S3A select reads, some Iceberg / Parquet code paths) will see zero cache hits. Routing those
- * through the cache is a future task; configure your reader to use {@code open(Path, int)} until
- * then.
+ * <p><b>Cached vs passthrough APIs:</b> {@code open(Path)}, {@code open(Path, int)}, and {@code
+ * openFile(Path).build()} all route through the cache — the builder-API override redirects to our
+ * own {@code openFileWithOptions} so Spark vectorized Parquet/ORC readers, Iceberg, and S3A select
+ * readers that prefer the modern builder still hit the cache. {@code openFile(PathHandle)} and
+ * {@code open(PathHandle, int)} still pass through to the inner FS (PathHandle's opaque content tag
+ * prevents the cache from keying on a stable file identity); document this gap to integrators using
+ * PathHandle-based read APIs.
  */
 public final class CachedFileSystem extends FilterFileSystem {
 
@@ -266,6 +266,79 @@ public final class CachedFileSystem extends FilterFileSystem {
       releaseOnFailure(ptr, cis, ptrTransferred, ex);
       throw ex;
     }
+  }
+
+  /**
+   * Override of {@link FilterFileSystem#openFile(Path)}. The inherited delegation hands the builder
+   * to the inner FS, which means a Spark vectorized Parquet/ORC reader using {@code
+   * openFile(p).build()} would silently bypass the cache. By returning the default {@link
+   * FileSystem} builder bound to {@code this}, we keep ourselves on the call path so the builder's
+   * {@code build()} routes into {@link #openFileWithOptions(Path,
+   * org.apache.hadoop.fs.impl.OpenFileParameters)} below — which calls our {@link #open(Path, int)}
+   * and goes through the cache.
+   *
+   * <p>{@code withFileStatus(FileStatus)} is accepted but ignored on the cached path because the
+   * cache keys on {@code Path} (file identity is recomputed via {@code StringIdMap}); skipping the
+   * status pre-fetch optimization for now is a documented trade-off.
+   */
+  @Override
+  public org.apache.hadoop.fs.FutureDataInputStreamBuilder openFile(Path path) throws IOException {
+    return new CachedFsInputStreamBuilder(this, path).getThisBuilder();
+  }
+
+  /**
+   * Trivial concrete subclass of {@link org.apache.hadoop.fs.impl.FutureDataInputStreamBuilderImpl}
+   * — only exists because Hadoop's default builder is a {@code private} nested class of {@link
+   * FileSystem} and therefore unreachable. The inherited {@code build()} calls {@code
+   * getFS().openFileWithOptions(...)}, which lands on our override below.
+   */
+  private static final class CachedFsInputStreamBuilder
+      extends org.apache.hadoop.fs.impl.FutureDataInputStreamBuilderImpl {
+    CachedFsInputStreamBuilder(CachedFileSystem fs, Path path) throws IOException {
+      super(fs, path);
+    }
+
+    @Override
+    public java.util.concurrent.CompletableFuture<FSDataInputStream> build() throws IOException {
+      org.apache.hadoop.fs.impl.OpenFileParameters parameters =
+          new org.apache.hadoop.fs.impl.OpenFileParameters()
+              .withMandatoryKeys(getMandatoryKeys())
+              .withOptionalKeys(getOptionalKeys())
+              .withOptions(getOptions())
+              .withStatus(super.getStatus())
+              .withBufferSize(getBufferSize());
+      CachedFileSystem cfs = (CachedFileSystem) getFS();
+      return cfs.openFileWithOptions(getPath(), parameters);
+    }
+  }
+
+  /**
+   * Bypass: {@code PathHandle} carries an opaque content tag and (per Hadoop's contract) refers to
+   * a specific file content version, not a path. The cache keys on {@code Path} → {@code
+   * StringIdMap.fileNum}, so we cannot reliably resolve a PathHandle back to a cached entry without
+   * an inner-FS round trip that re-canonicalizes. For now, delegate to the inner FS unchanged —
+   * future work may key cached entries on PathHandle.contentHash for connectors that publish one.
+   */
+  @Override
+  public org.apache.hadoop.fs.FutureDataInputStreamBuilder openFile(
+      org.apache.hadoop.fs.PathHandle pathHandle) throws IOException {
+    return fs.openFile(pathHandle);
+  }
+
+  /**
+   * Path-based builder build(). Rejects unknown mandatory keys per the Hadoop contract, then routes
+   * to our {@link #open(Path, int)} so the cache sees the read.
+   */
+  @Override
+  protected java.util.concurrent.CompletableFuture<FSDataInputStream> openFileWithOptions(
+      Path path, org.apache.hadoop.fs.impl.OpenFileParameters parameters) throws IOException {
+    org.apache.hadoop.fs.impl.AbstractFSBuilderImpl.rejectUnknownMandatoryKeys(
+        parameters.getMandatoryKeys(),
+        org.apache.hadoop.fs.Options.OpenFileOptions.FS_OPTION_OPENFILE_STANDARD_OPTIONS,
+        "for " + path);
+    return org.apache.hadoop.util.LambdaUtils.eval(
+        new java.util.concurrent.CompletableFuture<>(),
+        () -> open(path, parameters.getBufferSize()));
   }
 
   private static void releaseOnFailure(

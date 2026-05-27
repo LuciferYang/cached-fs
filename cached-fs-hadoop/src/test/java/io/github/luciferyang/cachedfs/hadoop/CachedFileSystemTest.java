@@ -351,6 +351,74 @@ class CachedFileSystemTest {
     }
   }
 
+  // --- openFile() builder API wiring --------------------------------------
+
+  @Test
+  @DisplayName("openFile(path).build().get() routes through the cache (Spark vectorized path)")
+  void openFileBuilderRoutesThroughCache(@TempDir java.nio.file.Path dir) throws Exception {
+    byte[] payload = bytes(16 * 1024);
+    java.nio.file.Path file = dir.resolve("openfile.bin");
+    Files.write(file, payload);
+
+    try (CachedFileSystem cfs = newCfs(file.toUri(), defaultConf())) {
+      Path p = new Path(file.toUri());
+      // First openFile populates the cache via the builder API; assert bytes round-trip.
+      try (FSDataInputStream in = cfs.openFile(p).build().get()) {
+        byte[] got = in.readAllBytes();
+        assertThat(got).isEqualTo(payload);
+        // Builder path returns a CachingInputStream wrapped in FSDataInputStream — verify the
+        // wrapping (a passthrough would return the inner FS's stream type).
+        assertThat(in.getWrappedStream()).isInstanceOf(CachingInputStream.class);
+      }
+      // Second openFile is served by RAM hit; the cached-fs counter must bump.
+      try (FSDataInputStream in = cfs.openFile(p).build().get()) {
+        in.readAllBytes();
+        org.apache.hadoop.fs.statistics.IOStatistics stats = in.getIOStatistics();
+        assertThat(stats.counters().get("cachedfs_stream_cache_hit_bytes")).isEqualTo(16384L);
+      }
+    }
+  }
+
+  @Test
+  @DisplayName("openFile builder rejects unknown mandatory keys per Hadoop contract")
+  void openFileBuilderRejectsUnknownMandatoryKey(@TempDir java.nio.file.Path dir) throws Exception {
+    byte[] payload = bytes(64);
+    java.nio.file.Path file = dir.resolve("must.bin");
+    Files.write(file, payload);
+
+    try (CachedFileSystem cfs = newCfs(file.toUri(), defaultConf())) {
+      Path p = new Path(file.toUri());
+      assertThatThrownBy(
+              () -> cfs.openFile(p).must("fs.cached.bogus.mandatory.key", "x").build().get())
+          .satisfies(
+              ex -> {
+                // CompletableFuture wraps the IllegalArgumentException as ExecutionException.cause.
+                Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+                assertThat(cause).isInstanceOf(IllegalArgumentException.class);
+              });
+    }
+  }
+
+  @Test
+  @DisplayName("openFile(PathHandle) builder comes from the inner FS (documented bypass)")
+  void openFilePathHandlePassesThrough(@TempDir java.nio.file.Path dir) throws Exception {
+    // PathHandle's opaque content tag prevents reliable cache keying, so we delegate to the inner
+    // FS. LocalFileSystem hands back a builder whose build() would throw later; we just verify the
+    // decorator returns a non-null builder produced by the inner (NOT by our static-nested
+    // CachedFsInputStreamBuilder class).
+    byte[] payload = bytes(64);
+    java.nio.file.Path file = dir.resolve("ph.bin");
+    Files.write(file, payload);
+
+    try (CachedFileSystem cfs = newCfs(file.toUri(), defaultConf())) {
+      org.apache.hadoop.fs.PathHandle dummyHandle = () -> java.nio.ByteBuffer.allocate(0);
+      org.apache.hadoop.fs.FutureDataInputStreamBuilder builder = cfs.openFile(dummyHandle);
+      assertThat(builder).isNotNull();
+      // Builder class is NOT our inner static class — proves delegation, not interception.
+      assertThat(builder.getClass().getName()).doesNotContain("CachedFsInputStreamBuilder");
+    }
+  }
+
   // --- helpers -------------------------------------------------------------
 
   private static CachedFileSystem newCfs(URI fileUri, Configuration conf) throws IOException {

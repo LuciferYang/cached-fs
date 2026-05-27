@@ -35,7 +35,7 @@ For multi-scheme caching in the same JVM, give each `FileSystem.get(uri, conf)` 
 
 ### Limitations
 
-- Only the legacy `open(Path)` / `open(Path, int)` reader entry points route through the cache. The modern `openFile(Path)` builder API and `open(PathHandle, ...)` paths delegate to the inner FS unchanged. Configure your reader (Spark, Iceberg, Parquet, etc.) to call the legacy `open` if you want cache hits.
+- `open(Path)`, `open(Path, int)`, and `openFile(Path).build()` all route through the cache. `openFile(PathHandle)` and `open(PathHandle, int)` still delegate to the inner FS — PathHandle's opaque content tag prevents reliable cache keying.
 - `applyTTL(ttlSeconds)` rejects negative values and values larger than the current epoch second.
 - The `cached-fs-metrics` module is not yet shipped; depending on it today gets an empty jar.
 
