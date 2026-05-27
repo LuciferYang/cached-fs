@@ -289,91 +289,36 @@ public final class CachedFileSystem extends FilterFileSystem {
     org.apache.hadoop.fs.BlockLocation[] underlying = fs.getFileBlockLocations(file, start, len);
     org.apache.hadoop.fs.BlockLocation[] rewritten =
         provider.getBlockLocations(file, start, len, underlying);
-    // Defensive: a misbehaving provider that returns null falls back to the underlying value.
+    // The BlockLocationsProvider contract allows null as "no change" — fall back to underlying so
+    // a deferring provider doesn't have to know about the original array.
     return rewritten != null ? rewritten : underlying;
   }
 
   /**
-   * Override of {@link FilterFileSystem#listLocatedStatus(Path)}. Hadoop's HDFS / S3A / ABFS
-   * connectors return {@link org.apache.hadoop.fs.LocatedFileStatus} instances with block locations
-   * PRE-COMPUTED inside each entry; Spark's {@code HadoopFSUtils} consumes those locations directly
-   * without ever calling {@link #getFileBlockLocations(FileStatus, long, long)}. Without this
-   * override the affinity hint NEVER reaches Spark for the primary deployment targets. Rewrite each
-   * entry's {@code BlockLocation[]} through the provider so the planner sees executor-shaped task
-   * locations.
-   */
-  @Override
-  public org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus>
-      listLocatedStatus(Path f) throws IOException {
-    org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus> inner =
-        fs.listLocatedStatus(f);
-    BlockLocationsProvider provider = activeProvider();
-    if (provider == null) return inner;
-    return rewriteLocatedIterator(inner, provider);
-  }
-
-  /**
-   * Override of {@link FilterFileSystem#listFiles(Path, boolean)}. Same rationale as {@link
-   * #listLocatedStatus(Path)} — Spark also iterates this recursive variant for some FileScan code
-   * paths.
-   */
-  @Override
-  public org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus> listFiles(
-      Path f, boolean recursive) throws IOException {
-    org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus> inner =
-        fs.listFiles(f, recursive);
-    BlockLocationsProvider provider = activeProvider();
-    if (provider == null) return inner;
-    return rewriteLocatedIterator(inner, provider);
-  }
-
-  /**
-   * Returns the active provider, or null when the decorator is disabled / the bootstrap is not
-   * installed / no provider is registered. Centralizes the four-step null check used by every
-   * provider-aware override so they stay readable.
+   * We deliberately do NOT override {@code listLocatedStatus} or {@code listFiles}. Spark 4.0's
+   * {@code HadoopFSUtils.listLeafFiles} routes through {@code listLocatedStatus} only for {@code
+   * DistributedFileSystem | ViewFileSystem} subclasses (verified against
+   * apache/spark@v4.0.0:HadoopFSUtils.scala). {@link CachedFileSystem} extends {@link
+   * FilterFileSystem} which is neither, so Spark's primary path falls through to {@code
+   * fs.listStatus + fs.getFileBlockLocations} — and the latter IS overridden above. Overriding
+   * {@code listLocatedStatus} with a wrapper that rebuilds {@code LocatedFileStatus} via {@code new
+   * LocatedFileStatus(original, rewritten)} would also flatten HDFS-specific subclasses ({@code
+   * HdfsLocatedFileStatus}, dropping {@code FileEncryptionInfo} + erasure-coding policy + fileId),
+   * breaking Spark on HDFS Transparent Encryption clusters. The hook is provided via {@link
+   * #getFileBlockLocations(FileStatus, long, long)} and is sufficient for Spark and for any other
+   * consumer that asks explicitly for block locations.
+   *
+   * <p>Third-party callers that DO route through {@code listLocatedStatus} (some Iceberg /
+   * Hive-on-MR planners) bypass the affinity hint by design — they typically have their own
+   * locality logic. Re-enabling support here would require either preserving subclass identity (via
+   * per-subclass adapters) or cloning each {@link org.apache.hadoop.fs.BlockLocation} in-place with
+   * rewritten hosts; both are deferred to a future iteration.
    */
   private BlockLocationsProvider activeProvider() {
     if (!enabled) return null;
     CacheBootstrap b = CacheBootstrap.get().orElse(null);
     if (b == null) return null;
     return b.blockLocationsProvider();
-  }
-
-  /**
-   * Wraps a {@link org.apache.hadoop.fs.RemoteIterator} of {@link
-   * org.apache.hadoop.fs.LocatedFileStatus} so each entry's block-locations array is rewritten
-   * through the provider. Lazy: the rewrite happens on {@code next()}, preserving the inner
-   * iterator's streaming behavior (important for very-large directory listings on HDFS / S3A where
-   * eager materialization would OOM).
-   */
-  private static org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus>
-      rewriteLocatedIterator(
-          org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus> inner,
-          BlockLocationsProvider provider) {
-    return new org.apache.hadoop.fs.RemoteIterator<>() {
-      @Override
-      public boolean hasNext() throws IOException {
-        return inner.hasNext();
-      }
-
-      @Override
-      public org.apache.hadoop.fs.LocatedFileStatus next() throws IOException {
-        org.apache.hadoop.fs.LocatedFileStatus original = inner.next();
-        org.apache.hadoop.fs.BlockLocation[] underlying = original.getBlockLocations();
-        if (underlying == null || underlying.length == 0) {
-          return original;
-        }
-        // Ask the provider for [0, fileLen) — matches the typical Spark call that asks about the
-        // full file. Per-block sub-ranges would require N provider calls per file; not worth it
-        // since affinity is a whole-file decision.
-        org.apache.hadoop.fs.BlockLocation[] rewritten =
-            provider.getBlockLocations(original, 0L, original.getLen(), underlying);
-        if (rewritten == null || rewritten == underlying) {
-          return original;
-        }
-        return new org.apache.hadoop.fs.LocatedFileStatus(original, rewritten);
-      }
-    };
   }
 
   /**

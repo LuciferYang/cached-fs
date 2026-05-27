@@ -605,11 +605,21 @@ public final class CacheBootstrap {
 
   /**
    * Installs a {@link BlockLocationsProvider}. Pass {@code null} to revert to the default
-   * passthrough. Called by the {@code cached-fs-spark} module's Spark extension at startup;
-   * production callers should invoke this at most once per JVM.
+   * passthrough. Called by the {@code cached-fs-spark} module's Spark extension at startup via
+   * {@link #stageBlockLocationsProvider(BlockLocationsProvider)}; direct callers should prefer the
+   * static stage method so the install/stage race is centrally locked.
+   *
+   * <p>The setter itself acquires {@link #LOCK} for ordering against the install-time read in
+   * {@link #installIfNeeded(Configuration)} — so a write through this method and a write through
+   * the staging path can never interleave to leave pending+installed in inconsistent states.
    */
   public void setBlockLocationsProvider(BlockLocationsProvider provider) {
-    this.blockLocationsProvider = provider;
+    LOCK.lock();
+    try {
+      this.blockLocationsProvider = provider;
+    } finally {
+      LOCK.unlock();
+    }
   }
 
   /**

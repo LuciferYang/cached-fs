@@ -167,42 +167,6 @@ class CachedFsAffinityBlockLocationsProviderTest {
     }
   }
 
-  @Test
-  @DisplayName("listLocatedStatus rewrites BlockLocations on each emitted LocatedFileStatus")
-  void listLocatedStatusRewritesEntries(@TempDir Path dir) throws IOException {
-    byte[] payload = bytes(1024);
-    Path fileA = dir.resolve("a.bin");
-    Path fileB = dir.resolve("b.bin");
-    Files.write(fileA, payload);
-    Files.write(fileB, payload);
-
-    Configuration conf = new Configuration(false);
-    conf.setBoolean(CachedFsConfig.ENABLED, true);
-    conf.set(CachedFsConfig.INNER_IMPL, LocalFileSystem.class.getName());
-
-    CachedFsSoftAffinityManager mgr = CachedFsAffinitySoftMgr();
-    mgr.setEnabled(true);
-    mgr.setReplicationNum(1);
-    mgr.handleExecutorAdded("exec-list", "host-list");
-    CacheBootstrap.stageBlockLocationsProvider(new CachedFsAffinityBlockLocationsProvider());
-
-    try (CachedFileSystem cfs = new CachedFileSystem()) {
-      cfs.initialize(URI.create("file:///"), conf);
-      org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus> it =
-          cfs.listLocatedStatus(new org.apache.hadoop.fs.Path(dir.toUri()));
-      int seen = 0;
-      while (it.hasNext()) {
-        org.apache.hadoop.fs.LocatedFileStatus entry = it.next();
-        if (entry.isDirectory()) continue;
-        BlockLocation[] locs = entry.getBlockLocations();
-        assertThat(locs).hasSize(1);
-        assertThat(safeHosts(locs[0])).containsExactly("executor_host-list_exec-list");
-        seen++;
-      }
-      assertThat(seen).isEqualTo(2);
-    }
-  }
-
   // --- helpers -----------------------------------------------------------
 
   private static CachedFsSoftAffinityManager CachedFsAffinitySoftMgr() {

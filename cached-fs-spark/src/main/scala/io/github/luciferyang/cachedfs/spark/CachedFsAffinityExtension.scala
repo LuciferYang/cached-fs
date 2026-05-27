@@ -118,11 +118,14 @@ class CachedFsAffinityExtension extends (SparkSessionExtensions => Unit) with Lo
 
     // Step 3: register the listener AFTER the manager is fully configured. Order matters because
     // SparkListenerExecutorAdded events arriving between addSparkListener and the manager being
-    // enabled would be recorded in the ring with enabled=false — harmless but wasteful.
+    // enabled would be recorded in the ring with enabled=false — harmless but wasteful. The
+    // listener is per-SparkContext; sequential SparkSessions sharing one SparkContext share the
+    // same listener (idempotent on identity).
     CachedFsSoftAffinityListener.ensureRegistered(sc)
 
     // Step 4: stage the block-locations provider. stageBlockLocationsProvider takes the bootstrap
-    // LOCK so this is race-free against a concurrent installIfNeeded (Hadoop-side fix).
+    // LOCK so this is race-free against a concurrent installIfNeeded (Hadoop-side fix). The
+    // provider singleton is recreated per apply() but installs idempotently into the bootstrap.
     CacheBootstrap.stageBlockLocationsProvider(new CachedFsAffinityBlockLocationsProvider())
 
     logInfo(

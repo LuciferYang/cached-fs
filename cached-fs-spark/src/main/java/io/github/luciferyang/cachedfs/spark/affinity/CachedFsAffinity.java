@@ -120,7 +120,6 @@ public final class CachedFsAffinity {
       int minTargetHosts,
       boolean detectDuplicateReading,
       int duplicateReadingMaxCacheItems) {
-    CachedFsSoftAffinityManager mgr = CachedFsSoftAffinityManager.getInstance();
     if (replicationNum <= 0) {
       throw new IllegalArgumentException(
           CachedFsAffinityConfig.REPLICATION_NUM + " must be positive, got " + replicationNum);
@@ -135,13 +134,32 @@ public final class CachedFsAffinity {
               + " must be positive, got "
               + duplicateReadingMaxCacheItems);
     }
-    mgr.setReplicationNum(replicationNum);
-    mgr.setMinTargetHosts(minTargetHosts);
-    mgr.setDetectDuplicateReading(detectDuplicateReading);
-    mgr.setDuplicateReadingMaxCacheItems(duplicateReadingMaxCacheItems);
-    // Set enabled LAST so a partially-initialized manager can never be observed as enabled.
-    mgr.setEnabled(enabled);
+    if (replicationNum > SPARK_PREFERRED_LOCATIONS_CAP) {
+      org.slf4j.LoggerFactory.getLogger(CachedFsAffinity.class)
+          .warn(
+              "{}={} exceeds Spark's FilePartition.preferredLocations cap of {}; the upper "
+                  + "candidates will be silently dropped by Spark's planner.",
+              CachedFsAffinityConfig.REPLICATION_NUM,
+              replicationNum,
+              SPARK_PREFERRED_LOCATIONS_CAP);
+    }
+    // Single write-lock acquisition under the hood — no half-applied state visible to readers.
+    CachedFsSoftAffinityManager.getInstance()
+        .configureAtomic(
+            enabled,
+            replicationNum,
+            minTargetHosts,
+            detectDuplicateReading,
+            duplicateReadingMaxCacheItems);
   }
+
+  /**
+   * Spark's {@code FilePartition.preferredLocations} caps at 3 hosts per file (FilePartition.scala
+   * groups by length then {@code take(3)}). Setting {@code replication-num} higher has no effect on
+   * Spark's planner — extra candidates are silently dropped. We warn at {@link #configure} when the
+   * operator exceeds this.
+   */
+  static final int SPARK_PREFERRED_LOCATIONS_CAP = 3;
 
   /**
    * Initializes the manager singleton with the requested ring density. Idempotent: if the singleton
@@ -160,6 +178,50 @@ public final class CachedFsAffinity {
    */
   public static void notifyApplicationEnd() {
     CachedFsSoftAffinityManager.getInstance().resetForApplicationEnd();
+  }
+
+  // --- listener entry points (called by CachedFsSoftAffinityListener) -------
+  //
+  // These bridge SparkListener events to the manager's package-private mutators. Putting them
+  // here keeps the manager's listener-coupled surface (handleExecutorAdded etc.) package-private
+  // while still letting the Scala listener in a sibling package fire events. External Java /
+  // Spark integrators should NOT call these — they are internal wiring for the cached-fs Spark
+  // extension. Use configure / getPreferredLocations / recordPartitionMap / notifyApplicationEnd
+  // for the supported public surface.
+
+  /**
+   * @hidden listener-internal.
+   */
+  public static void onExecutorAdded(String executorId, String host) {
+    CachedFsSoftAffinityManager.getInstance().handleExecutorAdded(executorId, host);
+  }
+
+  /**
+   * @hidden listener-internal.
+   */
+  public static void onExecutorRemoved(String executorId) {
+    CachedFsSoftAffinityManager.getInstance().handleExecutorRemoved(executorId);
+  }
+
+  /**
+   * @hidden listener-internal.
+   */
+  public static void onStageSubmitted(int stageId, int[] rddIds) {
+    CachedFsSoftAffinityManager.getInstance().updateStageSubmitted(stageId, rddIds);
+  }
+
+  /**
+   * @hidden listener-internal.
+   */
+  public static void onStageCompleted(int stageId, int[] rddIds) {
+    CachedFsSoftAffinityManager.getInstance().cleanMiddleStatusMap(stageId, rddIds);
+  }
+
+  /**
+   * @hidden listener-internal.
+   */
+  public static void onTaskEnd(int stageId, int partitionId, String executorId, String host) {
+    CachedFsSoftAffinityManager.getInstance().updateTaskEnd(stageId, partitionId, executorId, host);
   }
 
   // --- helpers -----------------------------------------------------------

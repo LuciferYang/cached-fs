@@ -48,7 +48,10 @@ public interface BlockLocationsProvider {
    * @param len byte length of the region the caller asked about
    * @param underlying the inner FS's {@link BlockLocation}s for {@code (status, start, len)} —
    *     never {@code null}; returned to callers unchanged when this provider chooses to defer
-   * @return the rewritten array (may share elements with {@code underlying}); never {@code null}
+   * @return the rewritten array (may share elements with {@code underlying}); {@code null} is legal
+   *     and means "defer to underlying" — the decorator falls back to {@code underlying} unchanged.
+   *     Providers that have no opinion for a given file should return {@code null} (or {@code
+   *     underlying}) rather than fabricating an empty array.
    */
   BlockLocation[] getBlockLocations(
       FileStatus status, long start, long len, BlockLocation[] underlying);

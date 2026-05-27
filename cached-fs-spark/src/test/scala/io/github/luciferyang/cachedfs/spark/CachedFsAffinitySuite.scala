@@ -15,124 +15,133 @@
  */
 package io.github.luciferyang.cachedfs.spark
 
+import io.github.luciferyang.cachedfs.hadoop.CacheBootstrap
 import io.github.luciferyang.cachedfs.spark.affinity.{
   CachedFsAffinity,
   CachedFsAffinityConfig,
   CachedFsSoftAffinityManager
 }
 
+import org.apache.spark.SparkContext
 import org.apache.spark.scheduler.cluster.ExecutorInfo
 import org.apache.spark.scheduler.{
   SparkListenerApplicationEnd,
   SparkListenerExecutorAdded,
-  SparkListenerExecutorRemoved,
-  SparkListenerStageSubmitted,
-  SparkListenerTaskEnd,
-  StageInfo,
-  TaskInfo,
-  TaskLocality
+  SparkListenerExecutorRemoved
 }
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.{SparkConf, Success, TaskState}
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.funsuite.AnyFunSuite
 
 /**
  * ScalaTest coverage for the Scala-side wiring (extension + listener). The Java tests already
  * cover the manager state machine; here we drive the listener's event hooks directly to confirm
- * they delegate to the manager correctly, and we exercise the extension's SparkConf parsing
- * against a local SparkSession to validate the no-arg public constructor + ` SparkSessionExtensions => Unit`
- * subtype Spark needs.
+ * they delegate through CachedFsAffinity to the manager, and we exercise the extension's
+ * SparkConf parsing against a local SparkSession to validate the no-arg public constructor +
+ * `SparkSessionExtensions => Unit` subtype Spark needs.
  */
 class CachedFsAffinitySuite extends AnyFunSuite with BeforeAndAfterEach {
 
   override def beforeEach(): Unit = {
     CachedFsSoftAffinityManager.resetForTesting()
     CachedFsSoftAffinityListener.resetForTesting()
+    CacheBootstrap.uninstallForTesting()
+  }
+
+  override def afterEach(): Unit = {
+    CacheBootstrap.uninstallForTesting()
+  }
+
+  /**
+   * Builds a SparkContext for testing listener event delivery. local[1] is sufficient because we
+   * dispatch events directly to the listener — we don't rely on Spark generating them.
+   */
+  private def withSparkContext(testBody: SparkContext => Unit): Unit = {
+    val sc = new SparkContext("local[1]", "cached-fs-affinity-suite")
+    try testBody(sc)
+    finally sc.stop()
   }
 
   test("listener.onExecutorAdded adds the executor to the ring") {
-    val listener = new CachedFsSoftAffinityListener()
-    val mgr = CachedFsSoftAffinityManager.getInstance()
-    CachedFsAffinity.configure(true, 2, 1, false, 10000)
-
-    listener.onExecutorAdded(
-      SparkListenerExecutorAdded(
-        time = 0L,
-        executorId = "executor-A",
-        executorInfo =
-          new ExecutorInfo("host-A", totalCores = 4, logUrlMap = Map.empty)))
-    assert(mgr.executorCount() == 1)
+    withSparkContext { sc =>
+      val listener = new CachedFsSoftAffinityListener(sc)
+      CachedFsAffinity.configure(true, 2, 1, false, 10000)
+      val mgr = CachedFsSoftAffinityManager.getInstance()
+      listener.onExecutorAdded(
+        SparkListenerExecutorAdded(
+          time = 0L,
+          executorId = "executor-A",
+          executorInfo = new ExecutorInfo("host-A", totalCores = 4, logUrlMap = Map.empty)))
+      assert(mgr.executorCount() == 1)
+    }
   }
 
   test("listener rejects an executor with empty host (would corrupt TaskLocation)") {
-    val listener = new CachedFsSoftAffinityListener()
-    val mgr = CachedFsSoftAffinityManager.getInstance()
-    CachedFsAffinity.configure(true, 2, 1, false, 10000)
-    listener.onExecutorAdded(
-      SparkListenerExecutorAdded(
-        time = 0L,
-        executorId = "executor-bad",
-        executorInfo =
-          new ExecutorInfo("", totalCores = 4, logUrlMap = Map.empty)))
-    assert(mgr.executorCount() == 0)
+    withSparkContext { sc =>
+      val listener = new CachedFsSoftAffinityListener(sc)
+      CachedFsAffinity.configure(true, 2, 1, false, 10000)
+      val mgr = CachedFsSoftAffinityManager.getInstance()
+      listener.onExecutorAdded(
+        SparkListenerExecutorAdded(
+          time = 0L,
+          executorId = "executor-bad",
+          executorInfo = new ExecutorInfo("", totalCores = 4, logUrlMap = Map.empty)))
+      assert(mgr.executorCount() == 0)
+    }
   }
 
   test("listener.onExecutorRemoved drops the executor from the ring") {
-    val listener = new CachedFsSoftAffinityListener()
-    val mgr = CachedFsSoftAffinityManager.getInstance()
-    CachedFsAffinity.configure(true, 2, 1, false, 10000)
-    listener.onExecutorAdded(
-      SparkListenerExecutorAdded(
-        time = 0L,
-        executorId = "e1",
-        executorInfo = new ExecutorInfo("h1", 4, Map.empty)))
-    assert(mgr.executorCount() == 1)
-    listener.onExecutorRemoved(SparkListenerExecutorRemoved(time = 0L, "e1", "decommissioned"))
-    assert(mgr.executorCount() == 0)
+    withSparkContext { sc =>
+      val listener = new CachedFsSoftAffinityListener(sc)
+      CachedFsAffinity.configure(true, 2, 1, false, 10000)
+      val mgr = CachedFsSoftAffinityManager.getInstance()
+      listener.onExecutorAdded(
+        SparkListenerExecutorAdded(
+          time = 0L,
+          executorId = "e1",
+          executorInfo = new ExecutorInfo("h1", 4, Map.empty)))
+      assert(mgr.executorCount() == 1)
+      listener.onExecutorRemoved(SparkListenerExecutorRemoved(time = 0L, "e1", "decommissioned"))
+      assert(mgr.executorCount() == 0)
+    }
   }
 
-  test("listener.onApplicationEnd resets manager state for the next SparkContext") {
-    val listener = new CachedFsSoftAffinityListener()
-    val mgr = CachedFsSoftAffinityManager.getInstance()
-    CachedFsAffinity.configure(true, 2, 1, false, 10000)
-    listener.onExecutorAdded(
-      SparkListenerExecutorAdded(
-        time = 0L,
-        executorId = "e1",
-        executorInfo = new ExecutorInfo("h1", 4, Map.empty)))
-    assert(mgr.executorCount() == 1)
+  test(
+    "listener.onApplicationEnd from a non-registered listener does NOT clear shared state") {
+    withSparkContext { sc =>
+      // Register a listener via ensureRegistered so the registry slot is occupied.
+      CachedFsSoftAffinityListener.ensureRegistered(sc)
+      CachedFsAffinity.configure(true, 2, 1, false, 10000)
+      val mgr = CachedFsSoftAffinityManager.getInstance()
+      CachedFsAffinity.onExecutorAdded("e1", "h1")
+      assert(mgr.executorCount() == 1)
 
-    listener.onApplicationEnd(SparkListenerApplicationEnd(0L))
-    assert(mgr.executorCount() == 0, "ring should be cleared after onApplicationEnd")
+      // A stranger listener (never registered) fires onApplicationEnd → must NOT wipe state
+      // because clearRegistered's identity check fails.
+      val stranger = new CachedFsSoftAffinityListener(sc)
+      stranger.onApplicationEnd(SparkListenerApplicationEnd(0L))
+      assert(
+        mgr.executorCount() == 1,
+        "non-registered listener's onApplicationEnd must not clear shared state")
+    }
   }
 
-  test("listener.onTaskEnd records an observation only when feedback mode is enabled") {
-    val listener = new CachedFsSoftAffinityListener()
-    val mgr = CachedFsSoftAffinityManager.getInstance()
-    CachedFsAffinity.configure(true, 2, 1, false, 10000)
-    // Without detectDuplicateReading, listener hooks must be cheap no-ops.
-    val taskInfo = new TaskInfo(
-      taskId = 0L,
-      index = 0,
-      attemptNumber = 0,
-      partitionId = 0,
-      launchTime = 0L,
-      executorId = "e1",
-      host = "h1",
-      taskLocality = TaskLocality.PROCESS_LOCAL,
-      speculative = false)
-    listener.onTaskEnd(
-      SparkListenerTaskEnd(
-        stageId = 1,
-        stageAttemptId = 0,
-        taskType = "ShuffleMapTask",
-        reason = Success,
-        taskInfo = taskInfo,
-        taskExecutorMetrics = null,
-        taskMetrics = null))
-    // No observations recorded.
-    assert(mgr.snapshot().duplicateReadingEntries() == 0)
+  test(
+    "listener.onApplicationEnd from the REGISTERED listener does wipe manager state " +
+      "(integration via ensureRegistered)") {
+    withSparkContext { sc =>
+      CachedFsSoftAffinityListener.ensureRegistered(sc)
+      CachedFsAffinity.configure(true, 2, 1, false, 10000)
+      val mgr = CachedFsSoftAffinityManager.getInstance()
+      CachedFsAffinity.onExecutorAdded("e1", "h1")
+      assert(mgr.executorCount() == 1)
+
+      // sc.stop fires SparkApplicationEnd → registered listener triggers reset.
+      sc.stop()
+      // Allow the event bus to flush.
+      Thread.sleep(200)
+      assert(mgr.executorCount() == 0)
+    }
   }
 
   test("extension.apply on a real SparkSession configures the manager from SparkConf") {
@@ -161,20 +170,24 @@ class CachedFsAffinitySuite extends AnyFunSuite with BeforeAndAfterEach {
     }
   }
 
-  test("extension.apply tolerates an invalid SparkConf and disables the feature") {
+  test(
+    "extension.apply silently falls back to defaults when a SparkConf integer is non-positive; " +
+      "session startup is not crashed") {
     val spark = SparkSession
       .builder()
       .master("local[1]")
       .appName("cached-fs-affinity-invalid-conf")
       .config(CachedFsAffinityConfig.ENABLED, "true")
-      .config(CachedFsAffinityConfig.REPLICATION_NUM, "0") // invalid
+      .config(CachedFsAffinityConfig.REPLICATION_NUM, "0") // invalid — extension warns + defaults
       .config("spark.sql.extensions", classOf[CachedFsAffinityExtension].getName)
       .getOrCreate()
     try {
-      // 0 replicationNum triggers the warning-then-default fallback; feature stays enabled but
-      // with the default replication. Manager should NOT crash the session.
       val snap = CachedFsSoftAffinityManager.getInstance().snapshot()
+      // The extension's readPositiveInt pre-sanitizes 0 → DEFAULT_REPLICATION_NUM, so configure()
+      // succeeds and enabled remains true. This documents the actual behavior (warn + default,
+      // NOT disable-on-failure) so an operator can rely on the fallback semantics.
       assert(snap.replicationNum() == CachedFsAffinityConfig.DEFAULT_REPLICATION_NUM)
+      assert(snap.enabled(), "feature stays enabled with default replication-num")
     } finally {
       spark.stop()
     }

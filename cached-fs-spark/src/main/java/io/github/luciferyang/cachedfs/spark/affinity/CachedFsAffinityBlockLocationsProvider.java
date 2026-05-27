@@ -55,7 +55,7 @@ public final class CachedFsAffinityBlockLocationsProvider implements BlockLocati
       return underlying;
     }
     String[] nativeHosts = collectHosts(underlying);
-    if (mgr.shouldDeferToNativeLocality(nativeHosts)) {
+    if (nativeHosts.length > 0 && mgr.shouldDeferToNativeLocality(nativeHosts)) {
       return underlying;
     }
     String[] preferred =
@@ -63,12 +63,33 @@ public final class CachedFsAffinityBlockLocationsProvider implements BlockLocati
     if (preferred.length == 0) {
       return underlying;
     }
-    // Single span block — preferredLocations are advisory and Spark doesn't subdivide the file
-    // via this hook. Per-split granularity is handled by the feedback-mode path on top of
-    // CachedFsAffinity.getPreferredLocations(splits, nativeHosts).
-    return new BlockLocation[] {
-      new BlockLocation(/* names */ new String[0], preferred, start, len)
-    };
+    // Rewrite per underlying block, preserving (offset, length) so callers that subdivide a file
+    // along block boundaries (HDFS FileInputFormat.getSplits, planners that consult per-block
+    // ranges) keep the natural split points. Hosts are replaced uniformly because the affinity
+    // hint is a whole-file decision; per-block heterogeneity would require a different API. When
+    // the inner FS returns no blocks at all (object stores), synthesize one spanning [start, len).
+    if (underlying == null || underlying.length == 0) {
+      return new BlockLocation[] {hostsOnly(preferred, start, len)};
+    }
+    BlockLocation[] out = new BlockLocation[underlying.length];
+    for (int i = 0; i < underlying.length; i++) {
+      BlockLocation src = underlying[i];
+      out[i] = hostsOnly(preferred, src.getOffset(), src.getLength());
+    }
+    return out;
+  }
+
+  /**
+   * Builds a fresh {@link BlockLocation} whose {@code hosts} carries the executor-shaped task
+   * locations, with {@code names} aligned to the same length so the informal {@code names.length ==
+   * hosts.length} parallel-array invariant some Hadoop consumers rely on holds.
+   */
+  private static BlockLocation hostsOnly(String[] preferred, long offset, long length) {
+    String[] names = new String[preferred.length];
+    for (int i = 0; i < preferred.length; i++) {
+      names[i] = preferred[i];
+    }
+    return new BlockLocation(names, preferred, offset, length);
   }
 
   /** Collects the union of inner-FS hosts. Deduped + null-safe; returns empty when unset. */
@@ -82,9 +103,13 @@ public final class CachedFsAffinityBlockLocationsProvider implements BlockLocati
         for (String h : hs) {
           if (h != null && !h.isEmpty()) hosts.add(h);
         }
-      } catch (java.io.IOException ignored) {
-        // BlockLocation.getHosts() is declared with IOException, but the default impl never
-        // throws. Defensive catch so a misbehaving Hadoop FS doesn't bubble through our planner.
+      } catch (java.io.IOException ex) {
+        // BlockLocation.getHosts() declares IOException for historical reasons; the default
+        // impl never throws. If a custom inner FS does throw, log + treat as no native hint
+        // for this block — better than swallowing silently while building a partial host set
+        // that would mislead the minTargetHosts short-circuit.
+        org.slf4j.LoggerFactory.getLogger(CachedFsAffinityBlockLocationsProvider.class)
+            .warn("BlockLocation.getHosts threw — treating block as no-locality", ex);
       }
     }
     return hosts.toArray(new String[0]);
