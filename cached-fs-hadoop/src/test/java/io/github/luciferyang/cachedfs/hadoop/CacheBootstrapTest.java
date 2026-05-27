@@ -312,6 +312,62 @@ class CacheBootstrapTest {
     assertThat(exec.isTerminated()).isTrue();
   }
 
+  @Test
+  @DisplayName(
+      "installIfNeeded rollback shuts the prefetch executor down on a late-stage failure")
+  void installRollbackShutsDownPrefetchExecutor() {
+    // Force prefetchHeapPressureTtlMs(conf) to throw IAE — that call runs AFTER the prefetch
+    // executor has already been created (CacheBootstrap.installIfNeeded line ~250). Without
+    // the catch-block shutdownNow, this executor would leak: a retry would create another,
+    // and another, accumulating worker-thread state until JVM exit.
+    Configuration conf = minimalConf();
+    conf.setBoolean(CachedFsConfig.PREFETCH_ENABLED, true);
+    conf.setLong(CachedFsConfig.PREFETCH_HEAP_PRESSURE_TTL_MS, 0L);
+
+    // Snapshot the names of any pre-existing prefetch threads so we can detect new leaks only.
+    java.util.Set<String> before = liveCachedFsPrefetchThreadNames();
+
+    assertThatThrownBy(() -> CacheBootstrap.installIfNeeded(conf))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining(CachedFsConfig.PREFETCH_HEAP_PRESSURE_TTL_MS);
+
+    // No new cached-fs-prefetch-* threads survive the rollback. ThreadPoolExecutor spawns
+    // workers lazily on the first execute(), so under normal conditions there is nothing to
+    // shut down here — but shutdownNow() is also the only guarantee against a future code
+    // path that prestarts core threads or warms the pool prior to the failure point.
+    java.util.Set<String> after = liveCachedFsPrefetchThreadNames();
+    after.removeAll(before);
+    assertThat(after).as("no cached-fs-prefetch-* threads should leak across the rollback")
+        .isEmpty();
+
+    // A retry with a valid conf must succeed — proves no orphan singleton/registry state
+    // survived from the failed install. This is the load-bearing assertion: the next caller
+    // gets a clean JVM, exactly per the rollback contract.
+    Configuration retry = minimalConf();
+    retry.setBoolean(CachedFsConfig.PREFETCH_ENABLED, true);
+    try {
+      CacheBootstrap b = CacheBootstrap.installIfNeeded(retry);
+      assertThat(b.prefetchExecutor()).isNotNull();
+      assertThat(b.prefetchExecutor().isShutdown()).isFalse();
+    } catch (IOException ioe) {
+      org.junit.jupiter.api.Assertions.fail("retry install must succeed", ioe);
+    }
+  }
+
+  private static java.util.Set<String> liveCachedFsPrefetchThreadNames() {
+    java.util.Set<String> names = new java.util.HashSet<>();
+    int active = Thread.activeCount();
+    Thread[] all = new Thread[active * 2];
+    int n = Thread.enumerate(all);
+    for (int i = 0; i < n; i++) {
+      Thread t = all[i];
+      if (t != null && t.getName().startsWith("cached-fs-prefetch-")) {
+        names.add(t.getName());
+      }
+    }
+    return names;
+  }
+
   private static Configuration minimalConf() {
     Configuration conf = new Configuration(false);
     conf.setBoolean(CachedFsConfig.ENABLED, true);

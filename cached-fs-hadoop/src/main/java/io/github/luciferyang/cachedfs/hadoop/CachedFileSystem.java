@@ -62,7 +62,7 @@ import org.apache.hadoop.util.ReflectionUtils;
  * prevents the cache from keying on a stable file identity); document this gap to integrators using
  * PathHandle-based read APIs.
  */
-public final class CachedFileSystem extends FilterFileSystem {
+public class CachedFileSystem extends FilterFileSystem {
 
   // volatile: Hadoop's FileSystem.CACHE publishes instances via a synchronized map which gives
   // happens-before, but the test-only constructor below + tests that call initialize/open from
@@ -492,13 +492,23 @@ public final class CachedFileSystem extends FilterFileSystem {
 
     @Override
     public java.util.concurrent.CompletableFuture<FSDataInputStream> build() throws IOException {
+      // Mirror Hadoop's reference FSDataInputStreamBuilder.build(): the
+      // FS_OPTION_OPENFILE_BUFFER_SIZE opt — when set — overrides the sticky bufferSize.
+      // Standard options MUST be honored per FS_OPTION_OPENFILE_STANDARD_OPTIONS; dropping
+      // the opt would silently regress callers using .opt(...) instead of .bufferSize(...),
+      // most visibly on the bypass path where bufferSize is forwarded to fs.open(f, N).
+      int effectiveBufferSize =
+          getOptions()
+              .getInt(
+                  org.apache.hadoop.fs.Options.OpenFileOptions.FS_OPTION_OPENFILE_BUFFER_SIZE,
+                  getBufferSize());
       org.apache.hadoop.fs.impl.OpenFileParameters parameters =
           new org.apache.hadoop.fs.impl.OpenFileParameters()
               .withMandatoryKeys(getMandatoryKeys())
               .withOptionalKeys(getOptionalKeys())
               .withOptions(getOptions())
               .withStatus(super.getStatus())
-              .withBufferSize(getBufferSize());
+              .withBufferSize(effectiveBufferSize);
       CachedFileSystem cfs = (CachedFileSystem) getFS();
       return cfs.openFileWithOptions(getPath(), parameters);
     }

@@ -400,6 +400,51 @@ class CachedFileSystemTest {
   }
 
   @Test
+  @DisplayName(
+      "openFile builder honors FS_OPTION_OPENFILE_BUFFER_SIZE opt over the sticky bufferSize")
+  void openFileBuilderHonorsBufferSizeOpt(@TempDir java.nio.file.Path dir) throws Exception {
+    // Hadoop's reference FSDataInputStreamBuilder.build() picks bufferSize from the standard
+    // opt FS_OPTION_OPENFILE_BUFFER_SIZE if present, else falls back to .bufferSize(...). Our
+    // CachedFsInputStreamBuilder must mirror that contract so a caller using .opt(...) sees
+    // their value flow into openFileWithOptions, not get silently dropped. Capture the
+    // OpenFileParameters via a subclass to observe the value.
+    byte[] payload = bytes(64);
+    java.nio.file.Path file = dir.resolve("buf.bin");
+    Files.write(file, payload);
+
+    int[] capturedBufferSize = new int[] {-1};
+    CachedFileSystem cfs =
+        new CachedFileSystem() {
+          @Override
+          protected java.util.concurrent.CompletableFuture<FSDataInputStream> openFileWithOptions(
+              Path path, org.apache.hadoop.fs.impl.OpenFileParameters parameters)
+              throws IOException {
+            capturedBufferSize[0] = parameters.getBufferSize();
+            return super.openFileWithOptions(path, parameters);
+          }
+        };
+    cfs.initialize(URI.create("file:///"), defaultConf());
+    try {
+      Path p = new Path(file.toUri());
+      try (FSDataInputStream in =
+          cfs.openFile(p)
+              .opt(
+                  org.apache.hadoop.fs.Options.OpenFileOptions.FS_OPTION_OPENFILE_BUFFER_SIZE, 8192)
+              .build()
+              .get()) {
+        byte[] read = new byte[payload.length];
+        in.readFully(read);
+        assertThat(read).isEqualTo(payload);
+      }
+      assertThat(capturedBufferSize[0])
+          .as("FS_OPTION_OPENFILE_BUFFER_SIZE opt must override sticky bufferSize")
+          .isEqualTo(8192);
+    } finally {
+      cfs.close();
+    }
+  }
+
+  @Test
   @DisplayName("openFile(PathHandle) builder comes from the inner FS (documented bypass)")
   void openFilePathHandlePassesThrough(@TempDir java.nio.file.Path dir) throws Exception {
     // PathHandle's opaque content tag prevents reliable cache keying, so we delegate to the inner

@@ -229,6 +229,8 @@ public final class CacheBootstrap {
       // overwrite, leaking the first instance for the JVM lifetime.
       AsyncDataCache ram = new AsyncDataCache(CachedFsConfig.ramOptions(conf));
       SsdCache ssd = null;
+      // Hoisted out of the inner try so the rollback catch can shut it down on a late failure.
+      java.util.concurrent.ThreadPoolExecutor prefetchExec = null;
       try {
         StringIdMap ids = new StringIdMap();
         SsdCache.Config ssdCfg = CachedFsConfig.ssdConfig(conf);
@@ -239,7 +241,6 @@ public final class CacheBootstrap {
         int quantum = CachedFsConfig.loadQuantumBytes(conf);
         // executor: built only when the master toggle is on. Null when disabled — the
         // hot read path checks for null before submitting a prefetch task.
-        java.util.concurrent.ThreadPoolExecutor prefetchExec = null;
         long maxPendingBytes = 0L;
         if (CachedFsConfig.prefetchEnabled(conf)) {
           int threads = CachedFsConfig.prefetchThreads(conf);
@@ -283,7 +284,18 @@ public final class CacheBootstrap {
         return b;
       } catch (IOException | RuntimeException | Error ex) {
         // Roll back partial construction; the JVM stays in the pre-install state so a retry
-        // gets a clean slate.
+        // gets a clean slate. The prefetch executor — when present — must be shut down too:
+        // its worker threads are daemon, but each holds a native stack + queued task graph
+        // that survives until JVM exit, and repeated install-failure retries compound the
+        // leak. shutdownNow is safe here because we have not yet returned the bootstrap to
+        // any caller, so no read path has submitted a prefetch task.
+        if (prefetchExec != null) {
+          try {
+            prefetchExec.shutdownNow();
+          } catch (RuntimeException suppressed) {
+            ex.addSuppressed(suppressed);
+          }
+        }
         if (ssd != null) {
           try {
             ssd.close();
