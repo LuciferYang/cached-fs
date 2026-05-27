@@ -240,6 +240,11 @@ class CoalesceTest {
     // Force coalesce on regardless of cache size (these tests run with a tiny in-memory cache
     // and would otherwise trip the auto-disable rule).
     conf.setBoolean(CachedFsConfig.COALESCE_ALWAYS_ON, true);
+    // Phase 5c: disable prefetch so the preadv-counting tests stay deterministic. With prefetch
+    // on, the bump-site fires after every chunk read and the task may absorb subsequent misses
+    // out-of-band, breaking the "N preadv for N missed chunks" invariant. Coalesce + prefetch
+    // interaction is exercised by PrefetchAdmissionTest separately.
+    conf.setBoolean(CachedFsConfig.PREFETCH_ENABLED, false);
     return conf;
   }
 

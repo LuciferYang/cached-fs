@@ -92,6 +92,24 @@ public final class CacheBootstrap {
    */
   private final java.util.concurrent.ThreadPoolExecutor prefetchExecutor;
 
+  /** Phase 5c admission gate — JVM-wide byte budget for in-flight prefetch. */
+  private final long maxPendingPrefetchBytes;
+
+  /**
+   * Heap-pressure cache TTL (nanos); {@link #isHeapPressureHigh} refreshes at most once per TTL.
+   */
+  private final long heapPressureTtlNs;
+
+  /**
+   * Last-refresh timestamp (nanoTime) for the heap-pressure check. Single-CAS-winner pattern: at
+   * most one thread per TTL window calls the MemoryMXBean; concurrent callers read the cached
+   * {@link #heapPressureActive} bit until the window expires.
+   */
+  private final java.util.concurrent.atomic.AtomicLong heapPressureLastCheckedNs;
+
+  /** Cached heap-pressure bit; refreshed by {@link #isHeapPressureHigh}. */
+  private volatile boolean heapPressureActive;
+
   /**
    * Per-scan {@link ScanTracker} registry. Lifetime entries are inserted lazily by {@link
    * #trackerFor(String)} and evicted by {@link #withScanId(String)} close or explicit {@link
@@ -134,7 +152,9 @@ public final class CacheBootstrap {
       StringIdMap stringIds,
       int loadQuantumBytes,
       int handleCapacity,
-      java.util.concurrent.ThreadPoolExecutor prefetchExecutor) {
+      java.util.concurrent.ThreadPoolExecutor prefetchExecutor,
+      long maxPendingPrefetchBytes,
+      long heapPressureTtlNs) {
     this.ramCache = ramCache;
     this.ssdCache = ssdCache;
     this.stringIds = stringIds;
@@ -145,6 +165,11 @@ public final class CacheBootstrap {
     // Cheap to construct (empty map) and harmless when no applyTTL caller exists.
     this.ttlController = new CacheTTLController(ramCache, ssdCache, Clock.systemUTC());
     this.prefetchExecutor = prefetchExecutor;
+    this.maxPendingPrefetchBytes = maxPendingPrefetchBytes;
+    this.heapPressureTtlNs = heapPressureTtlNs;
+    // Initialize timestamp so the first call always refreshes regardless of nanoTime's origin.
+    this.heapPressureLastCheckedNs =
+        new java.util.concurrent.atomic.AtomicLong(System.nanoTime() - heapPressureTtlNs - 1L);
   }
 
   /**
@@ -199,12 +224,26 @@ public final class CacheBootstrap {
         // Phase 5c executor: built only when the master toggle is on. Null when disabled — the
         // hot read path checks for null before submitting a prefetch task.
         java.util.concurrent.ThreadPoolExecutor prefetchExec = null;
+        long maxPendingBytes = 0L;
         if (CachedFsConfig.prefetchEnabled(conf)) {
+          int threads = CachedFsConfig.prefetchThreads(conf);
           prefetchExec =
-              PrefetchExecutorFactory.create(
-                  CachedFsConfig.prefetchThreads(conf), CachedFsConfig.prefetchQueue(conf));
+              PrefetchExecutorFactory.create(threads, CachedFsConfig.prefetchQueue(conf));
+          maxPendingBytes = CachedFsConfig.prefetchMaxPendingBytes(conf, quantum, threads);
         }
-        CacheBootstrap b = new CacheBootstrap(ram, ssd, ids, quantum, handleCap, prefetchExec);
+        long heapPressureTtlNs =
+            java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
+                CachedFsConfig.prefetchHeapPressureTtlMs(conf));
+        CacheBootstrap b =
+            new CacheBootstrap(
+                ram,
+                ssd,
+                ids,
+                quantum,
+                handleCap,
+                prefetchExec,
+                maxPendingBytes,
+                heapPressureTtlNs);
         // All pieces ready — now publish singletons atomically (w.r.t. LOCK) and commit.
         // Order matters because FileIds has no clearInstance API (test-only singleton):
         // publish AsyncDataCache FIRST so that if FileIds.setInstance somehow throws (it can
@@ -446,6 +485,35 @@ public final class CacheBootstrap {
    */
   public java.util.concurrent.ThreadPoolExecutor prefetchExecutor() {
     return prefetchExecutor;
+  }
+
+  /** JVM-wide byte budget for in-flight prefetches; checked by the admission gate. */
+  public long maxPendingPrefetchBytes() {
+    return maxPendingPrefetchBytes;
+  }
+
+  /**
+   * Returns the cached heap-pressure bit (true ⇔ heap is &gt;90% full). Refreshes at most once per
+   * {@link CachedFsConfig#PREFETCH_HEAP_PRESSURE_TTL_MS} via a single-CAS-winner pattern: only one
+   * thread per TTL window calls {@link java.lang.management.MemoryMXBean#getHeapMemoryUsage};
+   * concurrent callers read the cached bit. Bounds the MBean call rate to {@code 1 / TTL} across
+   * the entire JVM regardless of concurrent stream count.
+   */
+  public boolean isHeapPressureHigh() {
+    long now = System.nanoTime();
+    long prev = heapPressureLastCheckedNs.get();
+    if (now - prev > heapPressureTtlNs && heapPressureLastCheckedNs.compareAndSet(prev, now)) {
+      java.lang.management.MemoryUsage u =
+          java.lang.management.ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
+      long max = u.getMax();
+      if (max <= 0L) {
+        // No defined heap limit (e.g. -Xmx unset on some JVMs): treat as never-pressured.
+        heapPressureActive = false;
+      } else {
+        heapPressureActive = u.getUsed() * 10L > max * 9L; // >90% used
+      }
+    }
+    return heapPressureActive;
   }
 
   /**

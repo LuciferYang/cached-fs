@@ -81,6 +81,19 @@ public final class CachingInputStream extends InputStream
   private final int coalesceMaxChunksPerGroup;
   private final int coalesceMaxRestarts;
 
+  // --- Phase 5c admission knobs (captured at open time) -------------------
+
+  /** Bootstrap reference for the heap-pressure check + executor handle. */
+  private final CacheBootstrap bootstrap;
+
+  /** When false, the bump-site is a no-op regardless of state. */
+  private final boolean prefetchEnabled;
+
+  private final boolean heapPressureCheckEnabled;
+  private final double triggerTailFraction;
+  private final int densityThresholdPct;
+  private final long rejectionBackoffNs;
+
   // --- Phase 5c prefetch state (no callers in this commit; wired in next) -
 
   /**
@@ -136,7 +149,13 @@ public final class CachingInputStream extends InputStream
       boolean coalesceEnabled,
       int coalesceMaxGapBytes,
       int coalesceMaxChunksPerGroup,
-      int coalesceMaxRestarts) {
+      int coalesceMaxRestarts,
+      CacheBootstrap bootstrap,
+      boolean prefetchEnabled,
+      boolean heapPressureCheckEnabled,
+      double triggerTailFraction,
+      int densityThresholdPct,
+      long rejectionBackoffNs) {
     this.handlePtr = handlePtr;
     this.handle = handlePtr.value();
     this.cache = cache;
@@ -155,9 +174,15 @@ public final class CachingInputStream extends InputStream
     this.coalesceMaxGapBytes = coalesceMaxGapBytes;
     this.coalesceMaxChunksPerGroup = coalesceMaxChunksPerGroup;
     this.coalesceMaxRestarts = coalesceMaxRestarts;
-    // Place lastRejectionNanos far in the past so the very first prefetch attempt is never
-    // back-pressured. Constructor-time computation avoids the overflow edge of a static sentinel.
-    this.lastRejectionNanos = System.nanoTime() - 1_000_000_000L;
+    this.bootstrap = bootstrap;
+    this.prefetchEnabled = prefetchEnabled;
+    this.heapPressureCheckEnabled = heapPressureCheckEnabled;
+    this.triggerTailFraction = triggerTailFraction;
+    this.densityThresholdPct = densityThresholdPct;
+    this.rejectionBackoffNs = rejectionBackoffNs;
+    // Place lastRejectionNanos far enough in the past that the very first prefetch attempt is
+    // never back-pressured. Subtracting twice the backoff is sufficient regardless of the knob.
+    this.lastRejectionNanos = System.nanoTime() - 2L * Math.max(rejectionBackoffNs, 1_000_000_000L);
   }
 
   // --- Phase 5c sibling helpers (package-private; called by PrefetchTask + Handler) -
@@ -279,6 +304,146 @@ public final class CachingInputStream extends InputStream
     return ioStats;
   }
 
+  /** Test-only accessor for the {@link #pendingPrefetch} slot. */
+  CompletableFuture<io.github.luciferyang.cachedfs.core.RawFileCacheKey>
+      pendingPrefetchForTesting() {
+    return pendingPrefetch;
+  }
+
+  /**
+   * Debug counter incremented every time {@link #submitPrefetch} successfully CAS-installed the
+   * future into the {@code pendingPrefetch} slot AND submitted the task (whether the task later
+   * runs to completion or gets rejected). Single-writer (consumer thread per the read-path
+   * non-thread-safety contract); plain {@code long} is sufficient.
+   */
+  private long prefetchSubmissions;
+
+  long prefetchSubmissionsForTesting() {
+    return prefetchSubmissions;
+  }
+
+  // --- Phase 5c step 3: admission gate + submission ----------------------
+
+  /**
+   * Evaluates the admission gate's resource predicates and returns the appropriate flyweight {@link
+   * AdmissionResult}. NOT a guard on the trigger conditions (position-tail-fraction, backoff,
+   * density) — caller checks those BEFORE invoking this. The gate covers ONLY the resource limits:
+   * byte budget and (optionally) heap pressure.
+   */
+  private AdmissionResult admissionGate(int chunkSize) {
+    if (cache.pendingPrefetchBytes() + chunkSize > bootstrap.maxPendingPrefetchBytes()) {
+      return AdmissionResult.BUDGET_REJECT;
+    }
+    if (heapPressureCheckEnabled && bootstrap.isHeapPressureHigh()) {
+      return AdmissionResult.HEAP_REJECT;
+    }
+    return AdmissionResult.ADMIT;
+  }
+
+  /**
+   * Trigger predicate + 3-branch bump-site for the Phase 5c prefetch admission gate. Called from
+   * {@link #read(byte[], int, int)} and the positional read paths after each completed read so the
+   * gate fires once per "logical chunk advance".
+   *
+   * <p>Trigger guards (all must hold):
+   *
+   * <ol>
+   *   <li>{@link #prefetchEnabled} (master toggle) AND {@link #bootstrap}.prefetchExecutor() !=
+   *       null.
+   *   <li>No in-flight prefetch already pinned in the CAS slot ({@code pendingPrefetch == null}).
+   *   <li>State machine armed ({@code seqHWM > 0}).
+   *   <li>Position past the trigger-tail fraction of the current chunk.
+   *   <li>Next-chunk start is within the file.
+   *   <li>Rejection backoff elapsed ({@code nanoTime() - lastRejectionNanos >=
+   *       rejectionBackoffNs}).
+   * </ol>
+   *
+   * <p>When the guards pass, three branches:
+   *
+   * <ul>
+   *   <li>{@code readPct &gt;= densityThresholdPct} AND {@code admissionGate().admit()} → submit
+   *       the prefetch.
+   *   <li>{@code readPct &lt; densityThresholdPct} → bump {@code
+   *       incPrefetchEligibleSuppressed(chunkSize)} (the lower-tail observability counter).
+   *   <li>density passes but admission rejects → bump {@code incPrefetchSkipped(adm.reason(),
+   *       chunkSize)}.
+   * </ul>
+   */
+  private void maybeTriggerPrefetch(long currentPos) {
+    if (!prefetchEnabled) return;
+    java.util.concurrent.ThreadPoolExecutor exec = bootstrap.prefetchExecutor();
+    if (exec == null) return;
+    if (pendingPrefetch != null) return;
+
+    long hwm = seqHwmForTesting();
+    if (hwm <= 0L) return; // state machine not armed yet
+
+    // Use the LAST byte read (currentPos - 1) to identify the chunk we just touched. Avoids the
+    // boundary case where currentPos lands exactly on a chunk start (progressInChunk would be 0
+    // for the next chunk and we'd never trigger — the read just CONSUMED 100% of the prior
+    // chunk and is ready to advance).
+    if (currentPos <= 0) return;
+    long lastByte = currentPos - 1;
+    long thisChunkStart = (lastByte / loadQuantum) * (long) loadQuantum;
+    long thisChunkEnd = thisChunkStart + loadQuantum;
+    double progressInChunk = (double) (currentPos - thisChunkStart) / (double) loadQuantum;
+    if (progressInChunk < triggerTailFraction) return;
+
+    long nextChunkStart = thisChunkEnd;
+    if (nextChunkStart >= fileSize) return;
+    int nextChunkSize = (int) Math.min((long) loadQuantum, fileSize - nextChunkStart);
+
+    long now = System.nanoTime();
+    if (now - lastRejectionNanos < rejectionBackoffNs) return;
+
+    // Resolve resource gate + density predicate. Branch on the 3-tuple.
+    AdmissionResult adm = admissionGate(nextChunkSize);
+    int readPct = tracker.data(trackingId).readPct();
+
+    if (readPct >= densityThresholdPct && adm.admit()) {
+      submitPrefetch(nextChunkStart, nextChunkSize);
+    } else if (readPct < densityThresholdPct) {
+      // Density predicate was the SOLE reason we dropped (we already verified all other guards).
+      ioStats.incPrefetchEligibleSuppressed(nextChunkSize);
+    } else {
+      // Density passed but resource gate rejected — bump the per-reason skip bucket.
+      ioStats.incPrefetchSkipped(adm.reason(), nextChunkSize);
+    }
+  }
+
+  /**
+   * Submits a prefetch for {@code (nextChunkStart, nextChunkSize)} via the bootstrap's executor.
+   * Performs the CAS to install the {@code pendingPrefetch} slot before submission so the rejection
+   * handler (synchronous-on-submit-thread) sees the slot already pointing at our future. Catches
+   * {@link java.util.concurrent.RejectedExecutionException} for the post-shutdown race (executor
+   * moved to SHUTDOWN between our null check and our {@code execute()} call) and mirrors the {@link
+   * DiscardAndCountHandler} recovery.
+   */
+  private void submitPrefetch(long nextChunkStart, int nextChunkSize) {
+    java.util.concurrent.CompletableFuture<io.github.luciferyang.cachedfs.core.RawFileCacheKey>
+        future = new java.util.concurrent.CompletableFuture<>();
+    if (!PENDING_VH.compareAndSet(this, null, future)) {
+      // Another path raced us to install — skip silently.
+      future.cancel(false);
+      return;
+    }
+    io.github.luciferyang.cachedfs.core.RawFileCacheKey key =
+        new io.github.luciferyang.cachedfs.core.RawFileCacheKey(fileNum, nextChunkStart);
+    PrefetchTask task =
+        new PrefetchTask(
+            this, ioStats, cache, handle.readFile(), nextChunkSize, key, nextChunkStart, future);
+    try {
+      bootstrap.prefetchExecutor().execute(task);
+      prefetchSubmissions++;
+    } catch (java.util.concurrent.RejectedExecutionException ex) {
+      // Mirror DiscardAndCountHandler recovery for the post-shutdown race.
+      ioStats.incPrefetchSkipped("queue_full", nextChunkSize);
+      future.completeExceptionally(ex);
+      clearPendingPrefetchIf(future);
+      lastRejectionNanos = System.nanoTime();
+    }
+  }
+
   /**
    * Package-private static extracted from the original instance {@code fillExclusive} so {@link
    * PrefetchTask} can fill cache entries without duplicating the preadv logic. The instance method
@@ -332,6 +497,9 @@ public final class CachingInputStream extends InputStream
     // calls) get a finer threshold than the per-chunk plan describes but still satisfy the
     // dead-zone-breaking property.
     advanceSeqHwmSequential(position, Math.max(n, 1));
+    // Phase 5c step 3: after each completed sequential read, consider firing a prefetch for the
+    // next chunk if all trigger guards + density + resource gates pass.
+    maybeTriggerPrefetch(position);
     return n;
   }
 
@@ -354,6 +522,17 @@ public final class CachingInputStream extends InputStream
   public void close() throws IOException {
     if (!closed.compareAndSet(false, true)) {
       return;
+    }
+    // Phase 5c: cancel any in-flight prefetch promise. PrefetchTask's run-finally will detect the
+    // cancellation (cancel(false) marks the future as CANCELLED) and skip the future.complete
+    // calls; the decrementPendingPrefetch + clearPendingPrefetchIf still fire so the byte-budget
+    // stays balanced. cancel(false) does NOT interrupt the worker thread — that would race the
+    // exclusivePin.close() inside fillExclusive's catch.
+    @SuppressWarnings("unchecked")
+    java.util.concurrent.CompletableFuture<io.github.luciferyang.cachedfs.core.RawFileCacheKey>
+        pending = pendingPrefetch;
+    if (pending != null) {
+      pending.cancel(false);
     }
     // Merge per-stream stats into the bootstrap aggregate exactly once. The merge contract
     // requires `ioStats` to be quiescent here — Hadoop's FSDataInputStream.close is non-thread-
@@ -417,6 +596,7 @@ public final class CachingInputStream extends InputStream
     // contiguous-extend on pos == prev, otherwise leave HWM unchanged (scattered reads do not
     // perturb the sequential trajectory).
     advanceSeqHwmPositional(pos, n);
+    maybeTriggerPrefetch(pos + n);
     return n;
   }
 
@@ -437,6 +617,7 @@ public final class CachingInputStream extends InputStream
     }
     readFullyFromCache(pos, buffer, offset, length);
     advanceSeqHwmPositional(pos, length);
+    maybeTriggerPrefetch(pos + length);
   }
 
   @Override

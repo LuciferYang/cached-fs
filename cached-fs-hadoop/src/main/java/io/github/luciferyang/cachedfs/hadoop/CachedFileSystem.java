@@ -230,6 +230,14 @@ public final class CachedFileSystem extends FilterFileSystem {
       int maxChunksPerGroup =
           CachedFsConfig.coalesceMaxChunksPerGroup(conf, totalRamBytes, b.loadQuantumBytes());
       int maxRestarts = CachedFsConfig.coalesceMaxRestarts(conf);
+      // Phase 5c: admission knobs.
+      boolean prefetchEnabled = CachedFsConfig.prefetchEnabled(conf);
+      boolean heapPressureCheck = CachedFsConfig.prefetchHeapPressureCheckEnabled(conf);
+      double triggerTail = CachedFsConfig.prefetchTriggerTailFraction(conf);
+      int densityPct = CachedFsConfig.prefetchDensityThresholdPct(conf);
+      long rejectionBackoffNs =
+          java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
+              CachedFsConfig.prefetchRejectionBackoffMs(conf));
       cis =
           new CachingInputStream(
               ptr,
@@ -242,7 +250,13 @@ public final class CachedFileSystem extends FilterFileSystem {
               coalesceEnabled,
               maxGap,
               maxChunksPerGroup,
-              maxRestarts);
+              maxRestarts,
+              b,
+              prefetchEnabled,
+              heapPressureCheck,
+              triggerTail,
+              densityPct,
+              rejectionBackoffNs);
       ptrTransferred = true;
       return new FSDataInputStream(cis);
     } catch (java.io.UncheckedIOException ex) {

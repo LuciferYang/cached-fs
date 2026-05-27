@@ -232,6 +232,64 @@ public final class CachedFsConfig {
 
   public static final int DEFAULT_PREFETCH_QUEUE = 64;
 
+  /**
+   * {@code fs.cached.prefetch.heap-pressure-check.enabled} — gate the admission predicate on the
+   * heap-pressure check. Default {@code true}. When false the admission gate ignores heap pressure
+   * entirely (still gated by the byte budget).
+   */
+  public static final String PREFETCH_HEAP_PRESSURE_CHECK_ENABLED =
+      "fs.cached.prefetch.heap-pressure-check.enabled";
+
+  public static final boolean DEFAULT_PREFETCH_HEAP_PRESSURE_CHECK_ENABLED = true;
+
+  /**
+   * {@code fs.cached.prefetch.heap-pressure-ttl-ms} — refresh interval for the cached {@link
+   * java.lang.management.MemoryMXBean MemoryMXBean} heap-pressure read. Default 100 ms. One MBean
+   * call per TTL window across the entire JVM (single-CAS-winner pattern).
+   */
+  public static final String PREFETCH_HEAP_PRESSURE_TTL_MS =
+      "fs.cached.prefetch.heap-pressure-ttl-ms";
+
+  public static final long DEFAULT_PREFETCH_HEAP_PRESSURE_TTL_MS = 100L;
+
+  /**
+   * {@code fs.cached.prefetch.rejection-backoff-ms} — per-stream backoff after a queue-full
+   * rejection before the admission gate will re-attempt a prefetch submit. Default 100 ms.
+   */
+  public static final String PREFETCH_REJECTION_BACKOFF_MS =
+      "fs.cached.prefetch.rejection-backoff-ms";
+
+  public static final long DEFAULT_PREFETCH_REJECTION_BACKOFF_MS = 100L;
+
+  /**
+   * {@code fs.cached.prefetch.trigger-tail-fraction} — fraction of the way into the current chunk
+   * at which the admission gate considers the read "near the end" and submits a prefetch for the
+   * next chunk. Default 0.5 (chunk midpoint). Higher values delay the trigger; lower values fire
+   * earlier and over-prefetch on consumers that abandon reads.
+   */
+  public static final String PREFETCH_TRIGGER_TAIL_FRACTION =
+      "fs.cached.prefetch.trigger-tail-fraction";
+
+  public static final double DEFAULT_PREFETCH_TRIGGER_TAIL_FRACTION = 0.5;
+
+  /**
+   * {@code fs.cached.prefetch.density-threshold-pct} — minimum {@code readPct} (0-100) required
+   * before the admission gate's density predicate will pass. Default 80 — streams that have
+   * actually read 80%+ of their referenced bytes are deemed dense enough to benefit from
+   * speculative prefetch.
+   */
+  public static final String PREFETCH_DENSITY_THRESHOLD_PCT =
+      "fs.cached.prefetch.density-threshold-pct";
+
+  public static final int DEFAULT_PREFETCH_DENSITY_THRESHOLD_PCT = 80;
+
+  /**
+   * {@code fs.cached.prefetch.max-pending-bytes} — JVM-wide byte budget for in-flight prefetches.
+   * Default {@code loadQuantum * prefetchThreads * 4} (computed via {@link
+   * #defaultPrefetchMaxPendingBytes}). Operators with tight RAM budgets should lower this.
+   */
+  public static final String PREFETCH_MAX_PENDING_BYTES = "fs.cached.prefetch.max-pending-bytes";
+
   // --- parsers -------------------------------------------------------------
 
   /** True if {@link #ENABLED} is set to {@code true}. */
@@ -362,6 +420,61 @@ public final class CachedFsConfig {
     int v = conf.getInt(PREFETCH_QUEUE, DEFAULT_PREFETCH_QUEUE);
     if (v <= 0) {
       throw new IllegalArgumentException(PREFETCH_QUEUE + " must be > 0: " + v);
+    }
+    return v;
+  }
+
+  public static boolean prefetchHeapPressureCheckEnabled(Configuration conf) {
+    return conf.getBoolean(
+        PREFETCH_HEAP_PRESSURE_CHECK_ENABLED, DEFAULT_PREFETCH_HEAP_PRESSURE_CHECK_ENABLED);
+  }
+
+  public static long prefetchHeapPressureTtlMs(Configuration conf) {
+    long v = conf.getLong(PREFETCH_HEAP_PRESSURE_TTL_MS, DEFAULT_PREFETCH_HEAP_PRESSURE_TTL_MS);
+    if (v <= 0L) {
+      throw new IllegalArgumentException(PREFETCH_HEAP_PRESSURE_TTL_MS + " must be > 0: " + v);
+    }
+    return v;
+  }
+
+  public static long prefetchRejectionBackoffMs(Configuration conf) {
+    long v = conf.getLong(PREFETCH_REJECTION_BACKOFF_MS, DEFAULT_PREFETCH_REJECTION_BACKOFF_MS);
+    if (v < 0L) {
+      throw new IllegalArgumentException(PREFETCH_REJECTION_BACKOFF_MS + " must be >= 0: " + v);
+    }
+    return v;
+  }
+
+  public static double prefetchTriggerTailFraction(Configuration conf) {
+    double v =
+        conf.getDouble(PREFETCH_TRIGGER_TAIL_FRACTION, DEFAULT_PREFETCH_TRIGGER_TAIL_FRACTION);
+    if (v <= 0.0 || v > 1.0) {
+      throw new IllegalArgumentException(
+          PREFETCH_TRIGGER_TAIL_FRACTION + " must be in (0, 1]: " + v);
+    }
+    return v;
+  }
+
+  public static int prefetchDensityThresholdPct(Configuration conf) {
+    int v = conf.getInt(PREFETCH_DENSITY_THRESHOLD_PCT, DEFAULT_PREFETCH_DENSITY_THRESHOLD_PCT);
+    if (v < 0 || v > 100) {
+      throw new IllegalArgumentException(
+          PREFETCH_DENSITY_THRESHOLD_PCT + " must be in [0, 100]: " + v);
+    }
+    return v;
+  }
+
+  /** Default {@code loadQuantum × threads × 4}; chosen heuristic per phase-5c.md §step 6. */
+  public static long defaultPrefetchMaxPendingBytes(int loadQuantumBytes, int prefetchThreads) {
+    return (long) loadQuantumBytes * prefetchThreads * 4L;
+  }
+
+  public static long prefetchMaxPendingBytes(
+      Configuration conf, int loadQuantumBytes, int prefetchThreads) {
+    long autoDefault = defaultPrefetchMaxPendingBytes(loadQuantumBytes, prefetchThreads);
+    long v = conf.getLong(PREFETCH_MAX_PENDING_BYTES, autoDefault);
+    if (v <= 0L) {
+      throw new IllegalArgumentException(PREFETCH_MAX_PENDING_BYTES + " must be > 0: " + v);
     }
     return v;
   }
