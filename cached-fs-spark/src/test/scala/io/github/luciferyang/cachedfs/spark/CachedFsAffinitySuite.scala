@@ -248,4 +248,41 @@ class CachedFsAffinitySuite extends AnyFunSuite with BeforeAndAfterEach {
     }
   }
 
+  test(
+    "extension.apply tolerates non-integer and non-boolean SparkConf values; session startup " +
+      "is not crashed and feature falls back to defaults") {
+    // SparkConf.getInt throws NumberFormatException; getBoolean throws IllegalArgumentException
+    // for unparseable values. Spark 4's applyExtensions only catches CCE|CNFE|NCDFE, so an
+    // unwrapped parse failure would kill the whole SparkSession build. Set every numeric/boolean
+    // key to a garbage string to exercise every catch path: the session must still build and
+    // every knob must hold its default.
+    val spark = SparkSession
+      .builder()
+      .master("local[1]")
+      .appName("cached-fs-affinity-garbage-conf")
+      .config(CachedFsAffinityConfig.ENABLED, "truthy") // non-boolean
+      .config(CachedFsAffinityConfig.REPLICATION_NUM, "notanumber") // non-integer
+      .config(CachedFsAffinityConfig.MIN_TARGET_HOSTS, "alsobad") // non-integer
+      .config(CachedFsAffinityConfig.DUPLICATE_READING_DETECT_ENABLED, "yesplease") // non-boolean
+      .config(CachedFsAffinityConfig.DUPLICATE_READING_MAX_CACHE_ITEMS, "huge") // non-integer
+      .config(CachedFsAffinityConfig.VIRTUAL_NODES, "lots") // non-integer
+      .config("spark.sql.extensions", classOf[CachedFsAffinityExtension].getName)
+      .getOrCreate()
+    try {
+      val snap = CachedFsSoftAffinityManager.getInstance().snapshot()
+      assert(snap.enabled() == CachedFsAffinityConfig.DEFAULT_ENABLED)
+      assert(snap.replicationNum() == CachedFsAffinityConfig.DEFAULT_REPLICATION_NUM)
+      assert(snap.minTargetHosts() == CachedFsAffinityConfig.DEFAULT_MIN_TARGET_HOSTS)
+      assert(
+        snap.detectDuplicateReading() ==
+          CachedFsAffinityConfig.DEFAULT_DUPLICATE_READING_DETECT_ENABLED)
+      assert(
+        snap.duplicateReadingMaxCacheItems() ==
+          CachedFsAffinityConfig.DEFAULT_DUPLICATE_READING_MAX_CACHE_ITEMS)
+      assert(snap.virtualNodes() == CachedFsAffinityConfig.DEFAULT_VIRTUAL_NODES)
+    } finally {
+      spark.stop()
+    }
+  }
+
 }

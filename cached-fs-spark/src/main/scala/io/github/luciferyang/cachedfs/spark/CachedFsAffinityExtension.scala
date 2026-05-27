@@ -84,8 +84,10 @@ class CachedFsAffinityExtension extends (SparkSessionExtensions => Unit) with Lo
     // Step 2: apply knobs. CachedFsAffinity.configure validates inputs and rethrows with messages
     // that name the offending SparkConf key. We catch + log + disable on failure rather than
     // throwing up into the SparkSession startup.
-    val enabled = sc.getConf
-      .getBoolean(CachedFsAffinityConfig.ENABLED, CachedFsAffinityConfig.DEFAULT_ENABLED)
+    val enabled = readBooleanSafe(
+      sc,
+      CachedFsAffinityConfig.ENABLED,
+      CachedFsAffinityConfig.DEFAULT_ENABLED)
     val replicationNum = readPositiveInt(
       sc,
       CachedFsAffinityConfig.REPLICATION_NUM,
@@ -94,7 +96,8 @@ class CachedFsAffinityExtension extends (SparkSessionExtensions => Unit) with Lo
       sc,
       CachedFsAffinityConfig.MIN_TARGET_HOSTS,
       CachedFsAffinityConfig.DEFAULT_MIN_TARGET_HOSTS)
-    val detectDuplicateReading = sc.getConf.getBoolean(
+    val detectDuplicateReading = readBooleanSafe(
+      sc,
       CachedFsAffinityConfig.DUPLICATE_READING_DETECT_ENABLED,
       CachedFsAffinityConfig.DEFAULT_DUPLICATE_READING_DETECT_ENABLED)
     val duplicateReadingMaxCacheItems = readPositiveInt(
@@ -134,8 +137,13 @@ class CachedFsAffinityExtension extends (SparkSessionExtensions => Unit) with Lo
         s"detectDuplicateReading=$detectDuplicateReading, virtualNodes=$virtualNodes")
   }
 
+  // SparkConf.getInt throws NumberFormatException, getBoolean throws IllegalArgumentException
+  // for unparseable values. Spark 4's applyExtensions only catches CCE|CNFE|NCDFE, so an
+  // unwrapped parse failure kills the whole SparkSession build. These helpers swallow the
+  // parse failure, log a clear WARN naming the key, and fall back to the default — keeping the
+  // contract that a misconfigured cached-fs knob never takes down the driver.
   private def readPositiveInt(sc: SparkContext, key: String, default: Int): Int = {
-    val raw = sc.getConf.getInt(key, default)
+    val raw = readIntSafe(sc, key, default)
     if (raw <= 0) {
       logWarning(s"$key=$raw is not positive; falling back to default $default")
       default
@@ -143,10 +151,34 @@ class CachedFsAffinityExtension extends (SparkSessionExtensions => Unit) with Lo
   }
 
   private def readNonNegativeInt(sc: SparkContext, key: String, default: Int): Int = {
-    val raw = sc.getConf.getInt(key, default)
+    val raw = readIntSafe(sc, key, default)
     if (raw < 0) {
       logWarning(s"$key=$raw is negative; falling back to default $default")
       default
     } else raw
+  }
+
+  private def readIntSafe(sc: SparkContext, key: String, default: Int): Int = {
+    try sc.getConf.getInt(key, default)
+    catch {
+      case ex: NumberFormatException =>
+        logWarning(
+          s"$key has a non-integer SparkConf value (${ex.getMessage}); falling back to default $default")
+        default
+      case ex: IllegalArgumentException =>
+        logWarning(
+          s"$key has an invalid SparkConf value (${ex.getMessage}); falling back to default $default")
+        default
+    }
+  }
+
+  private def readBooleanSafe(sc: SparkContext, key: String, default: Boolean): Boolean = {
+    try sc.getConf.getBoolean(key, default)
+    catch {
+      case ex: IllegalArgumentException =>
+        logWarning(
+          s"$key has a non-boolean SparkConf value (${ex.getMessage}); falling back to default $default")
+        default
+    }
   }
 }
