@@ -51,6 +51,15 @@ class CachedFsSoftAffinityListener(private val ownerCtx: SparkContext)
           "TaskLocation parsing")
       return
     }
+    // Spark's local mode synthesizes a SparkListenerExecutorAdded with executorId="driver"
+    // for the in-process executor (SparkContext.DRIVER_IDENTIFIER, which is private-to-spark
+    // so we inline the literal). Adding it to the affinity ring is harmless in local mode
+    // (PROCESS_LOCAL hints route to the driver which IS the only executor anyway) but
+    // pollutes the ring in mixed local-test / unit-test scenarios and serves no purpose: real
+    // cluster deployments never emit a "driver" executor event through this listener.
+    if ("driver" == event.executorId) {
+      return
+    }
     CachedFsAffinity.onExecutorAdded(event.executorId, host)
   }
 

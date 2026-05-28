@@ -1,4 +1,11 @@
 target/
+# Spark integration tests pin spark.sql.warehouse.dir under target/ so these dirs should
+# never be created at the module root — but they CAN appear if a future test forgets the
+# override, or if someone runs an interactive spark-shell from the repo root. Ignore
+# defensively so an accidental run never pollutes the working tree.
+spark-warehouse/
+metastore_db/
+derby.log
 .idea/
 *.iml
 *.iws

@@ -82,6 +82,9 @@ class CachedFsAffinityIT {
             .config(CachedFsAffinityConfig.VIRTUAL_NODES, "100")
             .config("spark.ui.enabled", "false")
             .config("spark.sql.shuffle.partitions", "1")
+            // Pin driver to loopback for CI robustness against unusual hostname/network setups.
+            .config("spark.driver.host", "localhost")
+            .config("spark.driver.bindAddress", "127.0.0.1")
             // Force one FilePartition per file (no coalescing of small files) so each partition
             // carries the affinity hosts directly from its block. Without this, Spark groups
             // small files into a single coalesced FilePartition whose locations are taken from
@@ -89,16 +92,45 @@ class CachedFsAffinityIT {
             // can be filtered through getBlockHosts overlap math in surprising ways.
             .config("spark.sql.files.maxPartitionBytes", "1024")
             .config("spark.sql.files.openCostInBytes", "0")
+            // Pin Spark scratch + warehouse under target/ so they never pollute the repo
+            // working tree.
+            .config(
+                "spark.sql.warehouse.dir",
+                "file:" + System.getProperty("user.dir") + "/target/spark-warehouse")
+            .config("spark.local.dir", System.getProperty("user.dir") + "/target/spark-local")
             .getOrCreate();
   }
 
   @AfterAll
-  void tearDown() throws Exception {
-    if (spark != null) {
-      spark.stop();
+  void tearDown() {
+    // Each release in its own try/finally so a failure in spark.stop doesn't silently skip
+    // FileSystem.closeAll / CacheBootstrap.uninstall / listener+manager reset. The fork
+    // strategy (Failsafe forkCount=1 reuseForks=false) gives a hard outer safety net via
+    // JVM exit, but cleanups failing in sequence would otherwise mask the original cause.
+    try {
+      if (spark != null) {
+        spark.stop();
+      }
+    } catch (RuntimeException ignored) {
+      // best-effort; subsequent cleanups still run
     }
-    FileSystem.closeAll();
-    CacheBootstrap.uninstallForTesting();
+    try {
+      FileSystem.closeAll();
+    } catch (java.io.IOException | RuntimeException ignored) {
+    }
+    try {
+      CacheBootstrap.uninstallForTesting();
+    } catch (java.io.IOException | RuntimeException ignored) {
+    }
+    // Reset BOTH the manager singleton AND the listener-registration AtomicReference. Without
+    // the listener reset the companion-object's Registration still points at the stopped
+    // SparkContext + its listener — harmless under reuseForks=false (JVM exits per class) but
+    // a foot-gun if isolation strategy ever changes. Symmetric with CachedFsAffinitySuite.
+    // Companion-object access from Java goes through the synthetic MODULE$ holder.
+    try {
+      CachedFsSoftAffinityListener$.MODULE$.resetForTesting();
+    } catch (RuntimeException ignored) {
+    }
     CachedFsSoftAffinityManager.resetForTesting();
   }
 
@@ -115,10 +147,15 @@ class CachedFsAffinityIT {
 
   @AfterEach
   void clearExecutors() {
-    // Drop the executors before the next test so each test sees a deterministic ring.
+    // Drop the executors before the next test so each test sees a deterministic ring. Assert
+    // the post-condition so a leaked add from a test surfaces here, not in a downstream
+    // failure with a confusing executor count.
     CachedFsAffinity.onExecutorRemoved("exec1");
     CachedFsAffinity.onExecutorRemoved("exec2");
     CachedFsAffinity.onExecutorRemoved("exec3");
+    assertThat(CachedFsSoftAffinityManager.getInstance().executorCount())
+        .as("ring must be empty after clearExecutors — a non-zero count means a test leaked an add")
+        .isZero();
   }
 
   @Test
@@ -135,20 +172,24 @@ class CachedFsAffinityIT {
     FileSystem fs = FileSystem.get(URI.create("file:///"), hadoopConf);
     // Find the actual parquet part-file (a directory was created with a single part inside).
     FileStatus[] parquetFiles = fs.listStatus(parquetDir, p -> p.getName().endsWith(".parquet"));
-    assertThat(parquetFiles).hasSize(1);
-    FileStatus part = parquetFiles[0];
+    // Spark's range(100).write.parquet typically emits 1 part file in local[1], but write-side
+    // splitting is implementation-defined across Spark patch releases — iterate ALL part files
+    // so the assertion holds even if a future release fragments differently.
+    assertThat(parquetFiles).as("at least one parquet part file").isNotEmpty();
 
-    BlockLocation[] blocks = fs.getFileBlockLocations(part, 0, part.getLen());
-    assertThat(blocks).as("at least one BlockLocation").isNotEmpty();
-    // Every block's hosts should be the affinity-selected executor task-locations of the form
-    // "executor_<host>_<execId>" — the format Spark's TaskLocation.apply parses into
-    // ExecutorCacheTaskLocation for PROCESS_LOCAL routing.
-    for (BlockLocation block : blocks) {
-      String[] hosts = block.getHosts();
-      assertThat(hosts).as("block hosts non-empty").isNotEmpty();
-      assertThat(hosts)
-          .as("all hosts are executor task-location strings")
-          .allSatisfy(h -> assertThat(h).matches("executor_host-[ABC]_exec[123]"));
+    for (FileStatus part : parquetFiles) {
+      BlockLocation[] blocks = fs.getFileBlockLocations(part, 0, part.getLen());
+      assertThat(blocks).as("at least one BlockLocation for %s", part.getPath()).isNotEmpty();
+      // Every block's hosts should be the affinity-selected executor task-locations of the form
+      // "executor_<host>_<execId>" — the format Spark's TaskLocation.apply parses into
+      // ExecutorCacheTaskLocation for PROCESS_LOCAL routing.
+      for (BlockLocation block : blocks) {
+        String[] hosts = block.getHosts();
+        assertThat(hosts).as("block hosts non-empty for %s", part.getPath()).isNotEmpty();
+        assertThat(hosts)
+            .as("all hosts are executor task-location strings for %s", part.getPath())
+            .allSatisfy(h -> assertThat(h).matches("executor_host-[ABC]_exec[123]"));
+      }
     }
   }
 
@@ -211,34 +252,57 @@ class CachedFsAffinityIT {
     Partition[] partitions = fileScanRdd.partitions();
     assertThat(partitions).as("at least one FilePartition").isNotEmpty();
 
-    boolean atLeastOneHadAffinityLocation = false;
+    // Every partition from an affinity-routed file MUST carry affinity hosts. "At least one"
+    // would let a regression where most partitions silently lose their hint slip through
+    // (e.g., a bug in CachedFsAffinityBlockLocationsProvider's per-block loop only rewriting
+    // the first BlockLocation). Tolerate zero misses.
+    java.util.List<Integer> missingAffinity = new java.util.ArrayList<>();
     StringBuilder diag = new StringBuilder("collected preferredLocations:\n");
     for (Partition p : partitions) {
       List<String> locs = JavaConverters.seqAsJavaList(fileScanRdd.preferredLocations(p).toList());
       diag.append("  partition ").append(p.index()).append(": ").append(locs).append("\n");
-      if (locs.stream().anyMatch(s -> s.matches("executor_host-[ABC]_exec[123]"))) {
-        atLeastOneHadAffinityLocation = true;
+      boolean hasAffinity = locs.stream().anyMatch(s -> s.matches("executor_host-[ABC]_exec[123]"));
+      if (!hasAffinity) {
+        missingAffinity.add(p.index());
       }
     }
-    assertThat(atLeastOneHadAffinityLocation)
-        .as("FilePartition.preferredLocations should contain affinity targets. %s%s", lfsDiag, diag)
-        .isTrue();
+    assertThat(missingAffinity)
+        .as(
+            "every FilePartition over affinity-routed files must carry affinity hosts; "
+                + "partitions missing them: %s. %s%s",
+            missingAffinity, lfsDiag, diag)
+        .isEmpty();
   }
 
   /**
    * Walks {@code rdd}'s narrow dependencies (and only narrow dependencies — shuffle boundaries
    * break locality propagation in Spark itself) until it finds a {@code FileScanRDD}. Returns null
-   * if no FileScanRDD is reachable.
+   * if no FileScanRDD is reachable. Mirrors {@code DAGScheduler.getPreferredLocsInternal}: tracks a
+   * visited set (SPARK-695) to avoid exponential exploration on DAGs with shared narrow deps, and
+   * matches by fully-qualified class name (not {@code endsWith("FileScanRDD")}) so an unrelated
+   * class whose simple name ends with that string can't false-match.
    */
+  private static final String FILE_SCAN_RDD_FQN =
+      "org.apache.spark.sql.execution.datasources.FileScanRDD";
+
   private static org.apache.spark.rdd.RDD<?> findFileScanRdd(org.apache.spark.rdd.RDD<?> rdd) {
-    if (rdd.getClass().getName().endsWith("FileScanRDD")) {
+    return findFileScanRddImpl(
+        rdd, java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()));
+  }
+
+  private static org.apache.spark.rdd.RDD<?> findFileScanRddImpl(
+      org.apache.spark.rdd.RDD<?> rdd, java.util.Set<org.apache.spark.rdd.RDD<?>> visited) {
+    if (!visited.add(rdd)) {
+      return null;
+    }
+    if (FILE_SCAN_RDD_FQN.equals(rdd.getClass().getName())) {
       return rdd;
     }
     scala.collection.Iterator<org.apache.spark.Dependency<?>> deps = rdd.dependencies().iterator();
     while (deps.hasNext()) {
       org.apache.spark.Dependency<?> dep = deps.next();
       if (dep instanceof org.apache.spark.NarrowDependency<?>) {
-        org.apache.spark.rdd.RDD<?> found = findFileScanRdd(dep.rdd());
+        org.apache.spark.rdd.RDD<?> found = findFileScanRddImpl(dep.rdd(), visited);
         if (found != null) {
           return found;
         }

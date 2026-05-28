@@ -15,12 +15,20 @@ jobs:
           # The default Hadoop pin (3.4.1) is what production runs against.
           - jdk: '21'
             hadoop: '3.4.1'
+            spark-profile: 'spark-4.0'
+          # Spark 4.1 must also stay green — without this cell, the spark-4.1 profile would
+          # rot silently between manual verifications and any API/binary regression introduced
+          # by future PRs would only surface when someone re-tests locally.
+          - jdk: '21'
+            hadoop: '3.4.1'
+            spark-profile: 'spark-4.1'
           # JDK 25 needs Hadoop 3.5.x — earlier Hadoop releases call
           # Subject.getSubject(AccessControlContext) which was removed in JDK 24+.
           - jdk: '25'
             hadoop: '3.5.0'
+            spark-profile: 'spark-4.0'
     runs-on: ubuntu-latest
-    name: build (jdk-${{ matrix.jdk }} hadoop-${{ matrix.hadoop }})
+    name: build (jdk-${{ matrix.jdk }} hadoop-${{ matrix.hadoop }} ${{ matrix.spark-profile }})
     steps:
       - uses: actions/checkout@v4
       - name: Set up JDK ${{ matrix.jdk }}
@@ -34,11 +42,14 @@ jobs:
         # to that one matrix entry so newer JDKs (25+) don't trip on parser internals.
         run: >-
           mvn -B -ntp verify
+          -P${{ matrix.spark-profile }}
           -Dhadoop.version=${{ matrix.hadoop }}
           -Dspotless.check.skip=${{ matrix.jdk != '21' }}
       - name: Upload coverage
         if: matrix.jdk == '21'
         uses: actions/upload-artifact@v4
         with:
-          name: jacoco-report-jdk${{ matrix.jdk }}
+          # Now that two JDK 21 cells exist (spark-4.0 and spark-4.1), include the profile in
+          # the artifact name so the second upload doesn't collide with the first.
+          name: jacoco-report-jdk${{ matrix.jdk }}-${{ matrix.spark-profile }}
           path: '**/target/site/jacoco/'

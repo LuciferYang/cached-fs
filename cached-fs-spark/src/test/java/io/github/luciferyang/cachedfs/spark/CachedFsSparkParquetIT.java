@@ -22,8 +22,6 @@ import io.github.luciferyang.cachedfs.hadoop.CachedFileSystem;
 import io.github.luciferyang.cachedfs.hadoop.CachedFsConfig;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -75,18 +73,43 @@ class CachedFsSparkParquetIT {
             // Speed up tests: Spark's default UI/event log on local mode adds noise.
             .config("spark.ui.enabled", "false")
             .config("spark.sql.shuffle.partitions", "1")
+            // Pin driver to loopback so the build doesn't hang on CI hosts with unusual
+            // network setups (containers without a usable hostname → InetAddress.getLocalHost
+            // throws and SparkEnv setup stalls). Loopback is fine for local-mode ITs.
+            .config("spark.driver.host", "localhost")
+            .config("spark.driver.bindAddress", "127.0.0.1")
+            // Pin Spark scratch + warehouse under target/ so they never pollute the repo
+            // working tree. Without this, spark-warehouse/, metastore_db/, and derby.log
+            // can leak to the module root.
+            .config(
+                "spark.sql.warehouse.dir",
+                "file:" + System.getProperty("user.dir") + "/target/spark-warehouse")
+            .config("spark.local.dir", System.getProperty("user.dir") + "/target/spark-local")
             .getOrCreate();
   }
 
   @AfterAll
-  void tearDown() throws Exception {
-    if (spark != null) {
-      spark.stop();
+  void tearDown() {
+    // Each release in its own try/catch so a failure in spark.stop doesn't silently skip
+    // FileSystem.closeAll and CacheBootstrap.uninstallForTesting. Failsafe forkCount=1
+    // reuseForks=false gives a hard JVM-exit safety net, but a cascading teardown exception
+    // masks the original test failure with a noisier secondary cause.
+    try {
+      if (spark != null) {
+        spark.stop();
+      }
+    } catch (RuntimeException ignored) {
     }
-    // FileSystem caches the per-URI singletons across Spark stops; clear so the next IT class
-    // starts from a clean slate (otherwise stale CachedFileSystem instances linger).
-    FileSystem.closeAll();
-    CacheBootstrap.uninstallForTesting();
+    try {
+      // FileSystem caches the per-URI singletons across Spark stops; clear so the next IT
+      // class starts from a clean slate (otherwise stale CachedFileSystem instances linger).
+      FileSystem.closeAll();
+    } catch (java.io.IOException | RuntimeException ignored) {
+    }
+    try {
+      CacheBootstrap.uninstallForTesting();
+    } catch (java.io.IOException | RuntimeException ignored) {
+    }
   }
 
   @AfterEach
@@ -105,14 +128,35 @@ class CachedFsSparkParquetIT {
     // the cache path under test.
     spark.range(1000).toDF("id").write().mode("overwrite").parquet(parquetDir.toString());
 
-    Dataset<Row> first = spark.read().parquet(parquetDir.toString());
-    long firstCount = first.count();
-    assertThat(firstCount).as("first read row count").isEqualTo(1000);
+    // Collect actual id values, not just the count: a cache that corrupted column data while
+    // leaving the Parquet footer intact would still yield count=1000 because Parquet returns
+    // row count from metadata, not from re-decoding the data column. Set equality on the IDs
+    // catches that class of regression.
+    java.util.List<Long> firstIds =
+        spark
+            .read()
+            .parquet(parquetDir.toString())
+            .as(org.apache.spark.sql.Encoders.LONG())
+            .collectAsList();
+    java.util.List<Long> expected =
+        java.util.stream.LongStream.range(0, 1000)
+            .boxed()
+            .collect(java.util.stream.Collectors.toList());
+    assertThat(firstIds)
+        .as("first read id values match expected range — defends column-data corruption")
+        .containsExactlyInAnyOrderElementsOf(expected);
 
-    // Second read must succeed identically — proves the cache doesn't corrupt subsequent reads
-    // (positioned-read semantics + chunk reassembly).
-    long secondCount = spark.read().parquet(parquetDir.toString()).count();
-    assertThat(secondCount).as("second read row count").isEqualTo(1000);
+    // Second read: identical content. Proves the cache returns consistent bytes across reads
+    // (positioned-read semantics + chunk reassembly stable across cache hits vs misses).
+    java.util.List<Long> secondIds =
+        spark
+            .read()
+            .parquet(parquetDir.toString())
+            .as(org.apache.spark.sql.Encoders.LONG())
+            .collectAsList();
+    assertThat(secondIds)
+        .as("second read returns identical content")
+        .containsExactlyInAnyOrderElementsOf(expected);
   }
 
   @Test
@@ -139,10 +183,28 @@ class CachedFsSparkParquetIT {
     Path orcDir = new Path("file://" + tmp.resolve("data.orc").toAbsolutePath());
     spark.range(500).toDF("id").write().mode("overwrite").orc(orcDir.toString());
 
-    long first = spark.read().orc(orcDir.toString()).count();
-    assertThat(first).as("first ORC read row count").isEqualTo(500);
-    long second = spark.read().orc(orcDir.toString()).count();
-    assertThat(second).as("second ORC read row count").isEqualTo(500);
+    java.util.List<Long> expected =
+        java.util.stream.LongStream.range(0, 500)
+            .boxed()
+            .collect(java.util.stream.Collectors.toList());
+    java.util.List<Long> firstIds =
+        spark
+            .read()
+            .orc(orcDir.toString())
+            .as(org.apache.spark.sql.Encoders.LONG())
+            .collectAsList();
+    assertThat(firstIds)
+        .as("first ORC read id values match — defends column-data corruption")
+        .containsExactlyInAnyOrderElementsOf(expected);
+    java.util.List<Long> secondIds =
+        spark
+            .read()
+            .orc(orcDir.toString())
+            .as(org.apache.spark.sql.Encoders.LONG())
+            .collectAsList();
+    assertThat(secondIds)
+        .as("second ORC read returns identical content")
+        .containsExactlyInAnyOrderElementsOf(expected);
   }
 
   @Test
@@ -159,10 +221,22 @@ class CachedFsSparkParquetIT {
         .option("header", "true")
         .csv(csvDir.toString());
 
-    Dataset<Row> first = spark.read().option("header", "true").csv(csvDir.toString());
-    assertThat(first.count()).as("first CSV read row count").isEqualTo(200);
-    long second = spark.read().option("header", "true").csv(csvDir.toString()).count();
-    assertThat(second).as("second CSV read row count").isEqualTo(200);
+    java.util.Set<String> expected =
+        java.util.stream.LongStream.range(0, 200)
+            .mapToObj(String::valueOf)
+            .collect(java.util.stream.Collectors.toSet());
+    java.util.Set<String> firstIds =
+        spark.read().option("header", "true").csv(csvDir.toString()).collectAsList().stream()
+            .map(r -> r.getString(0))
+            .collect(java.util.stream.Collectors.toSet());
+    assertThat(firstIds)
+        .as("first CSV read values match — defends row-data corruption")
+        .isEqualTo(expected);
+    java.util.Set<String> secondIds =
+        spark.read().option("header", "true").csv(csvDir.toString()).collectAsList().stream()
+            .map(r -> r.getString(0))
+            .collect(java.util.stream.Collectors.toSet());
+    assertThat(secondIds).as("second CSV read returns identical content").isEqualTo(expected);
   }
 
   @Test
@@ -190,23 +264,48 @@ class CachedFsSparkParquetIT {
     assertThat(parts).hasSizeGreaterThanOrEqualTo(1);
 
     org.apache.hadoop.fs.FileStatus part = parts[0];
+
+    // Reference bytes via java.nio out-of-band (bypassing Hadoop entirely) so we have a
+    // known-good baseline to compare against. A 'read > 0' alone would silently pass if the
+    // builder fell through to the inner FS — the exact regression we're defending against.
+    int probeLen = (int) Math.min(part.getLen(), 1024);
+    byte[] referenceBytes = new byte[probeLen];
+    try (java.io.InputStream raw =
+        java.nio.file.Files.newInputStream(java.nio.file.Path.of(part.getPath().toUri()))) {
+      int filled = raw.read(referenceBytes);
+      assertThat(filled).as("reference read filled the probe buffer").isEqualTo(probeLen);
+    }
+
     try (org.apache.hadoop.fs.FSDataInputStream in =
         fs.openFile(part.getPath())
             .opt(org.apache.hadoop.fs.Options.OpenFileOptions.FS_OPTION_OPENFILE_BUFFER_SIZE, 16384)
             .withFileStatus(part)
             .build()
             .get()) {
-      byte[] buf = new byte[(int) Math.min(part.getLen(), 1024)];
-      int read = in.read(buf);
-      assertThat(read).as("read >0 bytes via openFile builder").isGreaterThan(0);
+      // Wrap-class assertion: the stream MUST come from cached-fs's CachingInputStream wrapper,
+      // not a fall-through to the inner FS. This is the exact regression the test claims to
+      // defend against — a 'read > 0' check would silently pass on a working inner-FS fallback.
+      assertThat(in.getWrappedStream().getClass().getName())
+          .as("openFile builder must route through CachedFileSystem's CachingInputStream")
+          .contains("CachingInputStream");
+
+      byte[] buf = new byte[probeLen];
+      org.apache.hadoop.io.IOUtils.readFully(in, buf, 0, probeLen);
+      assertThat(buf)
+          .as("bytes via openFile builder match the reference out-of-band read")
+          .isEqualTo(referenceBytes);
     }
 
-    // Second openFile via builder: bytes must round-trip identically. Routes through the cache.
+    // Second openFile via builder: hot path (cache hit). Must still route through
+    // CachingInputStream and yield identical bytes.
     try (org.apache.hadoop.fs.FSDataInputStream in =
         fs.openFile(part.getPath()).withFileStatus(part).build().get()) {
-      byte[] buf = new byte[(int) Math.min(part.getLen(), 1024)];
-      int read = in.read(buf);
-      assertThat(read).as("second openFile read >0 bytes").isGreaterThan(0);
+      assertThat(in.getWrappedStream().getClass().getName())
+          .as("second openFile must also route through CachingInputStream")
+          .contains("CachingInputStream");
+      byte[] buf = new byte[probeLen];
+      org.apache.hadoop.io.IOUtils.readFully(in, buf, 0, probeLen);
+      assertThat(buf).as("second openFile bytes match reference").isEqualTo(referenceBytes);
     }
   }
 
@@ -224,9 +323,21 @@ class CachedFsSparkParquetIT {
         .mode("overwrite")
         .text(textDir.toString());
 
-    long lines = spark.read().text(textDir.toString()).count();
-    assertThat(lines).as("text line count").isEqualTo(100);
-    long lines2 = spark.read().text(textDir.toString()).count();
-    assertThat(lines2).as("second text read line count").isEqualTo(100);
+    java.util.Set<String> expected =
+        java.util.stream.LongStream.range(0, 100)
+            .mapToObj(String::valueOf)
+            .collect(java.util.stream.Collectors.toSet());
+    java.util.Set<String> firstLines =
+        spark.read().text(textDir.toString()).collectAsList().stream()
+            .map(r -> r.getString(0))
+            .collect(java.util.stream.Collectors.toSet());
+    assertThat(firstLines)
+        .as("first text read line values match — defends row-data corruption")
+        .isEqualTo(expected);
+    java.util.Set<String> secondLines =
+        spark.read().text(textDir.toString()).collectAsList().stream()
+            .map(r -> r.getString(0))
+            .collect(java.util.stream.Collectors.toSet());
+    assertThat(secondLines).as("second text read returns identical content").isEqualTo(expected);
   }
 }

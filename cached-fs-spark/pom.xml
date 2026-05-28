@@ -21,9 +21,23 @@
 
   <properties>
     <!-- Spark 4.x ships with Scala 2.13 and supports JDK 21, matching cached-fs's JDK floor.
-         Earlier Spark releases (3.5 and below) do not fully support JDK 21. The concrete
-         spark.version + scala.version are set per profile below (spark-4.0 is the default;
-         opt into spark-4.1 with `-Pspark-4.1`). -->
+         Earlier Spark releases (3.5 and below) do not fully support JDK 21.
+
+         spark.version + scala.version are set HERE as the no-profile default (Spark 4.0.0)
+         instead of relying on `<activeByDefault>true</activeByDefault>` on a spark-4.0 profile.
+         Reason: Maven deactivates `activeByDefault` profiles whenever ANY other profile is
+         explicitly selected via `-P` or settings.xml. If a contributor or CI run ever passes
+         an unrelated profile (release, coverage, dependency-bom, etc.), spark-4.0 would
+         silently deactivate and the build would fail with a cryptic "Could not resolve
+         ${spark.version}" error. Defaulting at the property level keeps the no-profile build
+         working even if other profiles are layered in. The spark-4.0 profile below remains
+         for explicit selection (`-Pspark-4.0`); spark-4.1 overrides the defaults when picked.
+
+         Scala 2.13.16 matches the scala-library jar Spark 4.0.0 declares as a compile-time
+         dep (verified in spark-parent_2.13-4.0.0.pom); we compile and run against the same
+         patch to avoid any skew between compile-time and runtime classpaths. -->
+    <spark.version>4.0.0</spark.version>
+    <scala.version>2.13.16</scala.version>
     <scala.binary.version>2.13</scala.binary.version>
     <scala-maven-plugin.version>4.9.2</scala-maven-plugin.version>
     <scalatest-maven-plugin.version>2.2.0</scalatest-maven-plugin.version>
@@ -32,18 +46,14 @@
   </properties>
 
   <profiles>
-    <!-- Default: Spark 4.0. Activates whenever no other profile is passed via `-P`. Scala
-         2.13.15 here matches the binary range Spark 4.0 ships against (the actual bundled
-         jar in 4.0.2 is 2.13.16; 2.13.x patches are binary-compatible so the slightly older
-         compiler is fine for cross-compilation). -->
+    <!-- Explicit Spark 4.0 selector (`-Pspark-4.0`). Sets the same values as the default
+         properties above so the profile is redundant-but-safe — useful in CI matrices that
+         pass `-P${{ matrix.spark-profile }}` to force every cell to have an explicit choice. -->
     <profile>
       <id>spark-4.0</id>
-      <activation>
-        <activeByDefault>true</activeByDefault>
-      </activation>
       <properties>
         <spark.version>4.0.0</spark.version>
-        <scala.version>2.13.15</scala.version>
+        <scala.version>2.13.16</scala.version>
       </properties>
     </profile>
 
