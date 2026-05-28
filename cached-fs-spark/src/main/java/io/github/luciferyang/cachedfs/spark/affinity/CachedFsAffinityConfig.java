@@ -74,9 +74,10 @@ public final class CachedFsAffinityConfig {
   public static final boolean DEFAULT_DUPLICATE_READING_DETECT_ENABLED = false;
 
   /**
-   * Maximum entries retained in each of the three feedback-mode Guava caches. Keeps memory bounded
-   * on long-running drivers. Old entries are evicted LRU; the per-stage cleanup hook also drops
-   * entries proactively.
+   * Maximum entries retained in each of the three feedback-mode bounded maps (stage RDDs, RDD
+   * partitions, duplicate-read observations). Keeps memory bounded on long-running drivers. Old
+   * entries are evicted FIFO once the cap is reached (insertion-order LinkedHashMap); the
+   * per-stage cleanup hook also drops entries proactively when the stage finishes.
    */
   public static final String DUPLICATE_READING_MAX_CACHE_ITEMS =
       "spark.cached-fs.affinity.duplicate-reading.max-cache-items";
