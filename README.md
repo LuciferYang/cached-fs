@@ -183,6 +183,16 @@ The extension installs a SparkListener (executor lifecycle + per-stage task-end 
 
 For custom DataSource v2 connectors that own their own scan, the same hint is available as a public API: `CachedFsAffinity.getPreferredLocations(path, nativeHosts)` returns the executor location strings directly.
 
+### Per-task scanId (cached-fs-spark)
+
+`cached-fs-spark` also ships a Spark plugin that produces per-task scanIds so concurrent queries on the same JVM no longer collapse to the `"default"` scanId. Wire it on the driver:
+
+```properties
+spark.plugins=io.github.luciferyang.cachedfs.spark.CachedFsScanIdPlugin
+```
+
+The executor plugin opens a `withScanId("task-{stageId}-{partitionId}-{taskAttemptId}")` scope at `onTaskStart` and closes it at `onTaskSucceeded`/`onTaskFailed`. Each Spark task gets its own `ScanTracker`, so density-tracking for one query never contaminates another's, and retries get fresh trackers (the taskAttemptId rolls forward). Reads issued from a thread other than the task-runner thread (e.g. a `ForkJoinPool` task spawned inside the task body) won't see the scope and fall back to the existing `fs.cached.scan-id` resolution chain. Compose with other plugins by passing a comma-separated list.
+
 ## Build
 
 ```sh
