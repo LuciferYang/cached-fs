@@ -15,7 +15,6 @@
  */
 package io.github.luciferyang.cachedfs.core;
 
-import io.github.luciferyang.cachedfs.core.tracker.TrackingId;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.nio.ByteBuffer;
@@ -90,7 +89,6 @@ public final class CacheEntry {
   // --- identity ---
   private RawFileCacheKey key;
   private long groupId;
-  private TrackingId trackingId = TrackingId.EMPTY;
 
   // --- storage (mutually exclusive) ---
   private byte[] tinyData;
@@ -165,14 +163,6 @@ public final class CacheEntry {
 
   void setGroupId(long groupId) {
     this.groupId = groupId;
-  }
-
-  public TrackingId trackingId() {
-    return trackingId;
-  }
-
-  void setTrackingId(TrackingId trackingId) {
-    this.trackingId = trackingId;
   }
 
   // --- size / data -----------------------------------------------------------
@@ -269,7 +259,6 @@ public final class CacheEntry {
     freeData();
     clearKey();
     groupId = 0;
-    trackingId = TrackingId.EMPTY;
     accessStats.reset();
     isPrefetch = false;
     FIRST_USE.setVolatile(this, false);

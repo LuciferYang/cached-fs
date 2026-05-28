@@ -25,8 +25,8 @@ import java.util.Objects;
 import java.util.function.LongSupplier;
 
 /**
- * Micrometer {@link MeterBinder} that exposes cached-fs counters and gauges to any
- * {@link MeterRegistry} (Prometheus, JMX, statsd, etc.). Wire once after {@code
+ * Micrometer {@link MeterBinder} that exposes cached-fs counters and gauges to any {@link
+ * MeterRegistry} (Prometheus, JMX, statsd, etc.). Wire once after {@code
  * CacheBootstrap.installIfNeeded} and the registry will pick up every cumulative counter as a
  * {@link FunctionCounter} (correct semantics for derived rates) and every point-in-time value as a
  * {@link Gauge}.
@@ -59,7 +59,9 @@ public final class CachedFsMeterBinder implements MeterBinder {
 
   private static final String PREFIX = "cached_fs.";
 
-  /** Fixed reason set; mirrors IoStatistics.PREFETCH_SKIPPED_REASONS so tag cardinality is bounded. */
+  /**
+   * Fixed reason set; mirrors IoStatistics.PREFETCH_SKIPPED_REASONS so tag cardinality is bounded.
+   */
   private static final String[] PREFETCH_SKIPPED_REASONS = {
     "queue_full", "budget", "heap_pressure", "other"
   };
@@ -69,6 +71,7 @@ public final class CachedFsMeterBinder implements MeterBinder {
   private final AggregatedIoStatistics agg;
   private final LongSupplier scanTrackerEntries;
   private final LongSupplier scanTrackerMaxEntries;
+  private final LongSupplier scanTrackerEntriesRejected;
   private final LongSupplier pendingPrefetchBytes;
   private final LongSupplier maxPendingPrefetchBytes;
 
@@ -76,11 +79,13 @@ public final class CachedFsMeterBinder implements MeterBinder {
       AggregatedIoStatistics agg,
       LongSupplier scanTrackerEntries,
       LongSupplier scanTrackerMaxEntries,
+      LongSupplier scanTrackerEntriesRejected,
       LongSupplier pendingPrefetchBytes,
       LongSupplier maxPendingPrefetchBytes) {
     this.agg = Objects.requireNonNull(agg, "AggregatedIoStatistics");
     this.scanTrackerEntries = scanTrackerEntries;
     this.scanTrackerMaxEntries = scanTrackerMaxEntries;
+    this.scanTrackerEntriesRejected = scanTrackerEntriesRejected;
     this.pendingPrefetchBytes = pendingPrefetchBytes;
     this.maxPendingPrefetchBytes = maxPendingPrefetchBytes;
   }
@@ -95,9 +100,12 @@ public final class CachedFsMeterBinder implements MeterBinder {
     // Cumulative counts → FunctionCounter so derived rates (rate(cached_fs_read_total[1m])) work.
     counter(registry, "read.total", "read operations served", agg, AggregatedIoStatistics::read);
     counter(
-        registry, "read.bytes", "bytes returned to consumer", agg, AggregatedIoStatistics::readBytes);
-    counter(
-        registry, "ram.hit.total", "RAM-tier cache hits", agg, AggregatedIoStatistics::ramHit);
+        registry,
+        "read.bytes",
+        "bytes returned to consumer",
+        agg,
+        AggregatedIoStatistics::readBytes);
+    counter(registry, "ram.hit.total", "RAM-tier cache hits", agg, AggregatedIoStatistics::ramHit);
     counter(
         registry,
         "ram.hit.bytes",
@@ -118,11 +126,7 @@ public final class CachedFsMeterBinder implements MeterBinder {
         agg,
         AggregatedIoStatistics::prefetch);
     counter(
-        registry,
-        "prefetch.bytes",
-        "bytes prefetched",
-        agg,
-        AggregatedIoStatistics::prefetchBytes);
+        registry, "prefetch.bytes", "bytes prefetched", agg, AggregatedIoStatistics::prefetchBytes);
     counter(
         registry,
         "raw.overread.bytes",
@@ -157,9 +161,7 @@ public final class CachedFsMeterBinder implements MeterBinder {
     // Tag-keyed prefetch-skipped reason buckets. Bounded reason set keeps cardinality predictable.
     for (String reason : PREFETCH_SKIPPED_REASONS) {
       FunctionCounter.builder(
-              PREFIX + "prefetch.skipped.bytes",
-              agg,
-              a -> (double) a.prefetchSkipped(reason))
+              PREFIX + "prefetch.skipped.bytes", agg, a -> (double) a.prefetchSkipped(reason))
           .description("bytes the prefetch admission gate skipped, tagged by reason")
           .tag("reason", reason)
           .baseUnit("bytes")
@@ -178,6 +180,11 @@ public final class CachedFsMeterBinder implements MeterBinder {
         "scan_tracker.max_entries",
         "max ScanTracker entries observed since install",
         scanTrackerMaxEntries);
+    gauge(
+        registry,
+        "scan_tracker.entries_rejected",
+        "recordReference/recordRead calls dropped because the per-tracker entry cap was hit",
+        scanTrackerEntriesRejected);
     gauge(
         registry,
         "prefetch.pending.bytes",
@@ -211,6 +218,7 @@ public final class CachedFsMeterBinder implements MeterBinder {
     private final AggregatedIoStatistics agg;
     private LongSupplier scanTrackerEntries = ZERO;
     private LongSupplier scanTrackerMaxEntries = ZERO;
+    private LongSupplier scanTrackerEntriesRejected = ZERO;
     private LongSupplier pendingPrefetchBytes = ZERO;
     private LongSupplier maxPendingPrefetchBytes = ZERO;
 
@@ -225,6 +233,11 @@ public final class CachedFsMeterBinder implements MeterBinder {
 
     public Builder scanTrackerMaxEntries(LongSupplier supplier) {
       this.scanTrackerMaxEntries = Objects.requireNonNull(supplier);
+      return this;
+    }
+
+    public Builder scanTrackerEntriesRejected(LongSupplier supplier) {
+      this.scanTrackerEntriesRejected = Objects.requireNonNull(supplier);
       return this;
     }
 
@@ -243,6 +256,7 @@ public final class CachedFsMeterBinder implements MeterBinder {
           agg,
           scanTrackerEntries,
           scanTrackerMaxEntries,
+          scanTrackerEntriesRejected,
           pendingPrefetchBytes,
           maxPendingPrefetchBytes);
     }

@@ -152,6 +152,19 @@ public final class CachedFsConfig {
   public static final boolean DEFAULT_SCAN_TRACKER_ENABLED = true;
 
   /**
+   * {@code fs.cached.scan-tracker.max-entries-per-tracker} — soft cap on the distinct fileNums one
+   * {@link io.github.luciferyang.cachedfs.core.tracker.ScanTracker} will admit before silently
+   * rejecting new entries. {@code 0} (or negative) disables the cap; default {@code 10_000} matches
+   * the threshold called out in reader-glue follow-up R3. Sized so a single ~50k-file partitioned
+   * scan exposes the cap (observable via {@link CacheBootstrap#scanTrackerEntriesRejected()}) and
+   * operators choose between widening the cap and splitting the scan.
+   */
+  public static final String SCAN_TRACKER_MAX_ENTRIES_PER_TRACKER =
+      "fs.cached.scan-tracker.max-entries-per-tracker";
+
+  public static final int DEFAULT_SCAN_TRACKER_MAX_ENTRIES_PER_TRACKER = 10_000;
+
+  /**
    * {@code fs.cached.metrics.enabled} — master toggle for per-stream {@link
    * io.github.luciferyang.cachedfs.core.stats.IoStatistics}; default {@code true}. When false,
    * streams are constructed with {@code IoStatistics.NO_OP}.
@@ -333,6 +346,13 @@ public final class CachedFsConfig {
       throw new IllegalArgumentException(LOAD_QUANTUM_BYTES + " must be > 0: " + v);
     }
     return v;
+  }
+
+  public static int scanTrackerMaxEntriesPerTracker(Configuration conf) {
+    int v =
+        conf.getInt(
+            SCAN_TRACKER_MAX_ENTRIES_PER_TRACKER, DEFAULT_SCAN_TRACKER_MAX_ENTRIES_PER_TRACKER);
+    return Math.max(0, v); // negative → unlimited; clamp at 0 to be defensive
   }
 
   public static boolean scanTrackerEnabled(Configuration conf) {

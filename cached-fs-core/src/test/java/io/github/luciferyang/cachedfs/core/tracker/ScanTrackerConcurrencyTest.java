@@ -32,7 +32,7 @@ class ScanTrackerConcurrencyTest {
   @DisplayName("8 threads × 1M recordReference: no lost updates under CAS-loop storage")
   void recordReferenceNoLostUpdates() throws InterruptedException {
     ScanTracker tracker = new ScanTracker("scan-concurrency", 8 << 20);
-    TrackingId id = TrackingId.of(42, 0);
+    long id = 42L;
     int threads = 8;
     int iterations = 1_000_000;
 
@@ -69,7 +69,7 @@ class ScanTrackerConcurrencyTest {
       "8 writer threads + 1 reader thread: adjustedReadPct never observes negative under concurrent updates")
   void snapshotMonotonicityUnderContention() throws InterruptedException {
     ScanTracker tracker = new ScanTracker("scan-snapshot", 8 << 20);
-    TrackingId id = TrackingId.of(7, 1);
+    long id = 7L;
     int writers = 8;
     int writeIterations = 50_000;
     AtomicLong negativeObservations = new AtomicLong();
@@ -123,7 +123,7 @@ class ScanTrackerConcurrencyTest {
   @DisplayName("DISABLED tracker no-ops on recordReference/recordRead and returns EMPTY snapshot")
   void disabledTrackerNoOps() {
     ScanTracker disabled = ScanTracker.DISABLED;
-    TrackingId id = TrackingId.of(0, 0);
+    long id = 0L;
 
     disabled.recordReference(id, 1_000);
     disabled.recordRead(id, 500);
@@ -134,25 +134,21 @@ class ScanTrackerConcurrencyTest {
   }
 
   @Test
-  @DisplayName("size() reflects distinct (TrackingId) entries; increments only on first record")
+  @DisplayName("size() reflects distinct fileNum entries; increments only on first record")
   void sizeReflectsDistinctEntries() {
     ScanTracker tracker = new ScanTracker("scan-size", 8 << 20);
     assertThat(tracker.size()).isZero();
 
-    TrackingId a = TrackingId.of(1, 0);
-    TrackingId b = TrackingId.of(2, 0);
+    long a = 1L;
+    long b = 2L;
 
     tracker.recordReference(a, 100);
     assertThat(tracker.size()).isEqualTo(1);
 
     tracker.recordRead(a, 50);
-    assertThat(tracker.size()).isEqualTo(1); // same id, no new entry
+    assertThat(tracker.size()).isEqualTo(1); // same fileNum, no new entry
 
     tracker.recordReference(b, 100);
-    assertThat(tracker.size()).isEqualTo(2);
-
-    // EMPTY ids must NOT create entries.
-    tracker.recordReference(TrackingId.EMPTY, 100);
     assertThat(tracker.size()).isEqualTo(2);
   }
 }

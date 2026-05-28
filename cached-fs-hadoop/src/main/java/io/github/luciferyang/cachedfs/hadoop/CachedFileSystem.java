@@ -22,8 +22,6 @@ import io.github.luciferyang.cachedfs.core.id.StringIdMap;
 import io.github.luciferyang.cachedfs.core.io.ReadFile;
 import io.github.luciferyang.cachedfs.core.stats.IoStatistics;
 import io.github.luciferyang.cachedfs.core.tracker.ScanTracker;
-import io.github.luciferyang.cachedfs.core.tracker.TrackingId;
-import io.github.luciferyang.cachedfs.core.util.Murmur3;
 import java.io.IOException;
 import java.net.URI;
 import org.apache.hadoop.conf.Configuration;
@@ -214,11 +212,6 @@ public class CachedFileSystem extends FilterFileSystem {
           CachedFsConfig.scanTrackerEnabled(conf) ? b.trackerFor(scanId) : ScanTracker.DISABLED;
       IoStatistics ioStats =
           CachedFsConfig.metricsEnabled(conf) ? new IoStatistics() : IoStatistics.NO_OP;
-      // per-(scanId, fileNumHash) TrackingId: Murmur3.fmix32 distributes sequential StringIdMap
-      // ids uniformly across the 29-bit bucket space (a raw xor-fold would collide-zero until
-      // ids exceed 2^29).
-      int fileNumNode = Murmur3.fmix32((int) ptr.value().fileNum()) & ((1 << 29) - 1);
-      TrackingId trackingId = TrackingId.of(fileNumNode, 0);
       // capture coalesce knobs at open time. Auto-disable on small caches per the
       // coalesce.enabled resolver (cap==2 AND always-on=false → off). totalRamBytes proxies via
       // the JVM heap budget — AsyncDataCache has no fixed capacity getter today; for the
@@ -244,7 +237,6 @@ public class CachedFileSystem extends FilterFileSystem {
               b.ramCache(),
               b.loadQuantumBytes(),
               tracker,
-              trackingId,
               ioStats,
               b.aggregateIoStats(),
               coalesceEnabled,

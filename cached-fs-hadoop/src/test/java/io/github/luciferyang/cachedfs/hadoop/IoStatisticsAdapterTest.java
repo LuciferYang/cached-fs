@@ -98,8 +98,7 @@ class IoStatisticsAdapterTest {
 
     // Drive a couple of bootstrap-level signals.
     b.aggregateIoStats().incStaleScanIdRecoveries();
-    b.trackerFor("scan-A")
-        .recordReference(io.github.luciferyang.cachedfs.core.tracker.TrackingId.of(1, 0), 4096);
+    b.trackerFor("scan-A").recordReference(1L, 4096);
 
     // Merge a stream that exercises every per-stream counter so the aggregate side has non-zero
     // values to scrape — verifies both the name AND the wiring through AggregatedIoStatistics.add.

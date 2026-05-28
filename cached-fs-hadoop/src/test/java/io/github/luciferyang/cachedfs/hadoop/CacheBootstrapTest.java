@@ -267,9 +267,9 @@ class CacheBootstrapTest {
 
     var a = b.trackerFor("scan-A");
     var c = b.trackerFor("scan-C");
-    a.recordReference(io.github.luciferyang.cachedfs.core.tracker.TrackingId.of(1, 0), 100);
-    a.recordReference(io.github.luciferyang.cachedfs.core.tracker.TrackingId.of(2, 0), 100);
-    c.recordReference(io.github.luciferyang.cachedfs.core.tracker.TrackingId.of(3, 0), 100);
+    a.recordReference(1L, 100);
+    a.recordReference(2L, 100);
+    c.recordReference(3L, 100);
 
     assertThat(b.scanTrackerEntries()).isEqualTo(3); // 2 + 1
     assertThat(b.scanTrackerMaxEntries()).isEqualTo(2); // max(2, 1)
@@ -313,8 +313,7 @@ class CacheBootstrapTest {
   }
 
   @Test
-  @DisplayName(
-      "installIfNeeded rollback shuts the prefetch executor down on a late-stage failure")
+  @DisplayName("installIfNeeded rollback shuts the prefetch executor down on a late-stage failure")
   void installRollbackShutsDownPrefetchExecutor() {
     // Force prefetchHeapPressureTtlMs(conf) to throw IAE — that call runs AFTER the prefetch
     // executor has already been created (CacheBootstrap.installIfNeeded line ~250). Without
@@ -348,7 +347,8 @@ class CacheBootstrapTest {
     // a future code path that prestarts core threads prior to the failure point.
     java.util.Set<String> after = liveCachedFsPrefetchThreadNames();
     after.removeAll(before);
-    assertThat(after).as("no cached-fs-prefetch-* threads should leak across the rollback")
+    assertThat(after)
+        .as("no cached-fs-prefetch-* threads should leak across the rollback")
         .isEmpty();
 
     // A retry with a valid conf must succeed — proves no orphan singleton/registry state

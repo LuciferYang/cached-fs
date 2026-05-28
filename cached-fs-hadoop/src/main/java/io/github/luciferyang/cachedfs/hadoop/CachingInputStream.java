@@ -27,7 +27,6 @@ import io.github.luciferyang.cachedfs.core.io.ReadFile;
 import io.github.luciferyang.cachedfs.core.stats.AggregatedIoStatistics;
 import io.github.luciferyang.cachedfs.core.stats.IoStatistics;
 import io.github.luciferyang.cachedfs.core.tracker.ScanTracker;
-import io.github.luciferyang.cachedfs.core.tracker.TrackingId;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.invoke.MethodHandles;
@@ -66,11 +65,10 @@ public final class CachingInputStream extends InputStream
   private final long fileSize;
   private final long fileNum;
 
-  // per-(scanId, file) density tracker + packed TrackingId + per-stream IO counters.
-  // Aggregate sink is the bootstrap-level AggregatedIoStatistics; merged exactly once on close()
-  // via the `aggregated` AtomicBoolean to keep close() idempotent.
+  // per-(scanId, fileNum) density tracker keyed by the existing `fileNum` field above + per-stream
+  // IO counters. Aggregate sink is the bootstrap-level AggregatedIoStatistics; merged exactly once
+  // on close() via the `aggregated` AtomicBoolean to keep close() idempotent.
   private final ScanTracker tracker;
-  private final TrackingId trackingId;
   private final IoStatistics ioStats;
   private final AggregatedIoStatistics aggregateIoStats;
   private final AtomicBoolean aggregated = new AtomicBoolean();
@@ -143,7 +141,6 @@ public final class CachingInputStream extends InputStream
       AsyncDataCache cache,
       int loadQuantum,
       ScanTracker tracker,
-      TrackingId trackingId,
       IoStatistics ioStats,
       AggregatedIoStatistics aggregateIoStats,
       boolean coalesceEnabled,
@@ -167,7 +164,6 @@ public final class CachingInputStream extends InputStream
     }
     this.fileNum = handle.fileNum();
     this.tracker = tracker;
-    this.trackingId = trackingId;
     this.ioStats = ioStats;
     this.aggregateIoStats = aggregateIoStats;
     this.coalesceEnabled = coalesceEnabled;
@@ -408,7 +404,7 @@ public final class CachingInputStream extends InputStream
     // Resolve resource gate + density predicate independently and accumulate observability
     // counters per failed predicate. Submitting requires BOTH to pass.
     AdmissionResult adm = admissionGate(nextChunkSize);
-    boolean densityPass = tracker.data(trackingId).readPct() >= densityThresholdPct;
+    boolean densityPass = tracker.data(fileNum).readPct() >= densityThresholdPct;
 
     if (adm.admit() && densityPass) {
       submitPrefetch(nextChunkStart, nextChunkSize);
@@ -663,9 +659,9 @@ public final class CachingInputStream extends InputStream
    */
   private void readFullyFromCache(long pos, byte[] dst, int off, int length) throws IOException {
     // record top-of-call signals BEFORE issuing IO so a throw mid-read still reflects
-    // the planned reference. recordReference is a no-op on ScanTracker.DISABLED and on
-    // TrackingId.EMPTY; incRead is a no-op on IoStatistics.NO_OP.
-    tracker.recordReference(trackingId, length);
+    // the planned reference. recordReference is a no-op on ScanTracker.DISABLED;
+    // incRead is a no-op on IoStatistics.NO_OP.
+    tracker.recordReference(fileNum, length);
     ioStats.incRead(length);
 
     // if the read crosses 2+ chunks AND coalescing is enabled, attempt the coalesce
@@ -679,7 +675,7 @@ public final class CachingInputStream extends InputStream
       for (int restart = 0; restart <= coalesceMaxRestarts; restart++) {
         CoalesceOutcome outcome = readCoalesced(pos, dst, off, length, firstChunkStart, chunkCount);
         if (outcome == CoalesceOutcome.OK) {
-          tracker.recordRead(trackingId, length);
+          tracker.recordRead(fileNum, length);
           return;
         }
         // RESTART: pins released, waited-on future completed; loop and try again.
@@ -706,7 +702,7 @@ public final class CachingInputStream extends InputStream
     // Bottom-of-call: bytes actually consumed equal `length` (we always satisfy the whole
     // request via the loop or throw). recordRead drives readPct() / adjustedReadPct() in the
     // tracker; the prefetch admission gate reads those values to gate prefetch.
-    tracker.recordRead(trackingId, length);
+    tracker.recordRead(fileNum, length);
   }
 
   // --- coalesce path -------------------------------------------

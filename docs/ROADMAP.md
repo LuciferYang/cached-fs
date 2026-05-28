@@ -16,7 +16,9 @@ Status legend:
 | # | Item | Module | Status | Notes |
 | --- | --- | --- | --- | --- |
 | M1 | `cached-fs-metrics` — ship Micrometer/JMX bridges for `IoStatistics` + `AggregatedIoStatistics` + `ScanTracker` gauges. | `cached-fs-metrics` | 🟢 Done | Initial `CachedFsMeterBinder` with cumulative `FunctionCounter`s + supplier-driven gauges; 5 unit tests covering registration, live updates, reason-tag cardinality, and partial wiring. Latency counters NOT yet bound — needs latency getters on `AggregatedIoStatistics` (deferred). |
-| M2 | Per-`(scanId, fileNum)` tracker keying — needs Spark workloads producing real `scanId`s. Now testable end-to-end against `CachedFsAffinityIT`. | `cached-fs-core` + `cached-fs-spark` | 🔵 Planned | Precondition met by `cached-fs-spark` shipping. Needs design doc before implementation (where does `scanId` come from in Spark planner?). |
+| M2 | Per-`(scanId, fileNum)` tracker keying — drop the 29-bit `fileNumNode` hash, key `ScanTracker.data` by raw `long fileNum`. Eliminates birthday-paradox file-vs-file density contamination above ~33k files per scan. | `cached-fs-core` + `cached-fs-hadoop` | 🟢 Done | Design at `docs/m2-design.md`. `TrackingId` deleted entirely (zero external callers); `ScanTracker` retyped to `ConcurrentMap<Long, …>`; `CacheEntry.trackingId` dead field also removed. Collision-regression test pins the fix. |
+| M2.1 | Spark-side scanId production — wire `fs.cached.scan-id` per Spark stage/partition so concurrent queries on the same JVM no longer collapse to the `"default"` scanId. | `cached-fs-spark` | 🔵 Planned | Today every Spark task collapses to `"default"`. Listener/extension already wires; needs a `TaskContext`-driven scanId derivation + a `withScanId` scope on read open. M2 made the storage side independently valuable; M2.1 unlocks the inter-query isolation. |
+| R3 | Cap per-`ScanTracker` inner map at 10k entries so the per-file keying from M2 doesn't blow memory on 50k-file scans. | `cached-fs-core` + `cached-fs-hadoop` | 🟢 Done | New `fs.cached.scan-tracker.max-entries-per-tracker` (default 10_000). Cap-overflow surfaces via `CacheBootstrap.scanTrackerEntriesRejected()` and the `cached_fs.scan_tracker.entries_rejected` gauge. Soft cap: race-window overshoot bounded by concurrent puts. |
 | M3 | `cached-fs-cli` — Picocli-driven ops tool. Likely subcommands: `inspect <path>`, `stats --window`, `drain`, `purge --pattern`. Today the module is a pom-only stub. | `cached-fs-cli` | 🔵 Planned | Picocli 4.7.6 already in parent dependencyManagement. Acceptance criteria TBD; minimum is `inspect` + `stats`. |
 
 ## Reader-glue follow-ups (from `docs/reader-glue/followups.md`)
@@ -25,7 +27,7 @@ Status legend:
 | --- | --- | --- | --- |
 | R1 | Replace `loadQuantum × threads × 4` admission denominator with a workload-measured value | ⚪ Deferred | Needs a workload microbenchmark first; no current benchmark harness in the repo. |
 | R2 | Cap `bootstrap.scanTrackers` when `size() > 10_000` in any 24h window | ⚪ Deferred | Observability trigger: only act when production metrics show the gauge crosses the threshold. |
-| R3 | Cap per-`ScanTracker` inner `TrackingData` map at 10k entries | ⚪ Deferred | Same as R2 — gauge-driven (`ScanTracker.size()`). |
+| R3 | Cap per-`ScanTracker` inner `TrackingData` map at 10k entries | 🟢 Done | Shipped alongside M2 (see Modules table above). |
 | R4 | `IoStatistics` ring-buffer of recent N streams for debugging | ⚪ Deferred | Debugging convenience; not blocking any feature. |
 
 ## Known limitations (README `### Limitations`)

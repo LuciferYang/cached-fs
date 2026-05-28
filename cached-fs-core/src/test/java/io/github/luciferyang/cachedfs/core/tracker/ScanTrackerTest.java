@@ -16,7 +16,6 @@
 package io.github.luciferyang.cachedfs.core.tracker;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -27,19 +26,19 @@ class ScanTrackerTest {
   @DisplayName("readPct reflects ratio")
   void readPctReflectsRatio() {
     ScanTracker t = new ScanTracker("scan-1", 8 << 20);
-    TrackingId col = TrackingId.of(0, 1);
-    t.recordReference(col, 1000);
-    t.recordRead(col, 800);
-    assertThat(t.readPct(col)).isEqualTo(80);
+    long fileNum = 42L;
+    t.recordReference(fileNum, 1000);
+    t.recordRead(fileNum, 800);
+    assertThat(t.readPct(fileNum)).isEqualTo(80);
   }
 
   @Test
   @DisplayName("readPct on unreferenced stream returns 100 (admit prefetch — matches velox)")
   void readPctEmptyAdmitsPrefetch() {
     ScanTracker t = new ScanTracker("scan-1b", 8 << 20);
-    TrackingId col = TrackingId.of(0, 2);
+    long fileNum = 99L;
     // No recordReference yet; data() returns the EMPTY snapshot whose readPct must be 100.
-    assertThat(t.data(col).readPct()).isEqualTo(100);
+    assertThat(t.data(fileNum).readPct()).isEqualTo(100);
     assertThat(TrackingData.EMPTY.readPct()).isEqualTo(100);
   }
 
@@ -47,72 +46,92 @@ class ScanTrackerTest {
   @DisplayName("first stripe adjustedReadPct is zero")
   void firstStripeAdjustedReadPctIsZero() {
     ScanTracker t = new ScanTracker("scan-2", 8 << 20);
-    TrackingId col = TrackingId.of(0, 1);
-    t.recordReference(col, 1000);
-    assertThat(t.data(col).adjustedReadPct()).isZero();
+    long fileNum = 7L;
+    t.recordReference(fileNum, 1000);
+    assertThat(t.data(fileNum).adjustedReadPct()).isZero();
 
-    t.recordRead(col, 1000);
-    t.recordReference(col, 500);
+    t.recordRead(fileNum, 1000);
+    t.recordReference(fileNum, 500);
     // denominator = 1500 - 500 = 1000; readBytes = 1000; pct = 100
-    assertThat(t.data(col).adjustedReadPct()).isEqualTo(100);
-  }
-
-  @Test
-  @DisplayName("empty TrackingId is silently ignored")
-  void emptyIdIsIgnored() {
-    ScanTracker t = new ScanTracker("scan-3", 8 << 20);
-    t.recordReference(TrackingId.EMPTY, 1000);
-    t.recordRead(TrackingId.EMPTY, 1000);
-    assertThat(t.data(TrackingId.EMPTY)).isEqualTo(TrackingData.EMPTY);
-  }
-
-  @Test
-  @DisplayName("TrackingId bit packing roundtrips (29-bit node, 2-bit streamKind)")
-  void trackingIdBitPacking() {
-    TrackingId id = TrackingId.of(12345, 3);
-    assertThat(id.node()).isEqualTo(12345);
-    assertThat(id.streamKind()).isEqualTo(3);
-    assertThat(TrackingId.EMPTY.isEmpty()).isTrue();
-  }
-
-  @Test
-  @DisplayName("TrackingId max node value (2^29 - 1) packs and unpacks")
-  void trackingIdMaxNode() {
-    int maxNode = (1 << 29) - 1;
-    TrackingId id = TrackingId.of(maxNode, 0);
-    assertThat(id.id()).isEqualTo(maxNode << 2);
-    assertThat(id.node()).isEqualTo(maxNode);
-    assertThat(id.streamKind()).isZero();
-  }
-
-  @Test
-  @DisplayName("TrackingId rejects out-of-range node and streamKind")
-  void trackingIdRejectsOutOfRange() {
-    assertThatThrownBy(() -> TrackingId.of(1 << 29, 0))
-        .isInstanceOf(IllegalArgumentException.class);
-    assertThatThrownBy(() -> TrackingId.of(0, 4)).isInstanceOf(IllegalArgumentException.class);
-    assertThatThrownBy(() -> TrackingId.of(-1, 0)).isInstanceOf(IllegalArgumentException.class);
-  }
-
-  @Test
-  @DisplayName("node()/streamKind() throw on EMPTY sentinel")
-  void emptyNodeAndStreamKindThrow() {
-    assertThatThrownBy(TrackingId.EMPTY::node).isInstanceOf(IllegalStateException.class);
-    assertThatThrownBy(TrackingId.EMPTY::streamKind).isInstanceOf(IllegalStateException.class);
+    assertThat(t.data(fileNum).adjustedReadPct()).isEqualTo(100);
   }
 
   @Test
   @DisplayName("data() returns immutable snapshot")
   void dataIsImmutableSnapshot() {
     ScanTracker t = new ScanTracker("scan-4", 8 << 20);
-    TrackingId col = TrackingId.of(1, 2);
-    t.recordReference(col, 100);
-    t.recordRead(col, 50);
-    TrackingData snap1 = t.data(col);
-    t.recordRead(col, 50);
-    TrackingData snap2 = t.data(col);
+    long fileNum = 12345L;
+    t.recordReference(fileNum, 100);
+    t.recordRead(fileNum, 50);
+    TrackingData snap1 = t.data(fileNum);
+    t.recordRead(fileNum, 50);
+    TrackingData snap2 = t.data(fileNum);
     // snap1 is a record - cannot mutate. snap2 reflects the new total.
     assertThat(snap1.readBytes()).isEqualTo(50);
     assertThat(snap2.readBytes()).isEqualTo(100);
+  }
+
+  @Test
+  @DisplayName("DISABLED tracker is a no-op")
+  void disabledTrackerIsNoOp() {
+    ScanTracker.DISABLED.recordReference(1L, 1000);
+    ScanTracker.DISABLED.recordRead(1L, 500);
+    assertThat(ScanTracker.DISABLED.data(1L)).isEqualTo(TrackingData.EMPTY);
+    assertThat(ScanTracker.DISABLED.size()).isZero();
+  }
+
+  @Test
+  @DisplayName(
+      "different fileNums whose old 29-bit fileNumNode hash would collide are tracked independently"
+          + " — defends against the regression M2 fixes")
+  void distinctFileNumsAreTrackedIndependently() {
+    // Two longs that differ ONLY in their high 32 bits AND in the high 3 bits of the low 32 —
+    // the legacy `(fileNum ^ (fileNum >>> 32)) & ((1L << 29) - 1)` collapsed both to the same
+    // 29-bit fileNumNode bucket. With raw fileNum keying they are now distinct.
+    long fileA = 0x0000_0000_1234_5678L;
+    // Flip a bit that lives outside the 29-bit window of the legacy fold so the hashes match.
+    long fileB = fileA ^ (1L << 32);
+    assertThat(fileA).isNotEqualTo(fileB);
+
+    ScanTracker t = new ScanTracker("scan-collision", 8 << 20);
+    t.recordReference(fileA, 1000);
+    t.recordRead(fileA, 800);
+    t.recordReference(fileB, 2000);
+    t.recordRead(fileB, 200);
+
+    assertThat(t.data(fileA).readPct()).isEqualTo(80);
+    assertThat(t.data(fileB).readPct()).isEqualTo(10);
+    assertThat(t.size()).isEqualTo(2);
+    assertThat(t.entriesRejected()).isZero();
+  }
+
+  @Test
+  @DisplayName("maxEntries cap silently rejects new fileNums past the cap; existing entries grow")
+  void maxEntriesCapRejectsNewEntries() {
+    ScanTracker t = new ScanTracker("scan-cap", 8 << 20, /* maxEntries= */ 2);
+    t.recordReference(1L, 100);
+    t.recordReference(2L, 200);
+    // Cap reached. fileNum 3 is a new entry → rejected.
+    t.recordReference(3L, 300);
+    assertThat(t.size()).isEqualTo(2);
+    assertThat(t.entriesRejected()).isEqualTo(1L);
+    assertThat(t.data(3L)).isEqualTo(TrackingData.EMPTY);
+    // Existing entry continues to grow even after the cap is hit.
+    t.recordRead(1L, 50);
+    assertThat(t.data(1L).readBytes()).isEqualTo(50);
+    // Both record paths increment entriesRejected for new-fileNum calls under the cap.
+    t.recordRead(4L, 400);
+    assertThat(t.entriesRejected()).isEqualTo(2L);
+  }
+
+  @Test
+  @DisplayName("maxEntries=0 means unlimited (legacy behavior)")
+  void maxEntriesZeroIsUnlimited() {
+    ScanTracker t = new ScanTracker("scan-no-cap", 8 << 20, /* maxEntries= */ 0);
+    for (long i = 0; i < 100; i++) {
+      t.recordReference(i, 10);
+    }
+    assertThat(t.size()).isEqualTo(100);
+    assertThat(t.entriesRejected()).isZero();
   }
 }

@@ -64,6 +64,7 @@ All keys live under the `fs.cached.*` namespace; the first `installIfNeeded` cal
 | `fs.cached.handle-cache-capacity` | `1024` | Open-handle LRU capacity (per JVM, shared across schemes). |
 | `fs.cached.scan-id` | — | Optional scan identifier used by the per-`(scanId, file)` density tracker; resolved at `open()` time as `withScanId` ThreadLocal → this key → `"default"`. |
 | `fs.cached.scan-tracker.enabled` | `true` | When false, the tracker behaves as a no-op `ScanTracker.DISABLED`; `readPct()` returns 100% and the prefetch admission gate's density predicate always passes. |
+| `fs.cached.scan-tracker.max-entries-per-tracker` | `10000` | Soft cap on the distinct `fileNum`s one `ScanTracker` will admit. New fileNums past the cap silently no-op and bump `CacheBootstrap.scanTrackerEntriesRejected()` (and the `cached_fs.scan_tracker.entries_rejected` gauge). `0` or negative disables the cap. Memory cost is ~40 bytes per entry; the default fits a 10k-file scan with no rejections. |
 | `fs.cached.metrics.enabled` | `true` | When false, `IoStatistics.NO_OP` is wired into every stream — counter bumps short-circuit and the Hadoop `IOStatistics` surface returns zeros. |
 | `fs.cached.coalesce.enabled` | `true` | Coalesce contiguous missing chunks issued by a single read into one `preadv` call against the inner FS. |
 | `fs.cached.coalesce.always-on` | `false` | Bypass the auto-disable rule (which turns coalesce off on caches smaller than 8×`loadQuantum`). Set to `true` for unit / IT scenarios that use tiny caches. |

@@ -62,11 +62,11 @@ final class PrefetchExecutorFactory {
 
   /**
    * Test-only handle to the most recently constructed prefetch executor. Lets a test that
-   * deliberately triggers a late-stage install failure assert {@code isShutdown()} on the
-   * orphaned executor — which is otherwise unreachable because the failed-install local goes
-   * out of scope inside the rollback catch. Production code MUST NOT read this — there is no
-   * memory-coherence contract beyond the volatile write, and the field is overwritten on every
-   * subsequent {@link #create} call. Reset to {@code null} between tests.
+   * deliberately triggers a late-stage install failure assert {@code isShutdown()} on the orphaned
+   * executor — which is otherwise unreachable because the failed-install local goes out of scope
+   * inside the rollback catch. Production code MUST NOT read this — there is no memory-coherence
+   * contract beyond the volatile write, and the field is overwritten on every subsequent {@link
+   * #create} call. Reset to {@code null} between tests.
    */
   static volatile ThreadPoolExecutor lastCreatedForTesting;
 

@@ -18,8 +18,8 @@ package io.github.luciferyang.cachedfs.core.tracker;
 /**
  * Immutable snapshot of a stream's per-tracker counters. Mirrors velox {@code TrackingData}.
  *
- * <p>Returned by {@link ScanTracker#data(TrackingId)}. The internal mutable form is held privately
- * inside {@link ScanTracker}.
+ * <p>Returned by {@link ScanTracker#data(long)}. The internal mutable form is held privately inside
+ * {@link ScanTracker}.
  */
 public record TrackingData(long referencedBytes, long lastReferencedBytes, long readBytes) {
 

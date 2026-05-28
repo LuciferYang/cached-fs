@@ -16,13 +16,11 @@
 package io.github.luciferyang.cachedfs.core.util;
 
 /**
- * MurmurHash3 finalizer.
+ * MurmurHash3 32-bit finalizer.
  *
- * <p>Used by {@code fileNumHash} to uniformly distribute sequential file ids (assigned from 0 by
- * {@code StringIdMap}) across the {@link io.github.luciferyang.cachedfs.core.tracker.TrackingId}
- * 29-bit bucket space. A raw xor-fold of a sequential int yields the input unchanged, producing
- * zero collisions until ids exceed 2^29 — the birthday-paradox analysis in the reader-glue plan
- * assumes uniform distribution, which {@code fmix32} provides.
+ * <p>A reusable mixer for any consumer that needs to distribute sequential ints uniformly across a
+ * larger keyspace. cached-fs no longer hashes fileNums (ScanTracker now keys by raw long), so this
+ * utility currently has no internal callers — kept as a general-purpose helper for future use.
  */
 public final class Murmur3 {
 

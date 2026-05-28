@@ -163,6 +163,13 @@ public final class CacheBootstrap {
    */
   private final ConcurrentMap<String, HandleOpener> openersByEndpoint = new ConcurrentHashMap<>();
 
+  /**
+   * Per-{@link ScanTracker} cap on distinct fileNums; mirrors {@link
+   * CachedFsConfig#SCAN_TRACKER_MAX_ENTRIES_PER_TRACKER}. Passed to every {@link ScanTracker}
+   * constructed by {@link #trackerFor(String)}.
+   */
+  private final int scanTrackerMaxEntriesPerTracker;
+
   private CacheBootstrap(
       AsyncDataCache ramCache,
       SsdCache ssdCache,
@@ -171,11 +178,13 @@ public final class CacheBootstrap {
       int handleCapacity,
       java.util.concurrent.ThreadPoolExecutor prefetchExecutor,
       long maxPendingPrefetchBytes,
-      long heapPressureTtlNs) {
+      long heapPressureTtlNs,
+      int scanTrackerMaxEntriesPerTracker) {
     this.ramCache = ramCache;
     this.ssdCache = ssdCache;
     this.stringIds = stringIds;
     this.loadQuantumBytes = loadQuantumBytes;
+    this.scanTrackerMaxEntriesPerTracker = scanTrackerMaxEntriesPerTracker;
     // FileHandleFactory's generator captures `this` so it can route each key through the registry.
     this.handleFactory = new FileHandleFactory(handleCapacity, this::dispatchOpen);
     // TTL controller is always constructed; embedders opt in by calling applyTTL externally.
@@ -252,6 +261,7 @@ public final class CacheBootstrap {
         long heapPressureTtlNs =
             java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
                 CachedFsConfig.prefetchHeapPressureTtlMs(conf));
+        int scanTrackerMaxEntriesPerTracker = CachedFsConfig.scanTrackerMaxEntriesPerTracker(conf);
         CacheBootstrap b =
             new CacheBootstrap(
                 ram,
@@ -261,7 +271,8 @@ public final class CacheBootstrap {
                 handleCap,
                 prefetchExec,
                 maxPendingBytes,
-                heapPressureTtlNs);
+                heapPressureTtlNs,
+                scanTrackerMaxEntriesPerTracker);
         // All pieces ready — now publish singletons atomically (w.r.t. LOCK) and commit.
         // Order matters because FileIds has no clearInstance API (test-only singleton):
         // publish AsyncDataCache FIRST so that if FileIds.setInstance somehow throws (it can
@@ -688,7 +699,9 @@ public final class CacheBootstrap {
    */
   public ScanTracker trackerFor(String scanId) {
     String normalized = normalizeScanId(scanId);
-    return scanTrackers.computeIfAbsent(normalized, k -> new ScanTracker(k, this.loadQuantumBytes));
+    return scanTrackers.computeIfAbsent(
+        normalized,
+        k -> new ScanTracker(k, this.loadQuantumBytes, this.scanTrackerMaxEntriesPerTracker));
   }
 
   /**
@@ -706,8 +719,8 @@ public final class CacheBootstrap {
   }
 
   /**
-   * Total {@code TrackingId} entries summed across all live trackers. O(active scans). Used by
-   * tests and a future dynamic gauge.
+   * Total distinct-fileNum entries summed across all live trackers. O(active scans). Used by tests
+   * and the {@code cached_fs.scan_tracker.entries} gauge.
    */
   public long scanTrackerEntries() {
     long total = 0;
@@ -725,6 +738,21 @@ public final class CacheBootstrap {
       if (s > max) max = s;
     }
     return max;
+  }
+
+  /**
+   * Total {@code recordReference}/{@code recordRead} calls summed across all live trackers that
+   * were dropped because the per-tracker entry cap ({@link
+   * CachedFsConfig#SCAN_TRACKER_MAX_ENTRIES_PER_TRACKER}) was hit. A non-zero value means at least
+   * one scan touched more distinct files than the cap allowed; operators can decide whether to
+   * widen the cap or split the scan.
+   */
+  public long scanTrackerEntriesRejected() {
+    long total = 0;
+    for (ScanTracker t : scanTrackers.values()) {
+      total += t.entriesRejected();
+    }
+    return total;
   }
 
   // --- scanId ThreadLocal -------------------------------------

@@ -52,7 +52,8 @@ class CachedFsMeterBinderTest {
     assertThat(registry.get("cached_fs.ssd.read.bytes").functionCounter().count()).isEqualTo(48.0);
     assertThat(registry.get("cached_fs.prefetch.total").functionCounter().count()).isEqualTo(1.0);
     assertThat(registry.get("cached_fs.prefetch.bytes").functionCounter().count()).isEqualTo(96.0);
-    assertThat(registry.get("cached_fs.raw.overread.bytes").functionCounter().count()).isEqualTo(8.0);
+    assertThat(registry.get("cached_fs.raw.overread.bytes").functionCounter().count())
+        .isEqualTo(8.0);
   }
 
   @Test
@@ -90,9 +91,7 @@ class CachedFsMeterBinderTest {
 
     List<Meter> reasonMeters =
         registry.find("cached_fs.prefetch.skipped.bytes").meters().stream().toList();
-    assertThat(reasonMeters)
-        .as("exactly four reason tags — bounded cardinality")
-        .hasSize(4);
+    assertThat(reasonMeters).as("exactly four reason tags — bounded cardinality").hasSize(4);
     assertThat(
             registry
                 .get("cached_fs.prefetch.skipped.bytes")
