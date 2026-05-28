@@ -37,7 +37,7 @@ For multi-scheme caching in the same JVM, give each `FileSystem.get(uri, conf)` 
 
 - `open(Path)`, `open(Path, int)`, and `openFile(Path).build()` all route through the cache. `openFile(PathHandle)` and `open(PathHandle, int)` still delegate to the inner FS — PathHandle's opaque content tag prevents reliable cache keying.
 - `applyTTL(ttlSeconds)` rejects negative values and values larger than the current epoch second.
-- The `cached-fs-cli` module is a pom-only stub today; depending on it gets an empty jar.
+- The `cached-fs-cli` MVP ships `config` (load Hadoop XMLs, validate `fs.cached.*`, dump effective values) and `version`. Live-state subcommands (`inspect`, `stats`, `drain`, `purge`) are deferred until a JMX MBean or RPC endpoint exists for querying a running JVM.
 
 ### Configuration reference
 
