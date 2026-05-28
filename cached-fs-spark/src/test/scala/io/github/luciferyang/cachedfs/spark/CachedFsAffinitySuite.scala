@@ -76,6 +76,25 @@ class CachedFsAffinitySuite extends AnyFunSuite with BeforeAndAfterEach {
     }
   }
 
+  test("listener filters the synthesized \"driver\" executor (local mode) out of the ring") {
+    // Spark's local mode emits a SparkListenerExecutorAdded with executorId=\"driver\" (the
+    // SparkContext.DRIVER_IDENTIFIER literal) for the in-process executor. Adding it to the
+    // affinity ring serves no purpose — the only real cache targets are remote executors. The
+    // listener filters it; this test pins the contract so a future refactor that drops the
+    // filter is caught here rather than as a downstream PROCESS_LOCAL hint targeting "driver".
+    withSparkContext { sc =>
+      val listener = new CachedFsSoftAffinityListener(sc)
+      CachedFsAffinity.configure(true, 2, 1, false, 10000)
+      val mgr = CachedFsSoftAffinityManager.getInstance()
+      listener.onExecutorAdded(
+        SparkListenerExecutorAdded(
+          time = 0L,
+          executorId = "driver",
+          executorInfo = new ExecutorInfo("some-host", totalCores = 4, logUrlMap = Map.empty)))
+      assert(mgr.executorCount() == 0, "driver executor must not enter the affinity ring")
+    }
+  }
+
   test("listener rejects an executor with empty host (would corrupt TaskLocation)") {
     withSparkContext { sc =>
       val listener = new CachedFsSoftAffinityListener(sc)

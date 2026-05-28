@@ -110,6 +110,13 @@ class CachedFsSparkParquetIT {
       CacheBootstrap.uninstallForTesting();
     } catch (java.io.IOException | RuntimeException ignored) {
     }
+    // Symmetric with CachedFsAffinityIT: clear the listener registration even though THIS
+    // IT class never registers the affinity extension. Cheap insurance against a future
+    // refactor that adds extension wiring without remembering to clean the listener slot.
+    try {
+      CachedFsSoftAffinityListener$.MODULE$.resetForTesting();
+    } catch (RuntimeException ignored) {
+    }
   }
 
   @AfterEach
