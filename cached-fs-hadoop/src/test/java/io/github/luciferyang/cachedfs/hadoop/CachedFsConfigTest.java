@@ -28,6 +28,34 @@ import org.junit.jupiter.api.Test;
 class CachedFsConfigTest {
 
   @Test
+  @DisplayName(
+      "prefetch.max-pending-multiplier scales the auto-default budget; explicit"
+          + " .max-pending-bytes overrides")
+  void prefetchMaxPendingMultiplier() {
+    Configuration conf = new Configuration(false);
+    // Default multiplier: 4 → loadQuantum × threads × 4.
+    assertThat(CachedFsConfig.defaultPrefetchMaxPendingBytes(1024, 2)).isEqualTo(8192L);
+    assertThat(CachedFsConfig.prefetchMaxPendingMultiplier(conf)).isEqualTo(4);
+    assertThat(CachedFsConfig.prefetchMaxPendingBytes(conf, 1024, 2)).isEqualTo(8192L);
+
+    // Operator-set multiplier flows through to the auto-default.
+    conf.setInt(CachedFsConfig.PREFETCH_MAX_PENDING_MULTIPLIER, 8);
+    assertThat(CachedFsConfig.prefetchMaxPendingBytes(conf, 1024, 2)).isEqualTo(16384L);
+
+    // Explicit max-pending-bytes wins over the multiplier (back-compat).
+    conf.setLong(CachedFsConfig.PREFETCH_MAX_PENDING_BYTES, 99_999L);
+    assertThat(CachedFsConfig.prefetchMaxPendingBytes(conf, 1024, 2)).isEqualTo(99_999L);
+
+    // Non-positive multiplier rejected with the offending key in the message.
+    Configuration bad = new Configuration(false);
+    bad.setInt(CachedFsConfig.PREFETCH_MAX_PENDING_MULTIPLIER, 0);
+    org.assertj.core.api.Assertions.assertThatThrownBy(
+            () -> CachedFsConfig.prefetchMaxPendingMultiplier(bad))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining(CachedFsConfig.PREFETCH_MAX_PENDING_MULTIPLIER);
+  }
+
+  @Test
   @DisplayName("isEnabled defaults to false; toggled by fs.cached.enabled")
   void enabledToggle() {
     Configuration conf = new Configuration(false);

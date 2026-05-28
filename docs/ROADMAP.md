@@ -26,10 +26,11 @@ Status legend:
 
 | # | Item | Status | Trigger condition |
 | --- | --- | --- | --- |
-| R1 | Replace `loadQuantum × threads × 4` admission denominator with a workload-measured value | ⚪ Deferred | Needs a workload microbenchmark first; no current benchmark harness in the repo. |
-| R2 | Cap `bootstrap.scanTrackers` when `size() > 10_000` in any 24h window | ⚪ Deferred | Observability trigger: only act when production metrics show the gauge crosses the threshold. |
+| R1 | Make the `loadQuantum × threads × N` admission multiplier configurable so ops can tune without code edits. | 🟢 Done | New `fs.cached.prefetch.max-pending-multiplier` (default 4); the auto-default scales with it. Explicit `max-pending-bytes` still wins. R1.1 below tracks the "actually measure and pick a better default" follow-up. |
+| R1.1 | Build a JMH benchmark harness and measure the right multiplier on a representative workload | ⚪ Deferred | No benchmark module in the repo today. Until one exists, R1's configurable knob lets each operator tune empirically — which is better than picking a single guess. |
+| R2 | Cap `bootstrap.scanTrackers` count to prevent unbounded growth | 🟢 Done | New `fs.cached.scan-trackers.max-count` (default 10_000). At cap, `trackerFor` returns `ScanTracker.DISABLED` and bumps `scanTrackersRejected`. Exposed via the `cached_fs.scan_trackers.rejected` gauge. M2.1's per-task scanId production made this newly relevant — a misbehaving plugin path could otherwise leak unbounded trackers. |
 | R3 | Cap per-`ScanTracker` inner `TrackingData` map at 10k entries | 🟢 Done | Shipped alongside M2 (see Modules table above). |
-| R4 | `IoStatistics` ring-buffer of recent N streams for debugging | ⚪ Deferred | Debugging convenience; not blocking any feature. |
+| R4 | `IoStatistics` ring-buffer of recent N streams for debugging | 🟢 Done | New `RecentStreams` lock-free ring on `CacheBootstrap`; `CachingInputStream.close()` pushes per-stream snapshots. Capacity from `fs.cached.recent-streams.capacity` (default 64; 0 → `DISABLED` sentinel). Exposed as `cached_fs.recent_streams.added_total` gauge. |
 
 ## Known limitations (README `### Limitations`)
 

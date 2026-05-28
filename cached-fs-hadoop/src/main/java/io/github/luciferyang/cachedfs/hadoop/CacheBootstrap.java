@@ -170,6 +170,25 @@ public final class CacheBootstrap {
    */
   private final int scanTrackerMaxEntriesPerTracker;
 
+  /**
+   * JVM-wide cap on the number of distinct {@link ScanTracker}s this bootstrap will retain. Once
+   * hit, {@link #trackerFor(String)} returns {@link ScanTracker#DISABLED} for previously-unseen
+   * scanIds and bumps {@link #scanTrackersRejected()}. {@code 0} disables the cap.
+   */
+  private final int scanTrackersMaxCount;
+
+  /** Counter: trackerFor calls rejected because {@link #scanTrackersMaxCount} was hit. */
+  private final java.util.concurrent.atomic.AtomicLong scanTrackersRejectedCount =
+      new java.util.concurrent.atomic.AtomicLong();
+
+  /**
+   * Ring buffer of per-stream {@link
+   * io.github.luciferyang.cachedfs.core.stats.IoStatisticsSnapshot} entries pushed by {@code
+   * CachingInputStream.close()}. Capacity from {@link CachedFsConfig#RECENT_STREAMS_CAPACITY}; uses
+   * the {@code RecentStreams.DISABLED} sentinel when the configured capacity is zero.
+   */
+  private final io.github.luciferyang.cachedfs.core.stats.RecentStreams recentStreams;
+
   private CacheBootstrap(
       AsyncDataCache ramCache,
       SsdCache ssdCache,
@@ -179,12 +198,19 @@ public final class CacheBootstrap {
       java.util.concurrent.ThreadPoolExecutor prefetchExecutor,
       long maxPendingPrefetchBytes,
       long heapPressureTtlNs,
-      int scanTrackerMaxEntriesPerTracker) {
+      int scanTrackerMaxEntriesPerTracker,
+      int scanTrackersMaxCount,
+      int recentStreamsCapacity) {
     this.ramCache = ramCache;
     this.ssdCache = ssdCache;
     this.stringIds = stringIds;
     this.loadQuantumBytes = loadQuantumBytes;
     this.scanTrackerMaxEntriesPerTracker = scanTrackerMaxEntriesPerTracker;
+    this.scanTrackersMaxCount = scanTrackersMaxCount;
+    this.recentStreams =
+        recentStreamsCapacity == 0
+            ? io.github.luciferyang.cachedfs.core.stats.RecentStreams.DISABLED
+            : new io.github.luciferyang.cachedfs.core.stats.RecentStreams(recentStreamsCapacity);
     // FileHandleFactory's generator captures `this` so it can route each key through the registry.
     this.handleFactory = new FileHandleFactory(handleCapacity, this::dispatchOpen);
     // TTL controller is always constructed; embedders opt in by calling applyTTL externally.
@@ -262,6 +288,8 @@ public final class CacheBootstrap {
             java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
                 CachedFsConfig.prefetchHeapPressureTtlMs(conf));
         int scanTrackerMaxEntriesPerTracker = CachedFsConfig.scanTrackerMaxEntriesPerTracker(conf);
+        int scanTrackersMaxCount = CachedFsConfig.scanTrackersMaxCount(conf);
+        int recentStreamsCapacity = CachedFsConfig.recentStreamsCapacity(conf);
         CacheBootstrap b =
             new CacheBootstrap(
                 ram,
@@ -272,7 +300,9 @@ public final class CacheBootstrap {
                 prefetchExec,
                 maxPendingBytes,
                 heapPressureTtlNs,
-                scanTrackerMaxEntriesPerTracker);
+                scanTrackerMaxEntriesPerTracker,
+                scanTrackersMaxCount,
+                recentStreamsCapacity);
         // All pieces ready — now publish singletons atomically (w.r.t. LOCK) and commit.
         // Order matters because FileIds has no clearInstance API (test-only singleton):
         // publish AsyncDataCache FIRST so that if FileIds.setInstance somehow throws (it can
@@ -699,6 +729,16 @@ public final class CacheBootstrap {
    */
   public ScanTracker trackerFor(String scanId) {
     String normalized = normalizeScanId(scanId);
+    ScanTracker existing = scanTrackers.get(normalized);
+    if (existing != null) return existing;
+    // Soft cap on the tracker COUNT (separate from the per-tracker entry cap above). New scanIds
+    // past the cap silently get ScanTracker.DISABLED so the scan still works but contributes no
+    // density tracking. Bumping the rejection counter is the operator's signal that the cap was
+    // hit and either the cap or the workload needs to change.
+    if (scanTrackersMaxCount > 0 && scanTrackers.size() >= scanTrackersMaxCount) {
+      scanTrackersRejectedCount.incrementAndGet();
+      return ScanTracker.DISABLED;
+    }
     return scanTrackers.computeIfAbsent(
         normalized,
         k -> new ScanTracker(k, this.loadQuantumBytes, this.scanTrackerMaxEntriesPerTracker));
@@ -753,6 +793,24 @@ public final class CacheBootstrap {
       total += t.entriesRejected();
     }
     return total;
+  }
+
+  /**
+   * Count of {@link #trackerFor(String)} calls that returned {@link ScanTracker#DISABLED} because
+   * the JVM-wide tracker count cap ({@link CachedFsConfig#SCAN_TRACKERS_MAX_COUNT}) was hit.
+   * Non-zero means concurrent scans on this executor exceeded the cap; widen it or split workloads.
+   */
+  public long scanTrackersRejected() {
+    return scanTrackersRejectedCount.get();
+  }
+
+  /**
+   * Ring of recent {@link io.github.luciferyang.cachedfs.core.stats.IoStatisticsSnapshot} pushed by
+   * {@code CachingInputStream.close()}. Returns {@code RecentStreams.DISABLED} when {@link
+   * CachedFsConfig#RECENT_STREAMS_CAPACITY} is zero.
+   */
+  public io.github.luciferyang.cachedfs.core.stats.RecentStreams recentStreams() {
+    return recentStreams;
   }
 
   // --- scanId ThreadLocal -------------------------------------

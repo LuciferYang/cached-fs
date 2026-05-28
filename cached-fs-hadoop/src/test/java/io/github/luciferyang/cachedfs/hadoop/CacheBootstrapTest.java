@@ -171,6 +171,56 @@ class CacheBootstrapTest {
   }
 
   @Test
+  @DisplayName(
+      "trackerFor returns ScanTracker.DISABLED past the count cap; rejection counter ticks "
+          + "(R2 follow-up); existing scanIds still resolve to their live trackers")
+  void trackerCountCapRejectsNewScanIds() throws IOException {
+    Configuration conf = minimalConf();
+    conf.setInt(CachedFsConfig.SCAN_TRACKERS_MAX_COUNT, 2);
+    CacheBootstrap.installIfNeeded(conf);
+    CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+
+    var t1 = b.trackerFor("scan-A");
+    var t2 = b.trackerFor("scan-B");
+    // Cap reached. A previously-unseen scanId now gets DISABLED.
+    var t3 = b.trackerFor("scan-C");
+    assertThat(t3)
+        .as("new scanIds past the cap must return the DISABLED sentinel")
+        .isSameAs(io.github.luciferyang.cachedfs.core.tracker.ScanTracker.DISABLED);
+    assertThat(b.scanTrackersRejected()).isEqualTo(1L);
+    // Existing scanIds still resolve to their live trackers — cap only blocks NEW entries.
+    assertThat(b.trackerFor("scan-A")).isSameAs(t1);
+    assertThat(b.trackerFor("scan-B")).isSameAs(t2);
+    // Another rejection bumps the counter again.
+    b.trackerFor("scan-D");
+    assertThat(b.scanTrackersRejected()).isEqualTo(2L);
+    assertThat(b.scanTrackerCount()).isEqualTo(2);
+  }
+
+  @Test
+  @DisplayName(
+      "recentStreams ring respects fs.cached.recent-streams.capacity (R4 follow-up); capacity 0 "
+          + "yields the DISABLED sentinel")
+  void recentStreamsCapacityWiring() throws IOException {
+    Configuration conf = minimalConf();
+    conf.setInt(CachedFsConfig.RECENT_STREAMS_CAPACITY, 8);
+    CacheBootstrap.installIfNeeded(conf);
+    CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+    assertThat(b.recentStreams().capacity()).isEqualTo(8);
+
+    CacheBootstrap.uninstallForTesting();
+
+    Configuration disabled = minimalConf();
+    disabled.setInt(CachedFsConfig.RECENT_STREAMS_CAPACITY, 0);
+    CacheBootstrap.installIfNeeded(disabled);
+    CacheBootstrap b2 = CacheBootstrap.get().orElseThrow();
+    assertThat(b2.recentStreams())
+        .as("capacity 0 must yield the DISABLED sentinel")
+        .isSameAs(io.github.luciferyang.cachedfs.core.stats.RecentStreams.DISABLED);
+    assertThat(b2.recentStreams().capacity()).isZero();
+  }
+
+  @Test
   @DisplayName("withScanId close path: ThreadLocal cleared AND tracker evicted")
   void withScanIdCloseEvictsTracker() throws Exception {
     CacheBootstrap.installIfNeeded(minimalConf());

@@ -165,6 +165,31 @@ public final class CachedFsConfig {
   public static final int DEFAULT_SCAN_TRACKER_MAX_ENTRIES_PER_TRACKER = 10_000;
 
   /**
+   * {@code fs.cached.scan-trackers.max-count} — soft cap on the number of distinct {@link
+   * io.github.luciferyang.cachedfs.core.tracker.ScanTracker}s {@link CacheBootstrap} will retain.
+   * Once the cap is hit, {@link CacheBootstrap#trackerFor(String)} returns {@code
+   * ScanTracker.DISABLED} for new scanIds and bumps {@link CacheBootstrap#scanTrackersRejected()};
+   * existing trackers keep tracking normally. {@code 0} (or negative) disables the cap.
+   *
+   * <p>With M2.1 wiring per-task scanIds, leaked trackers (e.g. from crashed tasks before the
+   * plugin's onTaskSucceeded fires) accumulate; the cap is the safety net that prevents unbounded
+   * growth on a long-lived executor.
+   */
+  public static final String SCAN_TRACKERS_MAX_COUNT = "fs.cached.scan-trackers.max-count";
+
+  public static final int DEFAULT_SCAN_TRACKERS_MAX_COUNT = 10_000;
+
+  /**
+   * {@code fs.cached.recent-streams.capacity} — capacity of the ring buffer that retains per-stream
+   * {@link io.github.luciferyang.cachedfs.core.stats.IoStatisticsSnapshot}s for post-hoc debugging.
+   * Each closed stream pushes its snapshot into the ring; the oldest snapshot is overwritten when
+   * the ring wraps. {@code 0} disables the ring (snapshots are dropped on the floor).
+   */
+  public static final String RECENT_STREAMS_CAPACITY = "fs.cached.recent-streams.capacity";
+
+  public static final int DEFAULT_RECENT_STREAMS_CAPACITY = 64;
+
+  /**
    * {@code fs.cached.metrics.enabled} — master toggle for per-stream {@link
    * io.github.luciferyang.cachedfs.core.stats.IoStatistics}; default {@code true}. When false,
    * streams are constructed with {@code IoStatistics.NO_OP}.
@@ -303,6 +328,22 @@ public final class CachedFsConfig {
    */
   public static final String PREFETCH_MAX_PENDING_BYTES = "fs.cached.prefetch.max-pending-bytes";
 
+  /**
+   * {@code fs.cached.prefetch.max-pending-multiplier} — the {@code N} in {@code defaultPrefetchMax
+   * PendingBytes(loadQuantum, threads) = loadQuantum × threads × N}. Default {@code 4}: each
+   * prefetch thread is allowed 4 chunks queued before back-pressure kicks in. The constant {@code
+   * 4} is a heuristic; the right value depends on workload (read pattern, downstream consumer cost,
+   * storage latency). Operators can override this without touching cached-fs source. Ignored when
+   * {@link #PREFETCH_MAX_PENDING_BYTES} is set explicitly.
+   *
+   * <p>R1.1 (deferred): build a JMH benchmark harness, measure throughput across multipliers on a
+   * representative workload, and update the default if a better number is found.
+   */
+  public static final String PREFETCH_MAX_PENDING_MULTIPLIER =
+      "fs.cached.prefetch.max-pending-multiplier";
+
+  public static final int DEFAULT_PREFETCH_MAX_PENDING_MULTIPLIER = 4;
+
   // --- parsers -------------------------------------------------------------
 
   /** True if {@link #ENABLED} is set to {@code true}. */
@@ -353,6 +394,16 @@ public final class CachedFsConfig {
         conf.getInt(
             SCAN_TRACKER_MAX_ENTRIES_PER_TRACKER, DEFAULT_SCAN_TRACKER_MAX_ENTRIES_PER_TRACKER);
     return Math.max(0, v); // negative → unlimited; clamp at 0 to be defensive
+  }
+
+  public static int scanTrackersMaxCount(Configuration conf) {
+    int v = conf.getInt(SCAN_TRACKERS_MAX_COUNT, DEFAULT_SCAN_TRACKERS_MAX_COUNT);
+    return Math.max(0, v); // negative → unlimited
+  }
+
+  public static int recentStreamsCapacity(Configuration conf) {
+    int v = conf.getInt(RECENT_STREAMS_CAPACITY, DEFAULT_RECENT_STREAMS_CAPACITY);
+    return Math.max(0, v); // negative → disabled
   }
 
   public static boolean scanTrackerEnabled(Configuration conf) {
@@ -489,12 +540,29 @@ public final class CachedFsConfig {
    * in-flight budget to keep 4 chunks queued before back-pressure kicks in.
    */
   public static long defaultPrefetchMaxPendingBytes(int loadQuantumBytes, int prefetchThreads) {
-    return (long) loadQuantumBytes * prefetchThreads * 4L;
+    return defaultPrefetchMaxPendingBytes(
+        loadQuantumBytes, prefetchThreads, DEFAULT_PREFETCH_MAX_PENDING_MULTIPLIER);
+  }
+
+  /** Multiplier-aware overload — the auto-default that {@link #prefetchMaxPendingBytes} uses. */
+  public static long defaultPrefetchMaxPendingBytes(
+      int loadQuantumBytes, int prefetchThreads, int multiplier) {
+    return (long) loadQuantumBytes * prefetchThreads * (long) multiplier;
+  }
+
+  public static int prefetchMaxPendingMultiplier(Configuration conf) {
+    int v = conf.getInt(PREFETCH_MAX_PENDING_MULTIPLIER, DEFAULT_PREFETCH_MAX_PENDING_MULTIPLIER);
+    if (v <= 0) {
+      throw new IllegalArgumentException(PREFETCH_MAX_PENDING_MULTIPLIER + " must be > 0: " + v);
+    }
+    return v;
   }
 
   public static long prefetchMaxPendingBytes(
       Configuration conf, int loadQuantumBytes, int prefetchThreads) {
-    long autoDefault = defaultPrefetchMaxPendingBytes(loadQuantumBytes, prefetchThreads);
+    int multiplier = prefetchMaxPendingMultiplier(conf);
+    long autoDefault =
+        defaultPrefetchMaxPendingBytes(loadQuantumBytes, prefetchThreads, multiplier);
     long v = conf.getLong(PREFETCH_MAX_PENDING_BYTES, autoDefault);
     if (v <= 0L) {
       throw new IllegalArgumentException(PREFETCH_MAX_PENDING_BYTES + " must be > 0: " + v);

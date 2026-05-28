@@ -72,6 +72,8 @@ public final class CachedFsMeterBinder implements MeterBinder {
   private final LongSupplier scanTrackerEntries;
   private final LongSupplier scanTrackerMaxEntries;
   private final LongSupplier scanTrackerEntriesRejected;
+  private final LongSupplier scanTrackersRejected;
+  private final LongSupplier recentStreamsAddedTotal;
   private final LongSupplier pendingPrefetchBytes;
   private final LongSupplier maxPendingPrefetchBytes;
 
@@ -80,12 +82,16 @@ public final class CachedFsMeterBinder implements MeterBinder {
       LongSupplier scanTrackerEntries,
       LongSupplier scanTrackerMaxEntries,
       LongSupplier scanTrackerEntriesRejected,
+      LongSupplier scanTrackersRejected,
+      LongSupplier recentStreamsAddedTotal,
       LongSupplier pendingPrefetchBytes,
       LongSupplier maxPendingPrefetchBytes) {
     this.agg = Objects.requireNonNull(agg, "AggregatedIoStatistics");
     this.scanTrackerEntries = scanTrackerEntries;
     this.scanTrackerMaxEntries = scanTrackerMaxEntries;
     this.scanTrackerEntriesRejected = scanTrackerEntriesRejected;
+    this.scanTrackersRejected = scanTrackersRejected;
+    this.recentStreamsAddedTotal = recentStreamsAddedTotal;
     this.pendingPrefetchBytes = pendingPrefetchBytes;
     this.maxPendingPrefetchBytes = maxPendingPrefetchBytes;
   }
@@ -187,6 +193,18 @@ public final class CachedFsMeterBinder implements MeterBinder {
         scanTrackerEntriesRejected);
     gauge(
         registry,
+        "scan_trackers.rejected",
+        "trackerFor calls that returned ScanTracker.DISABLED because the JVM-wide tracker count "
+            + "cap was hit",
+        scanTrackersRejected);
+    gauge(
+        registry,
+        "recent_streams.added_total",
+        "cumulative count of per-stream IoStatistics snapshots pushed into the recent-streams "
+            + "ring (NOT capped by ring capacity)",
+        recentStreamsAddedTotal);
+    gauge(
+        registry,
         "prefetch.pending.bytes",
         "bytes currently pending prefetch admission",
         pendingPrefetchBytes);
@@ -219,6 +237,8 @@ public final class CachedFsMeterBinder implements MeterBinder {
     private LongSupplier scanTrackerEntries = ZERO;
     private LongSupplier scanTrackerMaxEntries = ZERO;
     private LongSupplier scanTrackerEntriesRejected = ZERO;
+    private LongSupplier scanTrackersRejected = ZERO;
+    private LongSupplier recentStreamsAddedTotal = ZERO;
     private LongSupplier pendingPrefetchBytes = ZERO;
     private LongSupplier maxPendingPrefetchBytes = ZERO;
 
@@ -241,6 +261,16 @@ public final class CachedFsMeterBinder implements MeterBinder {
       return this;
     }
 
+    public Builder scanTrackersRejected(LongSupplier supplier) {
+      this.scanTrackersRejected = Objects.requireNonNull(supplier);
+      return this;
+    }
+
+    public Builder recentStreamsAddedTotal(LongSupplier supplier) {
+      this.recentStreamsAddedTotal = Objects.requireNonNull(supplier);
+      return this;
+    }
+
     public Builder pendingPrefetchBytes(LongSupplier supplier) {
       this.pendingPrefetchBytes = Objects.requireNonNull(supplier);
       return this;
@@ -257,6 +287,8 @@ public final class CachedFsMeterBinder implements MeterBinder {
           scanTrackerEntries,
           scanTrackerMaxEntries,
           scanTrackerEntriesRejected,
+          scanTrackersRejected,
+          recentStreamsAddedTotal,
           pendingPrefetchBytes,
           maxPendingPrefetchBytes);
     }

@@ -564,6 +564,13 @@ public final class CachingInputStream extends InputStream
     // zeros.
     if (aggregated.compareAndSet(false, true)) {
       aggregateIoStats.add(ioStats);
+      // Push a snapshot into the bootstrap's recent-streams ring so post-hoc debugging can see
+      // what this stream observed. RecentStreams.DISABLED swallows the push when the operator has
+      // disabled the ring; the conditional avoids the allocation cost in that case.
+      io.github.luciferyang.cachedfs.core.stats.RecentStreams ring = bootstrap.recentStreams();
+      if (ring.capacity() > 0) {
+        ring.add(io.github.luciferyang.cachedfs.core.stats.IoStatisticsSnapshot.of(ioStats));
+      }
     }
     handlePtr.close();
   }
