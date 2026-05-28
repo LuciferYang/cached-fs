@@ -35,5 +35,14 @@
       <groupId>org.assertj</groupId>
       <artifactId>assertj-core</artifactId>
     </dependency>
+    <!-- byte-buddy-agent: parent surefire argLine references ${net.bytebuddy:byte-buddy-agent:jar}
+         which only resolves when the dependency-plugin's properties goal finds it on the test
+         classpath. Mockito isn't used here, but the agent dep is still required so the test JVM
+         starts (otherwise the property stays as a literal placeholder and the fork fails). -->
+    <dependency>
+      <groupId>net.bytebuddy</groupId>
+      <artifactId>byte-buddy-agent</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 </project>

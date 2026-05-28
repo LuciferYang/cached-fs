@@ -37,7 +37,7 @@ For multi-scheme caching in the same JVM, give each `FileSystem.get(uri, conf)` 
 
 - `open(Path)`, `open(Path, int)`, and `openFile(Path).build()` all route through the cache. `openFile(PathHandle)` and `open(PathHandle, int)` still delegate to the inner FS — PathHandle's opaque content tag prevents reliable cache keying.
 - `applyTTL(ttlSeconds)` rejects negative values and values larger than the current epoch second.
-- The `cached-fs-metrics` module is not yet shipped; depending on it today gets an empty jar.
+- The `cached-fs-cli` module is a pom-only stub today; depending on it gets an empty jar.
 
 ### Configuration reference
 
@@ -122,6 +122,23 @@ Bootstrap aggregate counters mirror these with the `cachedfs_aggregate_*` prefix
 - `cachedfs_pending_prefetch_bytes` — live in-flight prefetch byte budget.
 
 Disable the surface entirely with `fs.cached.metrics.enabled=false`; per-stream `IoStatistics` becomes `NO_OP` and every counter reads zero.
+
+### Micrometer export (cached-fs-metrics)
+
+The optional `cached-fs-metrics` module ships a `CachedFsMeterBinder` that registers every aggregate counter as a `FunctionCounter` and every bootstrap-level gauge (scan-tracker entries, pending prefetch bytes) as a `Gauge` under the `cached_fs.*` namespace. Bring your own `MeterRegistry` (Prometheus, JMX, statsd):
+
+```java
+CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+CachedFsMeterBinder.builder(b.aggregateIoStats())
+    .scanTrackerEntries(b::scanTrackerEntries)
+    .scanTrackerMaxEntries(b::scanTrackerMaxEntries)
+    .pendingPrefetchBytes(AsyncDataCache.getInstance()::pendingPrefetchBytes)
+    .maxPendingPrefetchBytes(b::maxPendingPrefetchBytes)
+    .build()
+    .bindTo(registry);
+```
+
+Prometheus exporters rewrite dots to underscores (e.g. `cached_fs_read_total`). Reason-tagged counters (`cached_fs.prefetch.skipped.bytes{reason=...}`) have a fixed reason set (`queue_full`, `budget`, `heap_pressure`, `other`) so tag cardinality stays bounded.
 
 ## Modules
 
