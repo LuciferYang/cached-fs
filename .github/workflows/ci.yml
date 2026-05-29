@@ -39,15 +39,21 @@ jobs:
           - jdk: '21'
             hadoop: '3.5.0'
             spark-profile: 'spark-4.0'
-          # JDK 25 cell intentionally absent until Spark 4.2 GA ships. JDK 24 removed
-          # Subject.getSubject(AccessControlContext); JDK 25 also rejects
-          # -Djava.security.manager=allow (JEP 486 finalized). Hadoop UGI — called by
-          # Spark's SparkContext init via Utils.getCurrentUserName — still hits the removed
-          # API, so every Suite that builds a SparkSession crashes before its first test.
-          # Spark 4.2 picks up the upstream migration to Subject.current(); re-add a
-          # {jdk:25, hadoop:3.5.x, spark-profile:spark-4.2} cell at that point.
+          # JDK 25 forward-compat — FS-agnostic modules only. The JDK-25 blocker is Hadoop UGI:
+          # UserGroupInformation.getCurrentUser calls Subject.getSubject(AccessControlContext),
+          # removed in JDK 24, and JDK 25 rejects the -Djava.security.manager=allow escape (JEP 486
+          # finalized). That breaks EVERY module which opens a Hadoop FileSystem — cached-fs-hadoop
+          # (HadoopReadFileTest), cached-fs-cli, cached-fs-bench, and Spark — not just Spark. Only
+          # cached-fs-core and cached-fs-metrics are FS-agnostic and pass on 25, so this cell scopes
+          # to them (guards the pure library against JDK-25 language/dependency regressions). Drop
+          # the `modules` scope and re-add hadoop/cli/bench + a spark-4.2 cell once Hadoop ships the
+          # Subject.current() migration (HADOOP-19212).
+          - jdk: '25'
+            hadoop: '3.5.0'
+            spark-profile: 'spark-4.0'
+            modules: 'cached-fs-core,cached-fs-metrics'
     runs-on: ubuntu-latest
-    name: build (jdk-${{ matrix.jdk }} hadoop-${{ matrix.hadoop }} ${{ matrix.spark-profile }}${{ matrix.locale && format(' {0}', matrix.locale) || '' }})
+    name: build (jdk-${{ matrix.jdk }} hadoop-${{ matrix.hadoop }} ${{ matrix.spark-profile }}${{ matrix.locale && format(' {0}', matrix.locale) || '' }}${{ matrix.modules && format(' [{0}]', matrix.modules) || '' }})
     # Pin the locale for every step (Maven + all forked test JVMs inherit it). The de_DE cell
     # exercises a comma-decimal locale; the others use C.UTF-8 for a deterministic baseline.
     env:
@@ -77,6 +83,7 @@ jobs:
         # to that one matrix entry so newer JDKs (25+) don't trip on parser internals.
         run: >-
           mvn -B -ntp verify
+          ${{ matrix.modules && format('-pl {0} -am', matrix.modules) || '' }}
           -P${{ matrix.spark-profile }}
           -Dhadoop.version=${{ matrix.hadoop }}
           -Dspotless.check.skip=${{ matrix.jdk != '21' }}
