@@ -224,6 +224,11 @@
           <reportsDirectory>${project.build.directory}/scalatest-reports</reportsDirectory>
           <junitxml>.</junitxml>
           <filereports>WDF TestSuite.txt</filereports>
+          <!-- JDK 24+ removed Subject.getSubject(AccessControlContext); Hadoop UGI (called by
+               Spark on SparkContext init) still hits that path. -Djava.security.manager=allow
+               restores the legacy SecurityManager-backed implementation so Spark sessions can
+               start under JDK 25. enable-native-access matches the surefire/failsafe argLine. -->
+          <argLine>-Djava.security.manager=allow --enable-native-access=ALL-UNNAMED</argLine>
         </configuration>
         <executions>
           <execution>
