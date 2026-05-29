@@ -211,6 +211,26 @@ public final class CachedFsConfig {
 
   public static final boolean DEFAULT_PATH_HANDLE_CACHE_ENABLED = true;
 
+  /**
+   * {@code fs.cached.jmx.enabled} — when {@code true} (default), the bootstrap registers a {@code
+   * CachedFsBootstrapMXBean} on the platform MBean server so the {@code cached-fs-cli} ops tool +
+   * JConsole / jmxterm can inspect and manage a running JVM. Set {@code false} to disable JMX
+   * exposure entirely (some sandboxed deployments forbid MBean registration).
+   */
+  public static final String JMX_ENABLED = "fs.cached.jmx.enabled";
+
+  public static final boolean DEFAULT_JMX_ENABLED = true;
+
+  /**
+   * {@code fs.cached.jmx.object-name} — JMX ObjectName under which the {@code
+   * CachedFsBootstrapMXBean} is registered. The default fits a single bootstrap per JVM; override
+   * when running multiple isolated bootstraps in one process (rare).
+   */
+  public static final String JMX_OBJECT_NAME = "fs.cached.jmx.object-name";
+
+  public static final String DEFAULT_JMX_OBJECT_NAME =
+      "io.github.luciferyang.cachedfs:type=CachedFsBootstrap";
+
   // --- coalescing -----------------------------------------------
 
   /**
@@ -429,6 +449,18 @@ public final class CachedFsConfig {
 
   public static boolean pathHandleCacheEnabled(Configuration conf) {
     return conf.getBoolean(PATH_HANDLE_CACHE_ENABLED, DEFAULT_PATH_HANDLE_CACHE_ENABLED);
+  }
+
+  public static boolean jmxEnabled(Configuration conf) {
+    return conf.getBoolean(JMX_ENABLED, DEFAULT_JMX_ENABLED);
+  }
+
+  public static String jmxObjectName(Configuration conf) {
+    String v = conf.getTrimmed(JMX_OBJECT_NAME, DEFAULT_JMX_OBJECT_NAME);
+    if (v.isEmpty()) {
+      throw new IllegalArgumentException(JMX_OBJECT_NAME + " must not be empty");
+    }
+    return v;
   }
 
   // --- coalescing parsers --------------------------------------------------

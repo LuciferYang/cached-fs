@@ -37,7 +37,7 @@ For multi-scheme caching in the same JVM, give each `FileSystem.get(uri, conf)` 
 
 - `open(Path)`, `open(Path, int)`, and `openFile(Path).build()` all route through the cache. `openFile(PathHandle)` and `open(PathHandle, int)` route through the cache when the supplied handle implements `io.github.luciferyang.cachedfs.hadoop.spi.ContentAddressedPathHandle` (opt-in SPI exposing `contentHash()` + `contentLength()`); plain `PathHandle`s still delegate to the inner FS because their bytes are opaque.
 - `applyTTL(ttlSeconds)` rejects negative values and values larger than the current epoch second.
-- The `cached-fs-cli` MVP ships `config` (load Hadoop XMLs, validate `fs.cached.*`, dump effective values) and `version`. Live-state subcommands (`inspect`, `stats`, `drain`, `purge`) are deferred until a JMX MBean or RPC endpoint exists for querying a running JVM.
+- The `cached-fs-cli` ships static subcommands (`config`, `version`) and live-state subcommands (`inspect <key>`, `stats`, `recent-streams`, `drain --yes`, `purge <regex> --yes`) backed by the `CachedFsBootstrapMXBean` JMX MBean. Live commands default to the local platform MBean server; pass `--jmx-url <service-url>` to target a remote JVM.
 
 ### Configuration reference
 
@@ -69,6 +69,8 @@ All keys live under the `fs.cached.*` namespace; the first `installIfNeeded` cal
 | `fs.cached.recent-streams.capacity` | `64` | Capacity of the ring buffer that retains per-stream `IoStatisticsSnapshot`s pushed by `CachingInputStream.close()`. Useful for post-hoc debugging without instrumenting every reader. `0` disables the ring entirely (snapshots dropped on the floor); the `RecentStreams.DISABLED` sentinel is used in that case. |
 | `fs.cached.prefetch.max-pending-multiplier` | `4` | `N` in the auto-default `loadQuantum × threads × N` for `fs.cached.prefetch.max-pending-bytes`. Lets ops tune the in-flight prefetch budget without overriding the absolute byte count. Ignored when `max-pending-bytes` is set explicitly. |
 | `fs.cached.path-handle.cache-enabled` | `true` | Routes `openFile(PathHandle)` / `open(PathHandle, int)` reads through the cache when the supplied handle implements `ContentAddressedPathHandle`. Set `false` to revert to inner-FS passthrough (useful for A/B benchmarking or diagnosing connector-side `contentHash` correctness). |
+| `fs.cached.jmx.enabled` | `true` | Registers a `CachedFsBootstrapMXBean` on the platform MBean server at install time so the `cached-fs-cli` ops tool + JConsole / jmxterm can inspect and manage a running JVM. Set `false` to disable JMX exposure (some sandboxed deployments forbid MBean registration). |
+| `fs.cached.jmx.object-name` | `io.github.luciferyang.cachedfs:type=CachedFsBootstrap` | JMX ObjectName for the bean. Override only when running multiple isolated bootstraps in one process (rare). |
 | `fs.cached.metrics.enabled` | `true` | When false, `IoStatistics.NO_OP` is wired into every stream — counter bumps short-circuit and the Hadoop `IOStatistics` surface returns zeros. |
 | `fs.cached.coalesce.enabled` | `true` | Coalesce contiguous missing chunks issued by a single read into one `preadv` call against the inner FS. |
 | `fs.cached.coalesce.always-on` | `false` | Bypass the auto-disable rule (which turns coalesce off on caches smaller than 8×`loadQuantum`). Set to `true` for unit / IT scenarios that use tiny caches. |

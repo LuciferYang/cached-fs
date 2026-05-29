@@ -237,6 +237,35 @@ public final class CachedFactory<K, V> {
   }
 
   /**
+   * Returns {@code true} if {@code key} is currently cached. Read-only — does not bump LRU order or
+   * pin the entry. Used by ops tooling (the JMX inspect endpoint) to ask "is this file open right
+   * now?" without side effects.
+   */
+  public boolean containsKey(K key) {
+    Objects.requireNonNull(key, "key");
+    lock.lock();
+    try {
+      return index.containsKey(key);
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /**
+   * Returns a snapshot of the currently-cached keys. Read-only — does not bump LRU order. Used by
+   * the JMX purge endpoint to enumerate candidates before applying the regex match. The returned
+   * list is a copy; callers may mutate it without affecting the cache.
+   */
+  public List<K> keys() {
+    lock.lock();
+    try {
+      return new ArrayList<>(lru.keySet());
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /**
    * Drains every entry (pinned or not) and returns the values so the caller can close them. Used
    * when the owning component is shutting down and must release every cached resource regardless of
    * pin state. In normal operation, pinned entries are released via {@link CachedPtr#close} and the

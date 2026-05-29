@@ -19,31 +19,49 @@ import picocli.CommandLine;
 import picocli.CommandLine.Command;
 
 /**
- * cached-fs CLI entry point. Today ships two subcommands:
+ * cached-fs CLI entry point.
+ *
+ * <p>Static (offline) subcommands:
  *
  * <ul>
  *   <li>{@code config} — validate a Hadoop config XML and dump the effective {@code fs.cached.*}
- *       keys with defaults filled in. Run at deploy time to catch range/type errors before the JVM
- *       installs the cache.
+ *       keys with defaults filled in.
  *   <li>{@code version} — print the cached-fs build version.
  * </ul>
  *
- * <p>Production live-state inspection (cache contents, hit/miss for a specific path) is
- * intentionally NOT here today — it requires JMX/RPC infrastructure that doesn't exist in cached-fs
- * yet. The Micrometer/Prometheus surface from {@code cached-fs-metrics} covers the cumulative
- * observability use case; per-path live state would need a daemon to query. Flagged as a follow-up.
+ * <p>Live-state subcommands (connect to a running JVM via JMX):
+ *
+ * <ul>
+ *   <li>{@code inspect <key>} — does this key have an open handle? Per-tracker breakdown.
+ *   <li>{@code stats} — aggregate IO + RAM/SSD cache + tracker + recent-streams snapshot.
+ *   <li>{@code recent-streams} — dump the recent {@code IoStatisticsSnapshot} ring.
+ *   <li>{@code drain} — close every cached handle. Requires {@code --yes}.
+ *   <li>{@code purge <regex>} — close handles whose key matches a Java regex. Requires {@code
+ *       --yes}.
+ * </ul>
+ *
+ * <p>Live commands default to the local platform MBean server (in-process). Pass {@code --jmx-url}
+ * (e.g. {@code service:jmx:rmi:///jndi/rmi://host:9999/jmxrmi}) to target a remote JVM.
  *
  * <p>Built as an executable jar with picocli's annotation processor; run via:
  *
  * <pre>{@code
- * java -jar cached-fs-cli-0.1.0-SNAPSHOT.jar config --conf core-site.xml
+ * java -jar cached-fs-cli-0.1.0-SNAPSHOT.jar stats --jmx-url service:jmx:rmi:///jndi/rmi://host:9999/jmxrmi
  * }</pre>
  */
 @Command(
     name = "cached-fs",
     description = "cached-fs ops + diagnostic CLI",
     mixinStandardHelpOptions = true,
-    subcommands = {ConfigCommand.class, VersionCommand.class})
+    subcommands = {
+      ConfigCommand.class,
+      VersionCommand.class,
+      InspectCommand.class,
+      StatsCommand.class,
+      RecentStreamsCommand.class,
+      DrainCommand.class,
+      PurgeCommand.class,
+    })
 public final class CachedFsCli implements Runnable {
 
   @Override

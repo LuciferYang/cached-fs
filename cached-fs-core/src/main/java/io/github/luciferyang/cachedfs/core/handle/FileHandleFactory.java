@@ -57,6 +57,24 @@ public final class FileHandleFactory {
   }
 
   /**
+   * Returns {@code true} if a handle for {@code key} is currently cached. Read-only — does not bump
+   * LRU order or pin the handle. Used by the {@code cached-fs-cli inspect} subcommand to answer "is
+   * this file open right now?".
+   */
+  public boolean containsHandle(String key) {
+    return delegate.containsKey(Objects.requireNonNull(key, "key"));
+  }
+
+  /**
+   * Returns a snapshot of currently-cached handle keys. The returned list is a copy; callers may
+   * mutate it without affecting the cache. Used by the {@code cached-fs-cli purge} subcommand to
+   * apply a regex match.
+   */
+  public java.util.List<String> keys() {
+    return delegate.keys();
+  }
+
+  /**
    * Drains every cached handle and closes it. Called by the owning FileSystem decorator on shutdown
    * (and by test cleanup) so input streams pinned inside FileHandles are released while their inner
    * FS is still alive. Throws an aggregated {@link IOException} if any handle close throws, but

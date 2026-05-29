@@ -182,6 +182,12 @@ public final class CacheBootstrap {
       new java.util.concurrent.atomic.AtomicLong();
 
   /**
+   * ObjectName under which this bootstrap's JMX MBean is registered. {@code null} when JMX is
+   * disabled or registration failed. Used by {@link #uninstallForTesting} to unregister cleanly.
+   */
+  private volatile javax.management.ObjectName mbeanName;
+
+  /**
    * Ring buffer of per-stream {@link
    * io.github.luciferyang.cachedfs.core.stats.IoStatisticsSnapshot} entries pushed by {@code
    * CachingInputStream.close()}. Capacity from {@link CachedFsConfig#RECENT_STREAMS_CAPACITY}; uses
@@ -323,6 +329,27 @@ public final class CacheBootstrap {
           b.blockLocationsProvider = pending;
         }
         installed = b;
+        // Register the JMX MBean AFTER `installed` is published so a concurrent MBean lookup never
+        // sees a half-constructed bootstrap. Registration failure must NOT abort install — JMX is
+        // an ops surface, not load-bearing for reads. Log and continue; metrics still flow through
+        // the Prometheus path.
+        if (CachedFsConfig.jmxEnabled(conf)) {
+          String objectName = CachedFsConfig.jmxObjectName(conf);
+          try {
+            javax.management.ObjectName name = new javax.management.ObjectName(objectName);
+            javax.management.MBeanServer server =
+                java.lang.management.ManagementFactory.getPlatformMBeanServer();
+            io.github.luciferyang.cachedfs.hadoop.mbean.CachedFsBootstrapMBean mbean =
+                new io.github.luciferyang.cachedfs.hadoop.mbean.CachedFsBootstrapMBean(b);
+            server.registerMBean(mbean, name);
+            b.mbeanName = name;
+          } catch (javax.management.JMException ex) {
+            LOG.warn(
+                "JMX MBean registration failed for {} — continuing without JMX ops surface",
+                objectName,
+                ex);
+          }
+        }
         return b;
       } catch (IOException | RuntimeException | Error ex) {
         // Roll back partial construction; the JVM stays in the pre-install state so a retry
@@ -466,6 +493,20 @@ public final class CacheBootstrap {
         return;
       }
       IOException primary = null;
+      // Unregister the JMX MBean BEFORE tearing down internals so a remote inspect call
+      // mid-shutdown
+      // sees "no such MBean" rather than a half-decomposed bootstrap. Catch JMException broadly:
+      // an unregister failure is non-fatal (next install will re-register or fail-fast on
+      // collision).
+      javax.management.ObjectName name = b.mbeanName;
+      if (name != null) {
+        try {
+          java.lang.management.ManagementFactory.getPlatformMBeanServer().unregisterMBean(name);
+        } catch (javax.management.JMException ex) {
+          LOG.warn("JMX MBean unregister failed for {}", name, ex);
+        }
+        b.mbeanName = null;
+      }
       // executor shutdown — happens BEFORE handle drain so any in-flight prefetch task
       // finishes its run-finally (decrementPendingPrefetch + clearPendingPrefetchIf) against a
       // still-live RAM cache. Bounded await: 5s then shutdownNow + another 5s; persistent
@@ -756,6 +797,18 @@ public final class CacheBootstrap {
   /** Number of distinct scanIds currently tracked. Used by tests and a future dynamic gauge. */
   public int scanTrackerCount() {
     return scanTrackers.size();
+  }
+
+  /**
+   * Returns a read-only view of the live {@link ScanTracker}s. Useful for the JMX inspect path,
+   * which walks every tracker looking for {@code TrackingData} on a given fileNum.
+   *
+   * <p>The view is backed by a {@link ConcurrentMap}, so iteration sees a weakly-consistent
+   * snapshot: a tracker added during iteration may or may not appear, but the iterator never throws
+   * {@link java.util.ConcurrentModificationException}.
+   */
+  public java.util.Collection<ScanTracker> scanTrackersView() {
+    return java.util.Collections.unmodifiableCollection(scanTrackers.values());
   }
 
   /**
