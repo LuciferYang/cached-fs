@@ -48,8 +48,16 @@ public final class RecentStreamsCommand implements Callable<Integer> {
 
   @Override
   public Integer call() throws Exception {
+    PrintWriter out = spec != null ? spec.commandLine().getOut() : new PrintWriter(System.out);
+    PrintWriter err = spec != null ? spec.commandLine().getErr() : new PrintWriter(System.err);
+    // Validate client-side so a bad value exits 2 (bad input), consistent with stats --window /
+    // purge — rather than letting the MBean throw and surface as a generic exit-1 runtime error.
+    if (limit < 0) {
+      err.println("--limit must be >= 0 (0 = all): " + limit);
+      err.flush();
+      return 2;
+    }
     try (JmxClient client = jmx.connect()) {
-      PrintWriter out = spec != null ? spec.commandLine().getOut() : new PrintWriter(System.out);
       out.print(client.proxy().recentStreams(limit));
       out.flush();
     }

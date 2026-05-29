@@ -17,9 +17,11 @@ package io.github.luciferyang.cachedfs.hadoop.mbean;
 
 /**
  * JMX MBean exposing live read-only state and a few destructive operations on the cached-fs
- * bootstrap. The {@code MXBean} suffix uses standard JMX boxed types (String, long) so JConsole /
- * jmxterm can drive every operation directly without custom type mappers — and the cached-fs CLI
- * can connect over standard JMX RMI to operate a running JVM.
+ * bootstrap. The {@code MXBean} suffix means every method's types are JMX open types: the scalar
+ * ops use String / long (rendered directly by JConsole / jmxterm) and {@link #counters} returns a
+ * {@code Map<String,Long>} (rendered as a TabularData). The cached-fs CLI connects over standard
+ * JMX RMI — via an {@code MXBean} proxy, so the Map round-trips back to a Map — to operate a
+ * running JVM.
  *
  * <p>All methods are thread-safe; reads observe a coherent point-in-time view (counters are read
  * atomically), and mutating operations are guarded by the bootstrap's own internal locks.
@@ -27,13 +29,15 @@ package io.github.luciferyang.cachedfs.hadoop.mbean;
 public interface CachedFsBootstrapMXBean {
 
   /**
-   * Returns a multi-line human-readable report for {@code path}: whether an open handle exists,
-   * tracker info (referencedBytes, readBytes) if the path was ever opened in the current process,
-   * and the resolved fileNum.
+   * Returns a multi-line human-readable report for {@code path}: whether an open handle exists for
+   * that exact key, the total open-handle count, and a per-scan breakdown (scanId, tracked-entry
+   * count, rejected-entry count) for every live tracker.
    *
-   * <p>This does NOT enumerate cached chunks per offset — the RAM cache is shard-hashed by {@code
-   * CacheKey} for O(1) lookup, not enumeration. A future revision MAY add per-chunk reporting if
-   * the AsyncDataCache grows an enumeration API.
+   * <p>It does NOT resolve {@code path} to a fileNum or report per-path bytes: doing so would
+   * require a side-effecting {@code StringIdMap.makeId}, and the cache keys trackers by fileNum
+   * with no reverse path lookup. It also does NOT enumerate cached chunks per offset — the RAM
+   * cache is shard-hashed by {@code CacheKey} for O(1) lookup, not enumeration. A future revision
+   * MAY add per-chunk reporting if the {@code AsyncDataCache} grows an enumeration API.
    */
   String inspect(String path);
 
@@ -46,13 +50,20 @@ public interface CachedFsBootstrapMXBean {
 
   /**
    * Returns the same numeric values as {@link #stats} but as a typed name → value map, so a caller
-   * can compute deltas/rates over a window without parsing the formatted text. Insertion-ordered to
-   * match the {@code stats()} layout. Cumulative counters (e.g. {@code read-bytes}) yield
-   * meaningful per-second rates; point-in-time gauges (e.g. {@code ram-num-entries}) yield a
-   * change-over-window that the caller may present differently.
+   * can compute deltas/rates over a window without parsing the formatted text. Keys are namespaced
+   * ({@code io.*}, {@code ram.*}, {@code handles.*}, {@code trackers.*}, {@code recent-streams.*}).
+   * Cumulative counters (e.g. {@code io.read-bytes}) yield meaningful per-second rates;
+   * point-in-time gauges (e.g. {@code ram.num-entries}) yield a change-over-window that the caller
+   * may present differently.
    *
-   * <p>{@code Map<String, Long>} is a JMX open type — JConsole renders it as a TabularData and a
-   * proxied client gets the map back directly.
+   * <p>The map is built insertion-ordered ({@code LinkedHashMap}) to mirror the {@code stats()}
+   * layout. That order is preserved by the standard platform MBean server's {@code TabularData}
+   * round-trip but is NOT guaranteed by the JMX spec across exotic implementations; callers that
+   * need a fixed order should sort. Row order is cosmetic only — each entry is self-keyed, so
+   * values never desync from their names.
+   *
+   * <p>{@code Map<String, Long>} is a JMX open type — JConsole renders it as a TabularData and an
+   * {@code MXBean} proxy reconstructs it back into a {@code Map}.
    */
   java.util.Map<String, Long> counters();
 
@@ -73,9 +84,11 @@ public interface CachedFsBootstrapMXBean {
 
   /**
    * Closes every cached file handle whose key matches the {@code regex} pattern. Returns the number
-   * of handles closed. Use {@code .*} to mean "everything" (equivalent to {@link #drain}). An
-   * invalid regex throws {@link java.util.regex.PatternSyntaxException} which JMX wraps as {@code
-   * MBeanException}.
+   * of keys that matched when the purge was issued — a best-effort count, not a guaranteed
+   * closed-count: the underlying close primitive is {@code void}, and a concurrent open or eviction
+   * between the match snapshot and the close can shift the true number. Use {@code .*} to mean
+   * "everything" (equivalent to {@link #drain}). An invalid regex throws {@link
+   * java.util.regex.PatternSyntaxException} which JMX wraps as {@code MBeanException}.
    */
   long purgeMatching(String regex);
 }

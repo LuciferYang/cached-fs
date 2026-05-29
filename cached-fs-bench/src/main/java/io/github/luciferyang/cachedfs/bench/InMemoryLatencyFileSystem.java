@@ -68,6 +68,14 @@ public final class InMemoryLatencyFileSystem extends RawLocalFileSystem {
    */
   public static volatile long latencyStrideBytes = 0L;
 
+  /**
+   * Count of latency parks charged so far, for deterministic testing of the stride logic (a wall-
+   * clock timing assertion would flake under GC/scheduling). The benchmark ignores it; the per-read
+   * {@code incrementAndGet} is negligible next to the park it accompanies.
+   */
+  public static final java.util.concurrent.atomic.AtomicLong parkCount =
+      new java.util.concurrent.atomic.AtomicLong();
+
   @Override
   public FSDataInputStream open(Path f, int bufferSize) {
     return new FSDataInputStream(
@@ -112,6 +120,7 @@ public final class InMemoryLatencyFileSystem extends RawLocalFileSystem {
       // boundary). Sequential follow-on page reads within the same chunk are free, modelling a
       // real connection's read-ahead. stride <= 0 → charge every read (worst-case model).
       if (latencyNanos > 0L && (latencyStride <= 0L || position % latencyStride == 0L)) {
+        parkCount.incrementAndGet();
         LockSupport.parkNanos(latencyNanos);
       }
       int n = (int) Math.min(length, size - position);

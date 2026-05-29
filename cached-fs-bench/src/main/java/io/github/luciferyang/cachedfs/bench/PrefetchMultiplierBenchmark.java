@@ -74,7 +74,13 @@ public class PrefetchMultiplierBenchmark {
   public enum Pattern {
     /** Read every chunk front to back — the ideal prefetch case. */
     SEQUENTIAL,
-    /** Read every other chunk — prefetch must run further ahead to stay useful. */
+    /**
+     * Read every other chunk (0, 2, 4, …). NOTE: the prefetcher only reads ONE chunk ahead ({@code
+     * CachingInputStream} prefetches {@code nextChunkStart = thisChunkEnd}), so under this pattern
+     * it loads the ODD chunks the consumer skips — every prefetch is wasted and every consumed
+     * chunk is a cold, consumer-paid miss. This is therefore a "wasted-prefetch" stressor (does the
+     * budget churn hurt when prefetch never helps?), NOT a look-ahead test.
+     */
     STRIDED
   }
 
@@ -150,8 +156,9 @@ public class PrefetchMultiplierBenchmark {
           total += readBuf[0];
         }
       } else {
-        // Strided: even chunks only. Half the bytes, but prefetch must look further ahead to
-        // land the next consumed chunk in time.
+        // Strided: even chunks only — half the bytes. The +1-chunk prefetcher loads the odd chunks
+        // we skip, so prefetch is pure waste here (see Pattern.STRIDED); this stresses budget churn
+        // when prefetch never helps, it is not a look-ahead test.
         for (int i = 0; i < chunks; i += 2) {
           in.readFully((long) i * LOAD_QUANTUM, readBuf, 0, LOAD_QUANTUM);
           total += readBuf[0];

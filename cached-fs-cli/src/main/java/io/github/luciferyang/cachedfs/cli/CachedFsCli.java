@@ -64,14 +64,32 @@ import picocli.CommandLine.Command;
     })
 public final class CachedFsCli implements Runnable {
 
+  /** Exit code for an unhandled execution failure (e.g. a JMX connection error). */
+  static final int EXIT_RUNTIME_ERROR = 1;
+
   @Override
   public void run() {
     // Bare invocation with no subcommand → print usage and exit 0.
     CommandLine.usage(this, System.out);
   }
 
+  /**
+   * Renders execution failures as a one-line message + defined exit code instead of picocli's
+   * default rethrow (which dumps a raw stack trace and exits 1 via the uncaught-exception path).
+   * The live commands talk to a possibly-remote JVM over JMX, so a connection failure / RMI error
+   * is an expected operational outcome, not a bug to stack-trace.
+   */
+  static CommandLine newCommandLine() {
+    return new CommandLine(new CachedFsCli())
+        .setExecutionExceptionHandler(
+            (ex, commandLine, parseResult) -> {
+              commandLine.getErr().println("error: " + ex.getMessage());
+              return EXIT_RUNTIME_ERROR;
+            });
+  }
+
   public static void main(String[] args) {
-    int exit = new CommandLine(new CachedFsCli()).execute(args);
+    int exit = newCommandLine().execute(args);
     System.exit(exit);
   }
 }

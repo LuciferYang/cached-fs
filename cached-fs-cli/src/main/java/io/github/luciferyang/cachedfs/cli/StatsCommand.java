@@ -18,6 +18,7 @@ package io.github.luciferyang.cachedfs.cli;
 import io.github.luciferyang.cachedfs.cli.jmx.JmxClient;
 import io.github.luciferyang.cachedfs.cli.jmx.JmxOptions;
 import java.io.PrintWriter;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.Callable;
 import picocli.CommandLine.Command;
@@ -83,18 +84,32 @@ public final class StatsCommand implements Callable<Integer> {
     Map<String, Long> second = client.proxy().counters();
     double elapsedSeconds = (System.nanoTime() - startNanos) / 1_000_000_000.0;
 
+    // Locale.ROOT: this is machine-greppable ops output (and the windowRow test asserts "120.0"),
+    // so the decimal separator must be '.' regardless of the host locale.
     out.printf(
-        "=== cached-fs stats --window %ds (elapsed %.3fs) ===%n", windowSeconds, elapsedSeconds);
-    out.printf("%-42s %16s %16s %16s%n", "counter", "current", "delta", "per-sec");
+        Locale.ROOT,
+        "=== cached-fs stats --window %ds (elapsed %.3fs) ===%n",
+        windowSeconds,
+        elapsedSeconds);
+    out.printf(Locale.ROOT, "%-42s %16s %16s %16s%n", "counter", "current", "delta", "per-sec");
     for (Map.Entry<String, Long> e : second.entrySet()) {
       String key = e.getKey();
       long now = e.getValue();
       // Counters never disappear between snapshots, but guard defensively rather than NPE.
       long before = first.getOrDefault(key, now);
-      long delta = now - before;
-      double perSec = elapsedSeconds > 0 ? delta / elapsedSeconds : 0.0;
-      out.printf("%-42s %16d %+16d %16.1f%n", key, now, delta, perSec);
+      out.println(windowRow(key, before, now, elapsedSeconds));
     }
     out.flush();
+  }
+
+  /**
+   * Formats one windowed-delta row: current value, signed change over the window, and per-second
+   * rate. Kept as a pure function so the delta/rate arithmetic is unit-testable without a real
+   * window sleep. {@code elapsedSeconds <= 0} yields a 0.0 rate (avoids divide-by-zero).
+   */
+  static String windowRow(String key, long before, long now, double elapsedSeconds) {
+    long delta = now - before;
+    double perSec = elapsedSeconds > 0 ? delta / elapsedSeconds : 0.0;
+    return String.format(Locale.ROOT, "%-42s %16d %+16d %16.1f", key, now, delta, perSec);
   }
 }

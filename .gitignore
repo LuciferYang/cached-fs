@@ -19,3 +19,6 @@ derby.log
 out/
 build/maven/
 dependency-reduced-pom.xml
+
+# Local CodeGraph MCP index (never commit)
+.codegraph/

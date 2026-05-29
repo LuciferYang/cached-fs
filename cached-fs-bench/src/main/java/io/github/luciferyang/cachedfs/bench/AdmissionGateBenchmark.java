@@ -24,9 +24,11 @@ import org.openjdk.jmh.annotations.Level;
 import org.openjdk.jmh.annotations.Measurement;
 import org.openjdk.jmh.annotations.Mode;
 import org.openjdk.jmh.annotations.OutputTimeUnit;
+import org.openjdk.jmh.annotations.Param;
 import org.openjdk.jmh.annotations.Scope;
 import org.openjdk.jmh.annotations.Setup;
 import org.openjdk.jmh.annotations.State;
+import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.annotations.Threads;
 import org.openjdk.jmh.infra.Blackhole;
 
@@ -37,11 +39,17 @@ import org.openjdk.jmh.infra.Blackhole;
  * java.util.concurrent.atomic.LongAdder} {@code sum()}) and compares it to the budget; admitted
  * prefetches {@code incrementPendingPrefetch} and later {@code decrementPendingPrefetch}.
  *
- * <p>This benchmark drives that inc / sum / dec triple from many threads to confirm the gate stays
- * cheap under concurrency — i.e. that raising the multiplier (allowing more in-flight prefetches,
- * hence more concurrent gate traffic) does not turn the counter into a contention bottleneck. The
- * {@code LongAdder} {@code sum()} cost grows with the number of contending cells, so this is the
- * relevant scaling dimension; sweep it with JMH's {@code -t} thread count.
+ * <p>This benchmark drives that sum / inc / dec sequence from many threads to confirm the gate
+ * stays cheap under concurrency — i.e. that raising the multiplier (allowing more in-flight
+ * prefetches, hence more concurrent gate traffic) does not turn the counter into a contention
+ * bottleneck. The {@code LongAdder} {@code sum()} cost grows with the number of contending cells,
+ * so thread count is the relevant scaling dimension; sweep it with JMH's {@code -t}.
+ *
+ * <p>The {@code budgetMiB} param exercises BOTH gate branches: a generous budget (admit path —
+ * times sum + inc + dec, the full admitted-prefetch lifecycle) and a zero budget (reject path —
+ * times only the sum() + comparison, since a rejected prefetch touches no counter). Neither
+ * scenario drives {@code pending} close to a non-trivial budget, so this measures per-decision cost
+ * under cell contention, NOT a saturated-budget hot-loop; see {@code docs/bench} for that caveat.
  *
  * <p>Run:
  *
@@ -60,29 +68,41 @@ import org.openjdk.jmh.infra.Blackhole;
 public class AdmissionGateBenchmark {
 
   private static final long CHUNK = 1L << 20; // 1 MiB, matches the default load quantum
-  private static final long BUDGET = 64L << 20; // generous budget so the gate mostly admits
 
+  // 64 → admit path (CHUNK always fits, so sum + inc + dec run); 0 → reject path (CHUNK never fits,
+  // so only sum() + the comparison run, mirroring a real BUDGET_REJECT that touches no counter).
+  @Param({"64", "0"})
+  public int budgetMiB;
+
+  private long budgetBytes;
   private AsyncDataCache cache;
 
   @Setup(Level.Trial)
   public void setUp() {
     this.cache = new AsyncDataCache(AsyncDataCache.Options.defaults());
+    this.budgetBytes = (long) budgetMiB << 20;
+  }
+
+  @TearDown(Level.Trial)
+  public void tearDown() {
+    cache.close();
   }
 
   /**
-   * One admission decision plus the matching accounting: read the pending sum (the gate check), and
-   * if it would fit the budget, increment then decrement — the full lifecycle a real prefetch
-   * drives through the counter. Returns the gate's boolean so JMH can't fold the read away.
+   * One admission decision plus the matching accounting. Mirrors the production gate expression
+   * exactly ({@code CachingInputStream.admissionGate}: reject when {@code pending + chunk >
+   * budget}), then on admit runs the increment / decrement a real prefetch drives through the
+   * counter. Returns the gate's boolean so JMH can't fold the {@code sum()} away.
    */
   @Benchmark
   public boolean admitAndAccount(Blackhole bh) {
     long pending = cache.pendingPrefetchBytes();
-    boolean admit = pending + CHUNK <= BUDGET;
-    if (admit) {
+    boolean reject = pending + CHUNK > budgetBytes;
+    if (!reject) {
       cache.incrementPendingPrefetch(CHUNK);
       bh.consume(cache.pendingPrefetchBytes());
       cache.decrementPendingPrefetch(CHUNK);
     }
-    return admit;
+    return !reject;
   }
 }

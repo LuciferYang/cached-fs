@@ -25,6 +25,10 @@ right default and how the knob behaves across workloads.
 
 ## Running
 
+JMH forks a child JVM to run each benchmark; that fork must be **Java 21** (the project's target).
+If your default `java` on `PATH` is older, pass `-jvm "$JAVA_HOME/bin/java"` (pointing at a JDK 21)
+or every fork dies with `UnsupportedClassVersionError`.
+
 ```bash
 # Build the shaded benchmark jar (also builds upstream modules):
 mvn -q -pl cached-fs-bench -am package
@@ -37,7 +41,11 @@ java -jar cached-fs-bench/target/benchmarks.jar PrefetchMultiplierBenchmark \
   -p latencyMicros=2000 -p pattern=SEQUENTIAL -p multiplier=1,4,16 \
   -f 1 -wi 2 -i 3 -w 2 -r 2
 
-# Gate accounting cost under contention (sweep thread count with -t):
+# If the default java is not 21, force the fork JVM:
+java -jar cached-fs-bench/target/benchmarks.jar PrefetchMultiplierBenchmark \
+  -jvm "$JAVA_HOME/bin/java"
+
+# Gate accounting cost under contention (sweep thread count with -t; budgetMiB picks admit/reject):
 java -jar cached-fs-bench/target/benchmarks.jar AdmissionGateBenchmark -t 1
 java -jar cached-fs-bench/target/benchmarks.jar AdmissionGateBenchmark -t 8
 java -jar cached-fs-bench/target/benchmarks.jar AdmissionGateBenchmark -t 32
@@ -53,10 +61,18 @@ you invoke the jar.
 | --- | --- | --- |
 | `multiplier` | 1, 2, 4, 8, 16 | the knob under test |
 | `latencyMicros` | 0, 200, 2000 | per-read backing-store latency: 0 = CPU/cache-bound baseline, 200 µs ≈ warm NVMe, 2000 µs ≈ cloud object-store first byte |
-| `pattern` | SEQUENTIAL, STRIDED | consumer access pattern |
+| `pattern` | SEQUENTIAL, STRIDED | consumer access pattern (see note below) |
 
 Fixed: 1 MiB load quantum, 64 MiB file (64 chunks), 8 prefetch threads. `PrefetchMultiplierBenchmark`
 reports average ms per full-file scan (lower is better).
+
+**On STRIDED:** the prefetcher only reads one chunk ahead (`CachingInputStream` prefetches the
+immediately-following chunk). STRIDED reads chunks 0, 2, 4, … so prefetch always loads the *odd*
+chunks the consumer skips — every prefetch is wasted and every consumed chunk is a cold,
+consumer-paid miss. STRIDED is therefore a **wasted-prefetch stressor** (does budget churn hurt when
+prefetch can't help?), NOT a look-ahead test. `AdmissionGateBenchmark` also takes a `budgetMiB`
+param: 64 exercises the admit path (sum + inc + dec), 0 exercises the reject path (sum + comparison
+only, since a rejected prefetch touches no counter).
 
 ### Latency model
 
@@ -90,6 +106,9 @@ nothing to overlap.)
 
 ### `AdmissionGateBenchmark` — gate decisions throughput (higher is better)
 
+Admit path (`budgetMiB=64`, times sum + inc + dec); the reject path (`budgetMiB=0`) times only
+`sum()` + the comparison and runs at least as fast.
+
 | threads | ops/µs (aggregate) |
 | --- | --- |
 | 1 | 112 |
@@ -106,13 +125,17 @@ nothing to overlap.)
   does not justify raising it, and arguably 2 is marginally better on this workload. Lowering the
   default to 2 is a possible follow-up but the gain is within noise here — not worth changing
   without a target-hardware run confirming it.
-- **STRIDED tracks SEQUENTIAL** (~half the time for half the chunks) — no separate strided knee that
-  would argue for a workload-specific override.
+- **STRIDED costs ~half of SEQUENTIAL** — but because it reads half the chunks (32 vs 64), each a
+  cold consumer-paid miss, NOT because look-ahead helps (the +1-chunk prefetcher loads the skipped
+  odd chunks, so prefetch is pure waste here). The multiplier curve is flat-to-mildly-regressing
+  just as in SEQUENTIAL, so there is no separate strided knee that would argue for a
+  workload-specific override.
 - **The gate is never the bottleneck.** Aggregate `admitAndAccount` throughput falls from 112 ops/µs
   (1 thread) to ~24 ops/µs (8–32 threads) as `LongAdder.sum()` scans more cells — real contention,
   but a floor of ~24 million gate decisions/sec is ~4–5 orders of magnitude above the actual
-  prefetch admission rate (bounded by chunk-load latency). So raising the multiplier costs memory
-  headroom, never CPU on the gate.
+  prefetch admission rate (bounded by chunk-load latency). Note this measures per-decision cost
+  under cell contention, not a budget saturated near its limit. So raising the multiplier costs
+  memory headroom, never CPU on the gate.
 
 The default lives in `CachedFsConfig.DEFAULT_PREFETCH_MAX_PENDING_MULTIPLIER`; change it there (and
 the README config-reference row) if a target-hardware run warrants. As of this harness landing, no

@@ -19,16 +19,22 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.luciferyang.cachedfs.hadoop.CacheBootstrap;
+import io.github.luciferyang.cachedfs.hadoop.CachedFileSystem;
 import io.github.luciferyang.cachedfs.hadoop.CachedFsConfig;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
+import java.net.URI;
+import java.nio.file.Files;
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.LocalFileSystem;
+import org.apache.hadoop.fs.Path;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 class CachedFsBootstrapMBeanTest {
 
@@ -107,6 +113,32 @@ class CachedFsBootstrapMBeanTest {
   }
 
   @Test
+  @DisplayName("counters() reflects real IO: io.read-bytes moves after a read through the cache")
+  void countersReflectRealIo(@TempDir java.nio.file.Path dir) throws Exception {
+    byte[] payload = new byte[8192];
+    for (int i = 0; i < payload.length; i++) {
+      payload[i] = (byte) i;
+    }
+    java.nio.file.Path file = dir.resolve("io.bin");
+    Files.write(file, payload);
+
+    Configuration conf = minimalConf();
+    try (CachedFileSystem cfs = new CachedFileSystem()) {
+      cfs.initialize(URI.create("file:///"), conf);
+      CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+      CachedFsBootstrapMBean mbean = new CachedFsBootstrapMBean(b);
+
+      assertThat(mbean.counters().get("io.read-bytes")).isZero();
+
+      try (FSDataInputStream in = cfs.open(new Path(file.toUri()), 4096)) {
+        in.readFully(0, new byte[4096]);
+      }
+      // aggregate merges on stream close — read-bytes must now reflect the 4096 consumed.
+      assertThat(mbean.counters().get("io.read-bytes")).isEqualTo(4096L);
+    }
+  }
+
+  @Test
   @DisplayName("inspect(key) reports open-handle false when nothing is cached for that key")
   void inspectReportsMiss() throws Exception {
     CacheBootstrap b = CacheBootstrap.installIfNeeded(minimalConf());
@@ -165,6 +197,58 @@ class CachedFsBootstrapMBeanTest {
     CacheBootstrap b = CacheBootstrap.installIfNeeded(minimalConf());
     CachedFsBootstrapMBean mbean = new CachedFsBootstrapMBean(b);
     assertThat(mbean.purgeMatching(".*")).isZero();
+  }
+
+  @Test
+  @DisplayName("drain() reports the number of open handles, not a constant 0")
+  void drainClosesOpenHandles(@TempDir java.nio.file.Path dir) throws Exception {
+    Configuration conf = minimalConf();
+    try (CachedFileSystem cfs = new CachedFileSystem()) {
+      cfs.initialize(URI.create("file:///"), conf);
+      CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+      CachedFsBootstrapMBean mbean = new CachedFsBootstrapMBean(b);
+
+      openAndRead(cfs, dir, "drain-a.bin");
+      openAndRead(cfs, dir, "drain-b.bin");
+      // Streams closed (handles unpinned) but still cached in the LRU — two distinct keys.
+      assertThat(b.handleFactory().size()).isEqualTo(2);
+      assertThat(mbean.drain()).isEqualTo(2);
+      assertThat(b.handleFactory().size()).isZero();
+    }
+  }
+
+  @Test
+  @DisplayName("purgeMatching closes only the keys matching the regex")
+  void purgeMatchingByRegex(@TempDir java.nio.file.Path dir) throws Exception {
+    Configuration conf = minimalConf();
+    try (CachedFileSystem cfs = new CachedFileSystem()) {
+      cfs.initialize(URI.create("file:///"), conf);
+      CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+      CachedFsBootstrapMBean mbean = new CachedFsBootstrapMBean(b);
+
+      openAndRead(cfs, dir, "keep.bin");
+      openAndRead(cfs, dir, "purge-me.bin");
+      assertThat(b.handleFactory().size()).isEqualTo(2);
+
+      // Match only the 'purge-me' key → closes 1, leaves 'keep'.
+      assertThat(mbean.purgeMatching(".*purge-me.*")).isEqualTo(1);
+      assertThat(b.handleFactory().size()).isEqualTo(1);
+      // A non-matching regex closes nothing.
+      assertThat(mbean.purgeMatching(".*no-such-key.*")).isZero();
+      assertThat(b.handleFactory().size()).isEqualTo(1);
+    }
+  }
+
+  /**
+   * Opens {@code name} under {@code dir} through {@code cfs}, reads a few bytes, closes the stream.
+   */
+  private static void openAndRead(CachedFileSystem cfs, java.nio.file.Path dir, String name)
+      throws IOException {
+    java.nio.file.Path file = dir.resolve(name);
+    Files.write(file, new byte[1024]);
+    try (FSDataInputStream in = cfs.open(new Path(file.toUri()), 4096)) {
+      in.readFully(0, new byte[16]);
+    }
   }
 
   private static Configuration minimalConf() {
