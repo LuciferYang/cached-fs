@@ -156,6 +156,7 @@ Prometheus exporters rewrite dots to underscores (e.g. `cached_fs_read_total`). 
 | `cached-fs-spark` | Spark soft-affinity scheduling (consistent-hash + feedback-driven duplicate-reading detect). Targets Spark 4.0+ / Scala 2.13 / JDK 21. |
 | `cached-fs-metrics` | JMX MBeans + Micrometer/Prometheus exporters. Optional. |
 | `cached-fs-cli` | Operations tooling. |
+| `cached-fs-bench` | JMH microbenchmarks (prefetch multiplier tuning, admission-gate contention). Run on-demand via `java -jar`; see `docs/bench/`. |
 
 ## Spark soft-affinity (cached-fs-spark)
 

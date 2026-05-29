@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.github.luciferyang</groupId>
+    <artifactId>cached-fs-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>cached-fs-bench</artifactId>
+  <name>cached-fs (bench)</name>
+  <description>JMH microbenchmarks: prefetch admission multiplier tuning and gate contention.</description>
+
+  <properties>
+    <jmh.version>1.37</jmh.version>
+    <!-- Benchmarks are run on-demand via `java -jar target/benchmarks.jar`, never during the
+         reactor build. JaCoCo would otherwise weave the benchmark fork and skew every number; no
+         coverage is meaningful for a benchmark module, so disable the agent here. -->
+    <jacoco.skip>true</jacoco.skip>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>io.github.luciferyang</groupId>
+      <artifactId>cached-fs-core</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.github.luciferyang</groupId>
+      <artifactId>cached-fs-hadoop</artifactId>
+    </dependency>
+    <!-- Hadoop is `provided` in cached-fs-hadoop because the host app already ships it. The
+         benchmark jar is standalone (run via `java -jar`), so override to `compile` to bundle it.
+         Mirrors the cached-fs-cli scope override. -->
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-common</artifactId>
+      <scope>compile</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.openjdk.jmh</groupId>
+      <artifactId>jmh-core</artifactId>
+      <version>${jmh.version}</version>
+    </dependency>
+    <!-- Annotation processor that generates the synthetic benchmark runners + META-INF/BenchmarkList.
+         `provided` so it runs at compile time but isn't bundled into the shaded jar. -->
+    <dependency>
+      <groupId>org.openjdk.jmh</groupId>
+      <artifactId>jmh-generator-annprocess</artifactId>
+      <version>${jmh.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-simple</artifactId>
+      <version>${slf4j.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- byte-buddy-agent: parent surefire argLine references the agent jar's path; without the dep
+         on the test classpath the property stays a literal placeholder and the fork fails. -->
+    <dependency>
+      <groupId>net.bytebuddy</groupId>
+      <artifactId>byte-buddy-agent</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- Bundle every benchmark + its deps into target/benchmarks.jar with JMH's Main as the
+           entry point: `java -jar cached-fs-bench/target/benchmarks.jar <regex> <opts>`. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.6.0</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals>
+              <goal>shade</goal>
+            </goals>
+            <configuration>
+              <finalName>benchmarks</finalName>
+              <transformers>
+                <transformer
+                    implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass>org.openjdk.jmh.Main</mainClass>
+                </transformer>
+                <!-- JMH ships a META-INF/BenchmarkList + CompilerHints per jar; merge rather than
+                     last-wins so the generated benchmark index survives shading. -->
+                <transformer
+                    implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+              </transformers>
+              <filters>
+                <filter>
+                  <!-- Strip signature files from signed deps (bouncycastle etc. pulled by hadoop)
+                       so the shaded jar's manifest stays valid. Also drop dnsjava's custom
+                       InetAddressResolverProvider service registration: JMH forks a fresh JVM that
+                       fails to load the provider class from the shaded jar during network init, and
+                       the benchmark only uses file:// URIs, so the JDK's built-in resolver is fine. -->
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                    <exclude>META-INF/services/java.net.spi.InetAddressResolverProvider</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>
