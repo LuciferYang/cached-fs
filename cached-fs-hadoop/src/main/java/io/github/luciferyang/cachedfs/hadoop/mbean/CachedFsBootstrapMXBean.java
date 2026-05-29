@@ -45,6 +45,18 @@ public interface CachedFsBootstrapMXBean {
   String stats();
 
   /**
+   * Returns the same numeric values as {@link #stats} but as a typed name → value map, so a caller
+   * can compute deltas/rates over a window without parsing the formatted text. Insertion-ordered to
+   * match the {@code stats()} layout. Cumulative counters (e.g. {@code read-bytes}) yield
+   * meaningful per-second rates; point-in-time gauges (e.g. {@code ram-num-entries}) yield a
+   * change-over-window that the caller may present differently.
+   *
+   * <p>{@code Map<String, Long>} is a JMX open type — JConsole renders it as a TabularData and a
+   * proxied client gets the map back directly.
+   */
+  java.util.Map<String, Long> counters();
+
+  /**
    * Returns a multi-line dump of the most-recent stream snapshots (oldest-discarded ring buffer)
    * with at most {@code limit} entries. Pass {@code 0} for "all retained". Pass a positive cap when
    * you want only the freshest. Each line summarizes one {@code IoStatisticsSnapshot}.

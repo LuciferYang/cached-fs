@@ -37,7 +37,7 @@ For multi-scheme caching in the same JVM, give each `FileSystem.get(uri, conf)` 
 
 - `open(Path)`, `open(Path, int)`, and `openFile(Path).build()` all route through the cache. `openFile(PathHandle)` and `open(PathHandle, int)` route through the cache when the supplied handle implements `io.github.luciferyang.cachedfs.hadoop.spi.ContentAddressedPathHandle` (opt-in SPI exposing `contentHash()` + `contentLength()`); plain `PathHandle`s still delegate to the inner FS because their bytes are opaque.
 - `applyTTL(ttlSeconds)` rejects negative values and values larger than the current epoch second.
-- The `cached-fs-cli` ships static subcommands (`config`, `version`) and live-state subcommands (`inspect <key>`, `stats`, `recent-streams`, `drain --yes`, `purge <regex> --yes`) backed by the `CachedFsBootstrapMXBean` JMX MBean. Live commands default to the local platform MBean server; pass `--jmx-url <service-url>` to target a remote JVM.
+- The `cached-fs-cli` ships static subcommands (`config`, `version`) and live-state subcommands (`inspect <key>`, `stats` / `stats --window <seconds>`, `recent-streams`, `drain --yes`, `purge <regex> --yes`) backed by the `CachedFsBootstrapMXBean` JMX MBean. `stats --window` samples twice that many seconds apart and prints per-counter change + per-second rate (like `iostat 5`). Live commands default to the local platform MBean server; pass `--jmx-url <service-url>` to target a remote JVM.
 
 ### Configuration reference
 

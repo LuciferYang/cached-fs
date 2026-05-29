@@ -22,7 +22,9 @@ import io.github.luciferyang.cachedfs.core.tracker.ScanTracker;
 import io.github.luciferyang.cachedfs.hadoop.CacheBootstrap;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.regex.Pattern;
@@ -135,6 +137,55 @@ public final class CachedFsBootstrapMBean implements CachedFsBootstrapMXBean {
     sb.append("added-total: ").append(bootstrap.recentStreams().addedTotal()).append('\n');
 
     return sb.toString();
+  }
+
+  @Override
+  public Map<String, Long> counters() {
+    // Insertion-ordered + namespaced keys (io. / ram. / handles. / trackers. / recent-streams.) so
+    // the flat map stays collision-free and groups read naturally. The CLI computes window deltas
+    // from this; cumulative counters yield per-second rates, gauges yield change-over-window.
+    Map<String, Long> m = new LinkedHashMap<>();
+    AggregatedIoStatistics agg = bootstrap.aggregateIoStats();
+    m.put("io.ram-hit", agg.ramHit());
+    m.put("io.ram-hit-bytes", agg.ramHitBytes());
+    m.put("io.read", agg.read());
+    m.put("io.read-bytes", agg.readBytes());
+    m.put("io.prefetch", agg.prefetch());
+    m.put("io.prefetch-bytes", agg.prefetchBytes());
+    m.put("io.ssd-read", agg.ssdRead());
+    m.put("io.ssd-read-bytes", agg.ssdReadBytes());
+    m.put("io.raw-overread-bytes", agg.rawOverreadBytes());
+    m.put("io.stale-scan-id-recoveries", agg.staleScanIdRecoveries());
+    m.put("io.prefetch-evicted-before-use", agg.prefetchEvictedBeforeUse());
+    m.put("io.prefetch-eligible-suppressed-bytes", agg.prefetchEligibleSuppressedBytes());
+    m.put("io.seq-hwm-regime-resets", agg.seqHwmRegimeResets());
+    m.put("io.prefetch-skipped-queue-full", agg.prefetchSkipped("queue_full"));
+    m.put("io.prefetch-skipped-budget", agg.prefetchSkipped("budget"));
+    m.put("io.prefetch-skipped-heap-pressure", agg.prefetchSkipped("heap_pressure"));
+    m.put("io.prefetch-skipped-other", agg.prefetchSkipped("other"));
+
+    CacheStats ram = bootstrap.ramCache().refreshStats();
+    m.put("ram.num-entries", (long) ram.numEntries());
+    m.put("ram.tiny-size", ram.tinySize());
+    m.put("ram.large-size", ram.largeSize());
+    m.put("ram.num-hit", ram.numHit());
+    m.put("ram.hit-bytes", ram.hitBytes());
+    m.put("ram.num-new", ram.numNew());
+    m.put("ram.num-evict", ram.numEvict());
+    m.put("ram.num-aged-out", ram.numAgedOut());
+    m.put("ram.num-stales", ram.numStales());
+
+    m.put("handles.size", (long) bootstrap.handleFactory().size());
+
+    m.put("trackers.scan-tracker-count", (long) bootstrap.scanTrackerCount());
+    m.put("trackers.scan-tracker-entries", bootstrap.scanTrackerEntries());
+    m.put("trackers.scan-tracker-max-entries", bootstrap.scanTrackerMaxEntries());
+    m.put("trackers.scan-tracker-entries-rejected", bootstrap.scanTrackerEntriesRejected());
+    m.put("trackers.scan-trackers-rejected", bootstrap.scanTrackersRejected());
+
+    m.put("recent-streams.capacity", (long) bootstrap.recentStreams().capacity());
+    m.put("recent-streams.added-total", bootstrap.recentStreams().addedTotal());
+    return m;
   }
 
   @Override

@@ -77,7 +77,11 @@ public final class JmxClient implements AutoCloseable {
     JMXConnector connector = JMXConnectorFactory.connect(url);
     MBeanServerConnection conn = connector.getMBeanServerConnection();
     ObjectName name = parseObjectName(objectName);
-    CachedFsBootstrapMXBean proxy = JMX.newMBeanProxy(conn, name, CachedFsBootstrapMXBean.class);
+    // newMXBeanProxy (not newMBeanProxy): the bean is registered as an MXBean, so open types like
+    // counters()'s Map<String,Long> travel as TabularData on the wire. A standard MBean proxy would
+    // hand that TabularData straight back and ClassCastException on the Map cast; the MXBean proxy
+    // reconstructs the Map. String/long methods behave identically either way.
+    CachedFsBootstrapMXBean proxy = JMX.newMXBeanProxy(conn, name, CachedFsBootstrapMXBean.class);
     return new JmxClient(connector, proxy);
   }
 
@@ -88,7 +92,7 @@ public final class JmxClient implements AutoCloseable {
   public static JmxClient local(String objectName) {
     ObjectName name = parseObjectName(objectName);
     CachedFsBootstrapMXBean proxy =
-        JMX.newMBeanProxy(
+        JMX.newMXBeanProxy(
             ManagementFactory.getPlatformMBeanServer(), name, CachedFsBootstrapMXBean.class);
     return new JmxClient(null, proxy);
   }

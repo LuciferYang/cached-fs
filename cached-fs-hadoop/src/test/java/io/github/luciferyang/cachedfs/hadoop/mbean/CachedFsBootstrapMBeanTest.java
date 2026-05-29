@@ -86,6 +86,27 @@ class CachedFsBootstrapMBeanTest {
   }
 
   @Test
+  @DisplayName("counters() returns the namespaced numeric map for windowed-delta computation")
+  void countersReturnsNamespacedMap() throws Exception {
+    CacheBootstrap b = CacheBootstrap.installIfNeeded(minimalConf());
+    CachedFsBootstrapMBean mbean = new CachedFsBootstrapMBean(b);
+    java.util.Map<String, Long> c = mbean.counters();
+    // Spot-check one key per namespace and that every value is non-negative on a fresh bootstrap.
+    assertThat(c)
+        .containsKeys(
+            "io.read-bytes",
+            "ram.num-entries",
+            "handles.size",
+            "trackers.scan-tracker-count",
+            "recent-streams.added-total");
+    assertThat(c.values()).allMatch(v -> v >= 0L);
+    // Insertion order: io.* group comes before recent-streams.* (matches the stats() layout).
+    var keys = new java.util.ArrayList<>(c.keySet());
+    assertThat(keys.indexOf("io.read-bytes"))
+        .isLessThan(keys.indexOf("recent-streams.added-total"));
+  }
+
+  @Test
   @DisplayName("inspect(key) reports open-handle false when nothing is cached for that key")
   void inspectReportsMiss() throws Exception {
     CacheBootstrap b = CacheBootstrap.installIfNeeded(minimalConf());

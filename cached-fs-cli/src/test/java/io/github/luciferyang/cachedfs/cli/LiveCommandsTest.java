@@ -65,6 +65,33 @@ class LiveCommandsTest {
   }
 
   @Test
+  @DisplayName("stats --window samples twice and prints per-counter delta + per-second rate")
+  void statsWindowPrintsRates() {
+    StringWriter sw = new StringWriter();
+    CommandLine cli = new CommandLine(new CachedFsCli()).setOut(new PrintWriter(sw));
+    int code = cli.execute("stats", "--window", "1");
+    assertThat(code).isZero();
+    String out = sw.toString();
+    assertThat(out)
+        .contains("=== cached-fs stats --window 1s")
+        .contains("counter")
+        .contains("current")
+        .contains("delta")
+        .contains("per-sec")
+        .contains("io.read-bytes");
+  }
+
+  @Test
+  @DisplayName("stats --window 0 is rejected with exit code 2")
+  void statsWindowRejectsNonPositive() {
+    StringWriter errW = new StringWriter();
+    CommandLine cli = new CommandLine(new CachedFsCli()).setErr(new PrintWriter(errW));
+    int code = cli.execute("stats", "--window", "0");
+    assertThat(code).isEqualTo(2);
+    assertThat(errW.toString()).contains("--window must be > 0");
+  }
+
+  @Test
   @DisplayName("inspect subcommand reports open-handle false for an unknown key")
   void inspectUnknownKey() {
     StringWriter sw = new StringWriter();
