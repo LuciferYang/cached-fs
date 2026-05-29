@@ -32,6 +32,13 @@ jobs:
             hadoop: '3.4.1'
             spark-profile: 'spark-4.0'
             locale: 'de_DE'
+          # Hadoop 3.5.x compatibility on the supported JDK. Production pins 3.4.1, but the
+          # decorator does reflective rebuilds of S3ALocatedFileStatus / AbfsLocatedFileStatus /
+          # EtagSource — internal Hadoop API that drifts across minors. This cell catches a
+          # reflection/API break against the 3.5.x line (also the line a future JDK-25 cell needs).
+          - jdk: '21'
+            hadoop: '3.5.0'
+            spark-profile: 'spark-4.0'
           # JDK 25 cell intentionally absent until Spark 4.2 GA ships. JDK 24 removed
           # Subject.getSubject(AccessControlContext); JDK 25 also rejects
           # -Djava.security.manager=allow (JEP 486 finalized). Hadoop UGI — called by
@@ -47,9 +54,9 @@ jobs:
       LANG: ${{ matrix.locale == 'de_DE' && 'de_DE.UTF-8' || 'C.UTF-8' }}
       LC_ALL: ${{ matrix.locale == 'de_DE' && 'de_DE.UTF-8' || 'C.UTF-8' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Set up JDK ${{ matrix.jdk }}
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: ${{ matrix.jdk }}
@@ -80,9 +87,9 @@ jobs:
         # failure, or a JDK-fork mismatch (all of which we've hit by hand, never via CI). A tiny
         # run (no warmup, one 1s measurement, -foe so a benchmark error fails the step) proves
         # every benchmark actually launches and completes in a forked JVM. Run once, on the plain
-        # spark-4.0 jdk-21 cell (the fork JVM is this cell's JDK 21; profile/locale are irrelevant
-        # to the bench module).
-        if: matrix.jdk == '21' && matrix.spark-profile == 'spark-4.0' && matrix.locale != 'de_DE'
+        # spark-4.0 jdk-21 cell (the fork JVM is this cell's JDK 21; profile/hadoop/locale are
+        # irrelevant to the bench module, so run it once on the baseline cell).
+        if: matrix.jdk == '21' && matrix.spark-profile == 'spark-4.0' && matrix.hadoop == '3.4.1' && matrix.locale != 'de_DE'
         run: |
           java -jar cached-fs-bench/target/benchmarks.jar PrefetchMultiplierBenchmark \
             -foe true -f 1 -wi 0 -i 1 -r 1 \
@@ -90,12 +97,13 @@ jobs:
           java -jar cached-fs-bench/target/benchmarks.jar AdmissionGateBenchmark \
             -foe true -f 1 -wi 0 -i 1 -r 1 -p budgetMiB=64
       - name: Upload coverage
-        # Exclude the de_DE cell: it shares the jdk21/spark-4.0 artifact name with the baseline
-        # cell, and upload-artifact@v4 rejects duplicate names within a run.
-        if: matrix.jdk == '21' && matrix.locale != 'de_DE'
-        uses: actions/upload-artifact@v4
+        # Upload only from the production-pinned hadoop-3.4.1 cells, and not the de_DE cell:
+        # otherwise the hadoop-3.5.0 / de_DE cells would reuse the jdk21/spark-4.0 artifact name and
+        # upload-artifact rejects duplicate names within a run.
+        if: matrix.jdk == '21' && matrix.hadoop == '3.4.1' && matrix.locale != 'de_DE'
+        uses: actions/upload-artifact@v7
         with:
-          # Now that two JDK 21 cells exist (spark-4.0 and spark-4.1), include the profile in
-          # the artifact name so the second upload doesn't collide with the first.
+          # Two JDK 21 / hadoop-3.4.1 cells exist (spark-4.0 and spark-4.1), so include the profile
+          # in the artifact name so the second upload doesn't collide with the first.
           name: jacoco-report-jdk${{ matrix.jdk }}-${{ matrix.spark-profile }}
           path: '**/target/site/jacoco/'
