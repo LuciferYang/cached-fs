@@ -492,12 +492,11 @@ class CachedFileSystemTest {
   }
 
   @Test
-  @DisplayName("openFile(PathHandle) builder comes from the inner FS (documented bypass)")
-  void openFilePathHandlePassesThrough(@TempDir java.nio.file.Path dir) throws Exception {
-    // PathHandle's opaque content tag prevents reliable cache keying, so we delegate to the inner
-    // FS. LocalFileSystem hands back a builder whose build() would throw later; we just verify the
-    // decorator returns a non-null builder produced by the inner (NOT by our static-nested
-    // CachedFsInputStreamBuilder class).
+  @DisplayName("openFile(PathHandle) without the marker interface delegates to the inner FS")
+  void openFilePathHandleDelegatesForNonMarker(@TempDir java.nio.file.Path dir) throws Exception {
+    // A plain PathHandle (not implementing ContentAddressedPathHandle) bypasses the cache: the
+    // decorator returns the INNER FS builder, not the cah builder. Guards the contract that
+    // connectors opt INTO content-addressed caching by implementing the marker.
     byte[] payload = bytes(64);
     java.nio.file.Path file = dir.resolve("ph.bin");
     Files.write(file, payload);
@@ -506,8 +505,181 @@ class CachedFileSystemTest {
       org.apache.hadoop.fs.PathHandle dummyHandle = () -> java.nio.ByteBuffer.allocate(0);
       org.apache.hadoop.fs.FutureDataInputStreamBuilder builder = cfs.openFile(dummyHandle);
       assertThat(builder).isNotNull();
-      // Builder class is NOT our inner static class — proves delegation, not interception.
-      assertThat(builder.getClass().getName()).doesNotContain("CachedFsInputStreamBuilder");
+      assertThat(builder.getClass().getName()).doesNotContain("CachedFsPathHandleBuilder");
+    }
+  }
+
+  // --- L1: content-addressed PathHandle caching ---------------------------
+
+  @Test
+  @DisplayName(
+      "open(ContentAddressedPathHandle, int) populates the cache; second open is served from RAM")
+  void contentAddressedPathHandleCachesOnSecondOpen(@TempDir java.nio.file.Path dir)
+      throws Exception {
+    byte[] payload = bytes(2048);
+    java.nio.file.Path file = dir.resolve("cah-hit.bin");
+    Files.write(file, payload);
+
+    Configuration conf = new Configuration(false);
+    conf.setBoolean(CachedFsConfig.ENABLED, true);
+    conf.set(CachedFsConfig.INNER_IMPL, PathHandleAwareLocalFs.class.getName());
+    conf.setInt(CachedFsConfig.LOAD_QUANTUM_BYTES, 1024);
+    try (CachedFileSystem cfs = newCfs(file.toUri(), conf)) {
+      Path p = new Path(file.toUri());
+      byte[] contentHash = sha256Of(payload);
+      TestCah handle = new TestCah(contentHash, payload.length, p);
+
+      try (FSDataInputStream in = cfs.open(handle, 4096)) {
+        byte[] got = in.readAllBytes();
+        assertThat(got).isEqualTo(payload);
+        assertThat(in.getWrappedStream()).isInstanceOf(CachingInputStream.class);
+      }
+      var statsBefore = CacheBootstrap.get().orElseThrow().ramCache().refreshStats();
+      try (FSDataInputStream in = cfs.open(handle, 4096)) {
+        byte[] got = in.readAllBytes();
+        assertThat(got).isEqualTo(payload);
+      }
+      var statsAfter = CacheBootstrap.get().orElseThrow().ramCache().refreshStats();
+      // Second read served from RAM: numHit grows, numNew is unchanged.
+      assertThat(statsAfter.numHit()).isGreaterThan(statsBefore.numHit());
+      assertThat(statsAfter.numNew()).isEqualTo(statsBefore.numNew());
+    }
+  }
+
+  @Test
+  @DisplayName(
+      "openFile(ContentAddressedPathHandle).build() routes through the cache (Spark builder API)")
+  void openFileContentAddressedBuilderRoutesThroughCache(@TempDir java.nio.file.Path dir)
+      throws Exception {
+    byte[] payload = bytes(1024);
+    java.nio.file.Path file = dir.resolve("cah-builder.bin");
+    Files.write(file, payload);
+
+    Configuration conf = new Configuration(false);
+    conf.setBoolean(CachedFsConfig.ENABLED, true);
+    conf.set(CachedFsConfig.INNER_IMPL, PathHandleAwareLocalFs.class.getName());
+    try (CachedFileSystem cfs = newCfs(file.toUri(), conf)) {
+      Path p = new Path(file.toUri());
+      TestCah handle = new TestCah(sha256Of(payload), payload.length, p);
+      try (FSDataInputStream in = cfs.openFile(handle).build().get()) {
+        byte[] got = in.readAllBytes();
+        assertThat(got).isEqualTo(payload);
+        assertThat(in.getWrappedStream()).isInstanceOf(CachingInputStream.class);
+      }
+    }
+  }
+
+  @Test
+  @DisplayName(
+      "fs.cached.path-handle.cache-enabled=false makes a marker handle pass through to the inner"
+          + " FS")
+  void contentAddressedDisableSwitchPassesThrough(@TempDir java.nio.file.Path dir)
+      throws Exception {
+    byte[] payload = bytes(64);
+    java.nio.file.Path file = dir.resolve("cah-off.bin");
+    Files.write(file, payload);
+
+    Configuration conf = new Configuration(false);
+    conf.setBoolean(CachedFsConfig.ENABLED, true);
+    conf.setBoolean(CachedFsConfig.PATH_HANDLE_CACHE_ENABLED, false);
+    conf.set(CachedFsConfig.INNER_IMPL, PathHandleAwareLocalFs.class.getName());
+    try (CachedFileSystem cfs = newCfs(file.toUri(), conf)) {
+      Path p = new Path(file.toUri());
+      TestCah handle = new TestCah(sha256Of(payload), payload.length, p);
+      // Builder is the inner FS's, not ours — proves the toggle short-circuits before the cah path.
+      assertThat(cfs.openFile(handle).getClass().getName())
+          .doesNotContain("CachedFsPathHandleBuilder");
+      // No cah handle is registered when the toggle is off.
+      CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+      assertThat(b.handleFactory().size()).isZero();
+    }
+  }
+
+  @Test
+  @DisplayName(
+      "open(ContentAddressedPathHandle) with empty contentHash falls back to inner-FS passthrough")
+  void contentAddressedEmptyHashFallsBack(@TempDir java.nio.file.Path dir) throws Exception {
+    byte[] payload = bytes(32);
+    java.nio.file.Path file = dir.resolve("cah-empty.bin");
+    Files.write(file, payload);
+
+    Configuration conf = new Configuration(false);
+    conf.setBoolean(CachedFsConfig.ENABLED, true);
+    conf.set(CachedFsConfig.INNER_IMPL, PathHandleAwareLocalFs.class.getName());
+    try (CachedFileSystem cfs = newCfs(file.toUri(), conf)) {
+      Path p = new Path(file.toUri());
+      TestCah empty = new TestCah(new byte[0], payload.length, p);
+      try (FSDataInputStream in = cfs.open(empty, 4096)) {
+        // PathHandleAwareLocalFs delegates to a Path-based open — bytes still flow through, but
+        // through fs.open(pathHandle, _) which our fallback uses.
+        assertThat(in.readAllBytes()).isEqualTo(payload);
+        // Stream is NOT a CachingInputStream — proves the fallback to fs.open(pathHandle, _) fired.
+        assertThat(in.getWrappedStream()).isNotInstanceOf(CachingInputStream.class);
+      }
+      CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+      assertThat(b.handleFactory().size()).isZero();
+    }
+  }
+
+  /**
+   * Test-only ContentAddressedPathHandle that carries the actual {@link Path} so {@link
+   * PathHandleAwareLocalFs} can resolve it back to a real file read. Production handles wouldn't
+   * carry the Path — the connector resolves the bytes its own way — but this is the simplest way to
+   * exercise the cah open path against {@link LocalFileSystem}-style I/O.
+   */
+  static final class TestCah
+      implements io.github.luciferyang.cachedfs.hadoop.spi.ContentAddressedPathHandle {
+    private final byte[] contentHash;
+    private final long contentLength;
+    private final Path actualPath;
+
+    TestCah(byte[] contentHash, long contentLength, Path actualPath) {
+      this.contentHash = contentHash;
+      this.contentLength = contentLength;
+      this.actualPath = actualPath;
+    }
+
+    @Override
+    public byte[] contentHash() {
+      return contentHash.clone();
+    }
+
+    @Override
+    public long contentLength() {
+      return contentLength;
+    }
+
+    Path actualPath() {
+      return actualPath;
+    }
+
+    @Override
+    public java.nio.ByteBuffer bytes() {
+      return java.nio.ByteBuffer.wrap(contentHash);
+    }
+  }
+
+  /**
+   * Test-only FS that recognizes {@link TestCah} handles and resolves them to a real {@link
+   * RawLocalFileSystem} read. Lets the L1 tests exercise the cah opener path without a real
+   * content-addressed connector.
+   */
+  public static final class PathHandleAwareLocalFs extends RawLocalFileSystem {
+    @Override
+    public FSDataInputStream open(org.apache.hadoop.fs.PathHandle ph, int bufferSize)
+        throws IOException {
+      if (ph instanceof TestCah cah) {
+        return open(cah.actualPath(), bufferSize);
+      }
+      return super.open(ph, bufferSize);
+    }
+  }
+
+  private static byte[] sha256Of(byte[] data) {
+    try {
+      return java.security.MessageDigest.getInstance("SHA-256").digest(data);
+    } catch (java.security.NoSuchAlgorithmException ex) {
+      throw new IllegalStateException(ex);
     }
   }
 

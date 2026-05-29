@@ -22,14 +22,19 @@ import io.github.luciferyang.cachedfs.core.id.StringIdMap;
 import io.github.luciferyang.cachedfs.core.io.ReadFile;
 import io.github.luciferyang.cachedfs.core.stats.IoStatistics;
 import io.github.luciferyang.cachedfs.core.tracker.ScanTracker;
+import io.github.luciferyang.cachedfs.hadoop.spi.ContentAddressedPathHandle;
 import java.io.IOException;
 import java.net.URI;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.FilterFileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.PathHandle;
 import org.apache.hadoop.util.ReflectionUtils;
 
 /**
@@ -56,9 +61,10 @@ import org.apache.hadoop.util.ReflectionUtils;
  * openFile(Path).build()} all route through the cache — the builder-API override redirects to our
  * own {@code openFileWithOptions} so Spark vectorized Parquet/ORC readers, Iceberg, and S3A select
  * readers that prefer the modern builder still hit the cache. {@code openFile(PathHandle)} and
- * {@code open(PathHandle, int)} still pass through to the inner FS (PathHandle's opaque content tag
- * prevents the cache from keying on a stable file identity); document this gap to integrators using
- * PathHandle-based read APIs.
+ * {@code open(PathHandle, int)} route through the cache when the supplied handle implements {@link
+ * io.github.luciferyang.cachedfs.hadoop.spi.ContentAddressedPathHandle} (keyed by the handle's
+ * {@code contentHash}); plain {@link PathHandle}s still pass through to the inner FS because their
+ * bytes are opaque and the decorator cannot tell them apart from non-content-derived identifiers.
  */
 public class CachedFileSystem extends FilterFileSystem {
 
@@ -77,6 +83,23 @@ public class CachedFileSystem extends FilterFileSystem {
   // close.
   private volatile String endpoint;
   private volatile CacheBootstrap.HandleOpener ownOpener;
+
+  // Content-addressed PathHandle ("cah") routing. Parallel to {@code endpoint}/{@code ownOpener},
+  // but the registry key is derived from a SHA-1 of the inner endpoint so distinct decorators don't
+  // collide in the registry while the URI shape stays {@code cah://<dec-id>/<hex-contenthash>}.
+  // Null when L1 caching is disabled for this decorator (master toggle off or cah toggle off).
+  private volatile String cahEndpoint;
+  private volatile CacheBootstrap.HandleOpener cahOpener;
+
+  // Per-call stash used by the cah opener to access the PathHandle whose bytes can't be embedded in
+  // the registry key. Set by {@link #open(PathHandle, int)} immediately before invoking
+  // {@code handleFactory.generate}; cleared in {@code finally}. The opener fires synchronously on
+  // cache miss, so the stash is live exactly long enough to materialize the FileHandle. Cache hits
+  // do not consult the stash. Static rather than instance-scoped so a single thread that happens to
+  // route through two decorators in the same call frame still observes its own stash.
+  private static final ThreadLocal<CahStash> CAH_STASH = new ThreadLocal<>();
+
+  private record CahStash(PathHandle pathHandle, int bufferSize, long contentLength) {}
 
   public CachedFileSystem() {}
 
@@ -135,6 +158,11 @@ public class CachedFileSystem extends FilterFileSystem {
         this.endpoint = CacheBootstrap.endpointKey(inner.getUri());
         this.ownOpener = this::openHandleForKey;
         CacheBootstrap.installOpener(endpoint, ownOpener);
+        if (CachedFsConfig.pathHandleCacheEnabled(conf)) {
+          this.cahEndpoint = computeCahEndpoint(this.endpoint);
+          this.cahOpener = this::openCahHandleForKey;
+          CacheBootstrap.installOpener(cahEndpoint, cahOpener);
+        }
       }
       this.enabled = enableNow;
       initialized = true;
@@ -507,16 +535,162 @@ public class CachedFileSystem extends FilterFileSystem {
   }
 
   /**
-   * Bypass: {@code PathHandle} carries an opaque content tag and (per Hadoop's contract) refers to
-   * a specific file content version, not a path. The cache keys on {@code Path} → {@code
-   * StringIdMap.fileNum}, so we cannot reliably resolve a PathHandle back to a cached entry without
-   * an inner-FS round trip that re-canonicalizes. For now, delegate to the inner FS unchanged —
-   * future work may key cached entries on PathHandle.contentHash for connectors that publish one.
+   * Builder-style PathHandle open. When {@code pathHandle} implements {@link
+   * ContentAddressedPathHandle} and cache + cah routing are enabled, the returned builder's {@code
+   * build()} re-routes through {@link #open(PathHandle, int)} so the read is cached. Otherwise
+   * delegates to the inner FS unchanged (preserving the pre-L1 behavior for connectors that haven't
+   * opted into content-addressed caching).
    */
   @Override
-  public org.apache.hadoop.fs.FutureDataInputStreamBuilder openFile(
-      org.apache.hadoop.fs.PathHandle pathHandle) throws IOException {
-    return fs.openFile(pathHandle);
+  public org.apache.hadoop.fs.FutureDataInputStreamBuilder openFile(PathHandle pathHandle)
+      throws IOException {
+    if (!enabled || cahEndpoint == null || !(pathHandle instanceof ContentAddressedPathHandle)) {
+      return fs.openFile(pathHandle);
+    }
+    return new CachedFsPathHandleBuilder(this, pathHandle);
+  }
+
+  /**
+   * Direct PathHandle open. When the marker interface is implemented and the bootstrap is
+   * available, route the open through the handle factory keyed by content hash so the second open
+   * of the same content hash is a cache hit. Otherwise — and when {@link #enabled} is false or the
+   * cah opener was not registered — delegate to the inner FS unchanged.
+   */
+  @Override
+  public FSDataInputStream open(PathHandle pathHandle, int bufferSize) throws IOException {
+    if (!enabled
+        || cahEndpoint == null
+        || !(pathHandle instanceof ContentAddressedPathHandle cah)) {
+      return fs.open(pathHandle, bufferSize);
+    }
+    CacheBootstrap b = CacheBootstrap.get().orElse(null);
+    if (b == null) {
+      return fs.open(pathHandle, bufferSize);
+    }
+    return openContentAddressed(b, cah, bufferSize);
+  }
+
+  /**
+   * Cached path for {@link ContentAddressedPathHandle} reads. Mirrors {@link #open(Path, int)} but
+   * with a synthetic {@code cah://<dec-id>/<hex-contenthash>} cache key and a stash-driven opener
+   * so the {@link PathHandle} (which can't be embedded in a URI key) reaches the underlying {@link
+   * HadoopPathHandleReadFile}.
+   */
+  private FSDataInputStream openContentAddressed(
+      CacheBootstrap b, ContentAddressedPathHandle cah, int bufferSize) throws IOException {
+    byte[] contentHash = cah.contentHash();
+    if (contentHash == null || contentHash.length == 0) {
+      // Defensive: a contract violation by the implementing connector. Fall back to passthrough
+      // rather than feeding an empty key into the registry — which would either NPE or collide.
+      return fs.open(cah, bufferSize);
+    }
+    long contentLength = cah.contentLength();
+    if (contentLength < 0) {
+      throw new IOException(
+          "ContentAddressedPathHandle.contentLength must be >= 0: " + contentLength);
+    }
+    String key = cahEndpoint + "/" + HexFormat.of().formatHex(contentHash);
+    CAH_STASH.set(new CahStash(cah, bufferSize, contentLength));
+    CachedFactory.CachedPtr<String, FileHandle> ptr;
+    try {
+      ptr = b.handleFactory().open(key);
+    } catch (java.io.UncheckedIOException ex) {
+      throw ex.getCause();
+    } catch (RuntimeException ex) {
+      throw new IOException(ex);
+    } finally {
+      // Cache hits don't read the stash; cache misses fired the opener synchronously above and the
+      // FileHandle now retains the PathHandle by closure. Either way, clear the stash so a later
+      // unrelated open on this thread can't pick up stale state.
+      CAH_STASH.remove();
+    }
+    CachingInputStream cis = null;
+    boolean ptrTransferred = false;
+    try {
+      b.ttlController().recordOpen(ptr.value().fileNum());
+      Configuration conf = getConf();
+      String scanId = b.currentScanId();
+      if (scanId == null || scanId.isBlank()) {
+        scanId = conf.getTrimmed(CachedFsConfig.SCAN_ID, "default");
+      }
+      ScanTracker tracker =
+          CachedFsConfig.scanTrackerEnabled(conf) ? b.trackerFor(scanId) : ScanTracker.DISABLED;
+      IoStatistics ioStats =
+          CachedFsConfig.metricsEnabled(conf) ? new IoStatistics() : IoStatistics.NO_OP;
+      long totalRamBytes = Runtime.getRuntime().maxMemory();
+      boolean coalesceEnabled =
+          CachedFsConfig.coalesceEnabled(conf, totalRamBytes, b.loadQuantumBytes());
+      int maxGap = CachedFsConfig.coalesceMaxGapBytes(conf, b.loadQuantumBytes());
+      int maxChunksPerGroup =
+          CachedFsConfig.coalesceMaxChunksPerGroup(conf, totalRamBytes, b.loadQuantumBytes());
+      int maxRestarts = CachedFsConfig.coalesceMaxRestarts(conf);
+      boolean prefetchEnabled = CachedFsConfig.prefetchEnabled(conf);
+      boolean heapPressureCheck = CachedFsConfig.prefetchHeapPressureCheckEnabled(conf);
+      double triggerTail = CachedFsConfig.prefetchTriggerTailFraction(conf);
+      int densityPct = CachedFsConfig.prefetchDensityThresholdPct(conf);
+      long rejectionBackoffNs =
+          java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
+              CachedFsConfig.prefetchRejectionBackoffMs(conf));
+      cis =
+          new CachingInputStream(
+              ptr,
+              b.ramCache(),
+              b.loadQuantumBytes(),
+              tracker,
+              ioStats,
+              b.aggregateIoStats(),
+              coalesceEnabled,
+              maxGap,
+              maxChunksPerGroup,
+              maxRestarts,
+              b,
+              prefetchEnabled,
+              heapPressureCheck,
+              triggerTail,
+              densityPct,
+              rejectionBackoffNs);
+      ptrTransferred = true;
+      return new FSDataInputStream(cis);
+    } catch (java.io.UncheckedIOException ex) {
+      releaseOnFailure(ptr, cis, ptrTransferred, ex);
+      throw ex.getCause();
+    } catch (RuntimeException | Error ex) {
+      releaseOnFailure(ptr, cis, ptrTransferred, ex);
+      throw ex;
+    }
+  }
+
+  /**
+   * Trivial concrete subclass of {@link org.apache.hadoop.fs.impl.FutureDataInputStreamBuilderImpl}
+   * for the PathHandle path. The constructor variant that accepts a {@link PathHandle} doesn't
+   * exist on the base class, so the builder uses the Path-form constructor with a sentinel path
+   * (the cahEndpoint URI) and stashes the {@link PathHandle} for {@code build()} to consume. The
+   * sentinel path is never read by the cached path — {@code build()} hands the {@link PathHandle}
+   * straight to {@link #open(PathHandle, int)}.
+   */
+  private static final class CachedFsPathHandleBuilder
+      extends org.apache.hadoop.fs.impl.FutureDataInputStreamBuilderImpl {
+    private final PathHandle pathHandle;
+
+    CachedFsPathHandleBuilder(CachedFileSystem fs, PathHandle pathHandle) throws IOException {
+      super(fs, new Path(URI.create(fs.cahEndpoint + "/builder-sentinel")));
+      this.pathHandle = pathHandle;
+    }
+
+    @Override
+    public java.util.concurrent.CompletableFuture<FSDataInputStream> build() {
+      // Mirror Hadoop's reference build(): the FS_OPTION_OPENFILE_BUFFER_SIZE opt, when set,
+      // overrides the sticky bufferSize. Same precedence as CachedFsInputStreamBuilder.
+      int effectiveBufferSize =
+          getOptions()
+              .getInt(
+                  org.apache.hadoop.fs.Options.OpenFileOptions.FS_OPTION_OPENFILE_BUFFER_SIZE,
+                  getBufferSize());
+      CachedFileSystem cfs = (CachedFileSystem) getFS();
+      return org.apache.hadoop.util.LambdaUtils.eval(
+          new java.util.concurrent.CompletableFuture<>(),
+          () -> cfs.open(pathHandle, effectiveBufferSize));
+    }
   }
 
   /**
@@ -590,7 +764,9 @@ public class CachedFileSystem extends FilterFileSystem {
     this.enabled = false;
     IOException primary = null;
     String localEndpoint = this.endpoint;
+    String localCahEndpoint = this.cahEndpoint;
     CacheBootstrap.HandleOpener localOpener = this.ownOpener;
+    CacheBootstrap.HandleOpener localCahOpener = this.cahOpener;
     CacheBootstrap b = CacheBootstrap.get().orElse(null);
     if (b != null && localEndpoint != null) {
       if (localOpener != null) {
@@ -598,19 +774,25 @@ public class CachedFileSystem extends FilterFileSystem {
         // between our open and our close keeps its registration intact.
         CacheBootstrap.removeOpener(localEndpoint, localOpener);
       }
+      if (localCahEndpoint != null && localCahOpener != null) {
+        CacheBootstrap.removeOpener(localCahEndpoint, localCahOpener);
+      }
       try {
         // Match handles whose URI parses to the same endpoint (scheme + authority) as this
-        // decorator. Parsing the key handles edge cases that raw startsWith can't (empty
-        // authority — file:// endpoint vs file:/path keys; authorities with `:` or `-`).
-        // Catch Exception, not just URISyntaxException, because endpointKey throws
-        // IllegalArgumentException for a schemeless URI — an IAE escaping mid-iteration would
-        // half-drain the LRU and skip super.close() entirely.
+        // decorator (the regular endpoint OR the cah endpoint, when cah caching is enabled).
+        // Parsing the key handles edge cases that raw startsWith can't (empty authority —
+        // file:// endpoint vs file:/path keys; authorities with `:` or `-`). Catch Exception,
+        // not just URISyntaxException, because endpointKey throws IllegalArgumentException for
+        // a schemeless URI — an IAE escaping mid-iteration would half-drain the LRU and skip
+        // super.close() entirely.
         String captured = localEndpoint;
+        String capturedCah = localCahEndpoint;
         b.handleFactory()
             .closeMatching(
                 k -> {
                   try {
-                    return captured.equals(CacheBootstrap.endpointKey(new URI(k)));
+                    String ep = CacheBootstrap.endpointKey(new URI(k));
+                    return captured.equals(ep) || (capturedCah != null && capturedCah.equals(ep));
                   } catch (Exception ex) {
                     return false;
                   }
@@ -715,5 +897,73 @@ public class CachedFileSystem extends FilterFileSystem {
       return StringIdLease.empty(ids);
     }
     return new StringIdLease(ids, parent.toUri().toString());
+  }
+
+  /**
+   * Materializes a {@link FileHandle} for a content-addressed PathHandle cache miss. The {@link
+   * PathHandle} reference travels via {@link #CAH_STASH} because Hadoop's PathHandle bytes are
+   * opaque and not safe to URL-encode for round-trip; the registry key carries only the SHA-1-
+   * derived dec-id and a hex content hash. The stash MUST be populated by the caller (see {@link
+   * #openContentAddressed}) — a missing stash signals a programming error, not a recoverable
+   * runtime condition, and surfaces as IOException so callers see the declared exception type.
+   */
+  private FileHandle openCahHandleForKey(String key) throws IOException {
+    CahStash stash = CAH_STASH.get();
+    if (stash == null) {
+      throw new IOException(
+          "cah opener fired without a stash for key " + key + "; bootstrap routing inconsistent");
+    }
+    ReadFile rf =
+        new HadoopPathHandleReadFile(
+            fs, stash.pathHandle(), stash.bufferSize(), key, stash.contentLength());
+    try {
+      StringIdMap ids =
+          CacheBootstrap.get()
+              .orElseThrow(() -> new IllegalStateException("CacheBootstrap missing"))
+              .stringIds();
+      StringIdLease uuid = new StringIdLease(ids, key);
+      try {
+        // groupId for cah handles is the cah endpoint — content-addressed files have no natural
+        // parent directory, but the directory-level eviction signal still benefits from grouping
+        // all this decorator's cah entries under one lease.
+        StringIdLease groupId = new StringIdLease(ids, cahEndpoint);
+        try {
+          return new FileHandle(rf, uuid, groupId);
+        } catch (RuntimeException | Error ex) {
+          groupId.close();
+          throw ex;
+        }
+      } catch (RuntimeException | Error ex) {
+        uuid.close();
+        throw ex;
+      }
+    } catch (RuntimeException | Error ex) {
+      try {
+        rf.close();
+      } catch (IOException suppressed) {
+        ex.addSuppressed(suppressed);
+      }
+      throw ex;
+    }
+  }
+
+  /**
+   * Derives a deterministic, URI-safe, decorator-unique endpoint string for the cah registry from
+   * the inner FS endpoint. SHA-1 first 16 hex chars is enough to make per-decorator collisions
+   * astronomically unlikely while staying short enough to keep cache keys legible in logs.
+   */
+  private static String computeCahEndpoint(String innerEndpoint) {
+    try {
+      byte[] digest =
+          MessageDigest.getInstance("SHA-1")
+              .digest(innerEndpoint.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+      // 16 hex chars = 64 bits of the digest; ample for the per-JVM decorator count.
+      String decId = HexFormat.of().formatHex(digest, 0, 8);
+      return "cah://" + decId;
+    } catch (NoSuchAlgorithmException ex) {
+      // SHA-1 is mandated by the JRE; if it ever isn't available we'd rather not silently disable
+      // L1 caching — surface as a startup failure.
+      throw new IllegalStateException("SHA-1 not available for cah endpoint derivation", ex);
+    }
   }
 }

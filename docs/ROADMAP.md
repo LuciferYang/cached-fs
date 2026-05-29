@@ -36,7 +36,7 @@ Status legend:
 
 | # | Item | Status | Notes |
 | --- | --- | --- | --- |
-| L1 | `openFile(PathHandle)` / `open(PathHandle, int)` delegate to inner FS | ⚪ Deferred | `PathHandle.contentTag` is opaque; cache keying needs `PathHandle.contentHash` support. Unblocks Iceberg metadata-pointer reads. |
+| L1 | `openFile(PathHandle)` / `open(PathHandle, int)` delegate to inner FS | 🟢 Done | New `ContentAddressedPathHandle` SPI (cached-fs-hadoop/spi); when a `PathHandle` implements it the decorator caches keyed by `contentHash()` via a synthetic `cah://<dec-id>/<hex-contenthash>` registry endpoint. Plain `PathHandle`s still passthrough. New `fs.cached.path-handle.cache-enabled` (default true) toggles the routing. README Limitations updated. |
 
 ## Velox parity gaps (out of scope)
 

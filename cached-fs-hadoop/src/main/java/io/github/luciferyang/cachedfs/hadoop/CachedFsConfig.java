@@ -198,6 +198,19 @@ public final class CachedFsConfig {
 
   public static final boolean DEFAULT_METRICS_ENABLED = true;
 
+  /**
+   * {@code fs.cached.path-handle.cache-enabled} — toggle for caching reads issued via {@code
+   * openFile(PathHandle)} / {@code open(PathHandle, int)} when the supplied handle implements
+   * {@link io.github.luciferyang.cachedfs.hadoop.spi.ContentAddressedPathHandle}. Default {@code
+   * true}: connectors that publish a content hash get cache reuse for free. Set to {@code false} to
+   * revert to the pre-L1 passthrough behavior for diagnostics or A/B benchmarking. Has no effect
+   * when {@link #ENABLED} is {@code false} or when the supplied handle does not implement the
+   * marker interface — both already passthrough.
+   */
+  public static final String PATH_HANDLE_CACHE_ENABLED = "fs.cached.path-handle.cache-enabled";
+
+  public static final boolean DEFAULT_PATH_HANDLE_CACHE_ENABLED = true;
+
   // --- coalescing -----------------------------------------------
 
   /**
@@ -412,6 +425,10 @@ public final class CachedFsConfig {
 
   public static boolean metricsEnabled(Configuration conf) {
     return conf.getBoolean(METRICS_ENABLED, DEFAULT_METRICS_ENABLED);
+  }
+
+  public static boolean pathHandleCacheEnabled(Configuration conf) {
+    return conf.getBoolean(PATH_HANDLE_CACHE_ENABLED, DEFAULT_PATH_HANDLE_CACHE_ENABLED);
   }
 
   // --- coalescing parsers --------------------------------------------------
