@@ -22,11 +22,13 @@ jobs:
           - jdk: '21'
             hadoop: '3.4.1'
             spark-profile: 'spark-4.1'
-          # JDK 25 needs Hadoop 3.5.x — earlier Hadoop releases call
-          # Subject.getSubject(AccessControlContext) which was removed in JDK 24+.
-          - jdk: '25'
-            hadoop: '3.5.0'
-            spark-profile: 'spark-4.0'
+          # JDK 25 cell intentionally absent until Spark 4.2 GA ships. JDK 24 removed
+          # Subject.getSubject(AccessControlContext); JDK 25 also rejects
+          # -Djava.security.manager=allow (JEP 486 finalized). Hadoop UGI — called by
+          # Spark's SparkContext init via Utils.getCurrentUserName — still hits the removed
+          # API, so every Suite that builds a SparkSession crashes before its first test.
+          # Spark 4.2 picks up the upstream migration to Subject.current(); re-add a
+          # {jdk:25, hadoop:3.5.x, spark-profile:spark-4.2} cell at that point.
     runs-on: ubuntu-latest
     name: build (jdk-${{ matrix.jdk }} hadoop-${{ matrix.hadoop }} ${{ matrix.spark-profile }})
     steps:

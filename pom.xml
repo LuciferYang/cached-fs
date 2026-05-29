@@ -168,10 +168,8 @@
           <configuration>
             <!-- @{argLine} expands JaCoCo's late-bound property so coverage works alongside our flags.
                  -javaagent attaches byte-buddy-agent so Mockito's inline mock-maker can rewrite
-                 final classes on JDK 24+, which removed dynamic agent self-attach.
-                 -Djava.security.manager=allow restores the legacy Subject.getSubject implementation
-                 on JDK 24+, which Hadoop UGI (called by Spark's SparkContext init) still needs. -->
-            <argLine>@{argLine} -javaagent:${net.bytebuddy:byte-buddy-agent:jar} --enable-native-access=ALL-UNNAMED -Djava.security.manager=allow</argLine>
+                 final classes on JDK 24+, which removed dynamic agent self-attach. -->
+            <argLine>@{argLine} -javaagent:${net.bytebuddy:byte-buddy-agent:jar} --enable-native-access=ALL-UNNAMED</argLine>
           </configuration>
         </plugin>
         <plugin>
@@ -181,10 +179,8 @@
           <configuration>
             <!-- @{argLine} expands JaCoCo's late-bound property so coverage works alongside our flags.
                  -javaagent attaches byte-buddy-agent so Mockito's inline mock-maker can rewrite
-                 final classes on JDK 24+, which removed dynamic agent self-attach.
-                 -Djava.security.manager=allow restores the legacy Subject.getSubject implementation
-                 on JDK 24+, which Hadoop UGI (called by Spark's SparkContext init) still needs. -->
-            <argLine>@{argLine} -javaagent:${net.bytebuddy:byte-buddy-agent:jar} --enable-native-access=ALL-UNNAMED -Djava.security.manager=allow</argLine>
+                 final classes on JDK 24+, which removed dynamic agent self-attach. -->
+            <argLine>@{argLine} -javaagent:${net.bytebuddy:byte-buddy-agent:jar} --enable-native-access=ALL-UNNAMED</argLine>
           </configuration>
           <executions>
             <execution>
