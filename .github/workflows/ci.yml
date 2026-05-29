@@ -22,6 +22,16 @@ jobs:
           - jdk: '21'
             hadoop: '3.4.1'
             spark-profile: 'spark-4.1'
+          # Locale cell: same stack as the spark-4.0 baseline but run under a comma-decimal
+          # locale (de_DE). Catches locale-sensitive formatting regressions — e.g. a future
+          # String.format("%.1f", x) without Locale.ROOT would render "120,0" here and fail any
+          # test asserting "120.0". Forward-looking guard: current formatting already pins
+          # Locale.ROOT, so this protects against NEW locale-dependent output rather than a
+          # present bug. Runs in parallel (fail-fast: false), so it adds no wall-clock cost.
+          - jdk: '21'
+            hadoop: '3.4.1'
+            spark-profile: 'spark-4.0'
+            locale: 'de_DE'
           # JDK 25 cell intentionally absent until Spark 4.2 GA ships. JDK 24 removed
           # Subject.getSubject(AccessControlContext); JDK 25 also rejects
           # -Djava.security.manager=allow (JEP 486 finalized). Hadoop UGI — called by
@@ -30,7 +40,12 @@ jobs:
           # Spark 4.2 picks up the upstream migration to Subject.current(); re-add a
           # {jdk:25, hadoop:3.5.x, spark-profile:spark-4.2} cell at that point.
     runs-on: ubuntu-latest
-    name: build (jdk-${{ matrix.jdk }} hadoop-${{ matrix.hadoop }} ${{ matrix.spark-profile }})
+    name: build (jdk-${{ matrix.jdk }} hadoop-${{ matrix.hadoop }} ${{ matrix.spark-profile }}${{ matrix.locale && format(' {0}', matrix.locale) || '' }})
+    # Pin the locale for every step (Maven + all forked test JVMs inherit it). The de_DE cell
+    # exercises a comma-decimal locale; the others use C.UTF-8 for a deterministic baseline.
+    env:
+      LANG: ${{ matrix.locale == 'de_DE' && 'de_DE.UTF-8' || 'C.UTF-8' }}
+      LC_ALL: ${{ matrix.locale == 'de_DE' && 'de_DE.UTF-8' || 'C.UTF-8' }}
     steps:
       - uses: actions/checkout@v4
       - name: Set up JDK ${{ matrix.jdk }}
@@ -39,6 +54,17 @@ jobs:
           distribution: 'temurin'
           java-version: ${{ matrix.jdk }}
           cache: 'maven'
+      - name: Generate de_DE locale
+        if: matrix.locale == 'de_DE'
+        run: sudo locale-gen de_DE.UTF-8 && sudo update-locale
+      - name: Confirm the JVM picked up the de_DE locale
+        if: matrix.locale == 'de_DE'
+        # Make the cell self-verifying: if LANG didn't actually flip the JVM default locale, the
+        # cell would pass vacuously and give false coverage. Fail loudly instead.
+        run: |
+          props=$(java -XshowSettings:properties -version 2>&1 | grep -E 'user\.(language|country)' | tr -d ' ')
+          echo "JVM locale: $props"
+          echo "$props" | grep -q 'user.language=de' || { echo "::error::JVM not running under de locale"; exit 1; }
       - name: Build & test
         # Spotless / google-java-format is pinned at a JDK 21-compatible version; gate the check
         # to that one matrix entry so newer JDKs (25+) don't trip on parser internals.
@@ -47,8 +73,26 @@ jobs:
           -P${{ matrix.spark-profile }}
           -Dhadoop.version=${{ matrix.hadoop }}
           -Dspotless.check.skip=${{ matrix.jdk != '21' }}
+      - name: Smoke-run the benchmark jar
+        # `verify` already shaded cached-fs-bench/target/benchmarks.jar (shade runs in the package
+        # phase), but nothing launches it — so runtime-only regressions escape: a broken shade
+        # manifest, a dropped JMH BenchmarkList, the dnsjava InetAddressResolverProvider SPI fork
+        # failure, or a JDK-fork mismatch (all of which we've hit by hand, never via CI). A tiny
+        # run (no warmup, one 1s measurement, -foe so a benchmark error fails the step) proves
+        # every benchmark actually launches and completes in a forked JVM. Run once, on the plain
+        # spark-4.0 jdk-21 cell (the fork JVM is this cell's JDK 21; profile/locale are irrelevant
+        # to the bench module).
+        if: matrix.jdk == '21' && matrix.spark-profile == 'spark-4.0' && matrix.locale != 'de_DE'
+        run: |
+          java -jar cached-fs-bench/target/benchmarks.jar PrefetchMultiplierBenchmark \
+            -foe true -f 1 -wi 0 -i 1 -r 1 \
+            -p multiplier=4 -p latencyMicros=0 -p pattern=SEQUENTIAL
+          java -jar cached-fs-bench/target/benchmarks.jar AdmissionGateBenchmark \
+            -foe true -f 1 -wi 0 -i 1 -r 1 -p budgetMiB=64
       - name: Upload coverage
-        if: matrix.jdk == '21'
+        # Exclude the de_DE cell: it shares the jdk21/spark-4.0 artifact name with the baseline
+        # cell, and upload-artifact@v4 rejects duplicate names within a run.
+        if: matrix.jdk == '21' && matrix.locale != 'de_DE'
         uses: actions/upload-artifact@v4
         with:
           # Now that two JDK 21 cells exist (spark-4.0 and spark-4.1), include the profile in
