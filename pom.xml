@@ -56,6 +56,10 @@
     <spotless.version>2.43.0</spotless.version>
     <surefire.version>3.5.2</surefire.version>
     <jacoco.version>0.8.12</jacoco.version>
+    <!-- Minimum per-module BUNDLE line coverage enforced by jacoco:check (merged unit+IT). A module
+         may override locally (e.g. <jacoco.check.line.minimum>0</jacoco.check.line.minimum>) if it
+         ever needs to opt out, but the default bar is 80% per testing standards. -->
+    <jacoco.check.line.minimum>0.80</jacoco.check.line.minimum>
     <maven-compiler-plugin.version>3.13.0</maven-compiler-plugin.version>
   </properties>
 
@@ -265,6 +269,33 @@
               <configuration>
                 <dataFile>${project.build.directory}/jacoco-merged.exec</dataFile>
                 <outputDirectory>${project.build.directory}/site/jacoco-merged</outputDirectory>
+              </configuration>
+            </execution>
+            <!-- Coverage gate: each module's BUNDLE line coverage must be >= 80% on the MERGED
+                 (unit+IT) data, enforcing the testing.md bar so coverage can't silently erode.
+                 Declared last so jacoco-merged.exec already exists. Modules with no exec (the parent
+                 pom) are skipped by JaCoCo ("missing execution data file"); cached-fs-bench is
+                 skipped via its jacoco.skip=true (benchmark tooling, not shipped code). The
+                 ${jacoco.check.line.minimum} property lets a single module relax the floor locally
+                 if ever needed without editing this rule. -->
+            <execution>
+              <id>check-coverage</id>
+              <phase>verify</phase>
+              <goals><goal>check</goal></goals>
+              <configuration>
+                <dataFile>${project.build.directory}/jacoco-merged.exec</dataFile>
+                <rules>
+                  <rule>
+                    <element>BUNDLE</element>
+                    <limits>
+                      <limit>
+                        <counter>LINE</counter>
+                        <value>COVEREDRATIO</value>
+                        <minimum>${jacoco.check.line.minimum}</minimum>
+                      </limit>
+                    </limits>
+                  </rule>
+                </rules>
               </configuration>
             </execution>
           </executions>
