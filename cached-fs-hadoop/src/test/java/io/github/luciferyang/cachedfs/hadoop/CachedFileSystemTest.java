@@ -683,6 +683,54 @@ class CachedFileSystemTest {
     }
   }
 
+  @Test
+  @DisplayName("the cached stream honors the InputStream + Seekable + PositionedReadable API")
+  void streamApiSurface(@TempDir java.nio.file.Path dir) throws IOException {
+    byte[] payload = bytes(8 * 1024);
+    java.nio.file.Path file = dir.resolve("api.bin");
+    Files.write(file, payload);
+
+    Configuration conf = defaultConf();
+    conf.setInt(CachedFsConfig.LOAD_QUANTUM_BYTES, 1024);
+    try (CachedFileSystem cfs = newCfs(file.toUri(), conf)) {
+      Path p = new Path(file.toUri());
+      try (FSDataInputStream in = cfs.open(p, 1024)) {
+        // single-byte read() advances position by one and returns an unsigned byte
+        assertThat(in.read()).isEqualTo(payload[0] & 0xff);
+        assertThat(in.getPos()).isEqualTo(1L);
+
+        // bulk read(byte[]) from the current position
+        byte[] buf = new byte[200];
+        int n = in.read(buf);
+        assertThat(n).isPositive();
+        assertThat(buf[0]).isEqualTo(payload[1]);
+
+        // skip advances the position
+        long before = in.getPos();
+        long skipped = in.skip(64);
+        assertThat(skipped).isEqualTo(64L);
+        assertThat(in.getPos()).isEqualTo(before + 64);
+
+        // available() is non-negative
+        assertThat(in.available()).isGreaterThanOrEqualTo(0);
+
+        // seek + positioned readFully do not disturb each other
+        in.seek(4000);
+        assertThat(in.getPos()).isEqualTo(4000L);
+        byte[] slice = new byte[100];
+        in.readFully(2000, slice);
+        for (int i = 0; i < slice.length; i++) {
+          assertThat(slice[i]).isEqualTo(payload[2000 + i]);
+        }
+        // positioned read must not move the stream position
+        assertThat(in.getPos()).isEqualTo(4000L);
+
+        // seekToNewSource is a no-op for the cache (no alternate replica)
+        assertThat(in.seekToNewSource(0)).isFalse();
+      }
+    }
+  }
+
   // --- helpers -------------------------------------------------------------
 
   private static CachedFileSystem newCfs(URI fileUri, Configuration conf) throws IOException {

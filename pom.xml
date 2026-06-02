@@ -234,6 +234,39 @@
               <phase>verify</phase>
               <goals><goal>report-integration</goal></goals>
             </execution>
+            <!-- Merge the unit (jacoco.exec) + IT (jacoco-it.exec) execution data into one file and
+                 report on it, so coverage reflects what BOTH test tiers exercise. The split per-tier
+                 reports understate true coverage (a line hit only by an IT shows as missed in the
+                 unit report); the merged report under target/site/jacoco-merged is the honest
+                 per-module number and the basis for any future coverage gate. Declared after the
+                 per-tier reports so both exec files exist when merge runs (same verify phase, ordered
+                 by declaration). Modules without ITs simply merge jacoco.exec alone. -->
+            <execution>
+              <id>merge-unit-and-it</id>
+              <phase>verify</phase>
+              <goals><goal>merge</goal></goals>
+              <configuration>
+                <destFile>${project.build.directory}/jacoco-merged.exec</destFile>
+                <fileSets>
+                  <fileSet>
+                    <directory>${project.build.directory}</directory>
+                    <includes>
+                      <include>jacoco.exec</include>
+                      <include>jacoco-it.exec</include>
+                    </includes>
+                  </fileSet>
+                </fileSets>
+              </configuration>
+            </execution>
+            <execution>
+              <id>report-merged</id>
+              <phase>verify</phase>
+              <goals><goal>report</goal></goals>
+              <configuration>
+                <dataFile>${project.build.directory}/jacoco-merged.exec</dataFile>
+                <outputDirectory>${project.build.directory}/site/jacoco-merged</outputDirectory>
+              </configuration>
+            </execution>
           </executions>
         </plugin>
       </plugins>

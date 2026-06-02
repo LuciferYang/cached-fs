@@ -165,6 +165,36 @@ class CachedFsBootstrapMBeanTest {
   }
 
   @Test
+  @DisplayName("recentStreams dumps per-stream entries after a closed read populates the ring")
+  void recentStreamsDumpsEntries(@TempDir java.nio.file.Path dir) throws Exception {
+    byte[] payload = new byte[2048];
+    java.nio.file.Path file = dir.resolve("ring.bin");
+    Files.write(file, payload);
+
+    Configuration conf = minimalConf(); // recent-streams capacity defaults to 64 (> 0)
+    try (CachedFileSystem cfs = new CachedFileSystem()) {
+      cfs.initialize(URI.create("file:///"), conf);
+      CacheBootstrap b = CacheBootstrap.get().orElseThrow();
+      CachedFsBootstrapMBean mbean = new CachedFsBootstrapMBean(b);
+
+      // Closing the stream pushes one IoStatisticsSnapshot into the ring.
+      try (FSDataInputStream in = cfs.open(new Path(file.toUri()), 4096)) {
+        in.readFully(0, new byte[2048]);
+      }
+
+      String report = mbean.recentStreams(0);
+      assertThat(report)
+          .contains("=== cached-fs recent-streams ===")
+          .contains("count: 1")
+          .contains("returned: 1")
+          .contains("#0 ")
+          .contains("read-bytes=2048");
+      // A positive cap is honored.
+      assertThat(mbean.recentStreams(5)).contains("returned: 1");
+    }
+  }
+
+  @Test
   @DisplayName("recentStreams rejects a negative limit")
   void recentStreamsRejectsNegativeLimit() throws Exception {
     CacheBootstrap b = CacheBootstrap.installIfNeeded(minimalConf());

@@ -429,6 +429,33 @@ class CacheBootstrapTest {
     return names;
   }
 
+  // --- BlockLocationsProvider staging -------------------------
+
+  @Test
+  @DisplayName("a provider staged BEFORE install is picked up when the bootstrap comes online")
+  void stagedProviderInstalledOnBootstrap() throws IOException {
+    BlockLocationsProvider p = (status, start, len, underlying) -> underlying;
+    // Stage before any install — the spark extension's start-of-session ordering.
+    CacheBootstrap.stageBlockLocationsProvider(p);
+    CacheBootstrap b = CacheBootstrap.installIfNeeded(minimalConf());
+    assertThat(b.blockLocationsProvider()).isSameAs(p);
+  }
+
+  @Test
+  @DisplayName("staging after install delegates to the live setter; null reverts to passthrough")
+  void stageAfterInstallDelegatesToSetter() throws IOException {
+    CacheBootstrap b = CacheBootstrap.installIfNeeded(minimalConf());
+    assertThat(b.blockLocationsProvider()).isNull();
+
+    BlockLocationsProvider p = (status, start, len, underlying) -> underlying;
+    // Bootstrap already installed → stage delegates to setBlockLocationsProvider on the instance.
+    CacheBootstrap.stageBlockLocationsProvider(p);
+    assertThat(b.blockLocationsProvider()).isSameAs(p);
+
+    b.setBlockLocationsProvider(null);
+    assertThat(b.blockLocationsProvider()).isNull();
+  }
+
   private static Configuration minimalConf() {
     Configuration conf = new Configuration(false);
     conf.setBoolean(CachedFsConfig.ENABLED, true);
