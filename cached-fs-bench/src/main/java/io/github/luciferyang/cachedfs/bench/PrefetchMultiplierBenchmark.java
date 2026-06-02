@@ -94,11 +94,18 @@ public class PrefetchMultiplierBenchmark {
   @Param({"SEQUENTIAL", "STRIDED"})
   public Pattern pattern;
 
+  // Prefetch pool size. The multiplier's optimal value is thread-dependent (the budget caps
+  // in-flight chunks, but real concurrency is capped by this pool), so sweeping it is the point of
+  // running on representative hardware — set it to your deployment's prefetch threads. Single
+  // default here so existing single-combo smoke runs are unaffected; override with
+  // `-p prefetchThreads=8,16,32` for the real sweep.
+  @Param({"8"})
+  public int prefetchThreads;
+
   // Fixed knobs — chosen so a single scan is long enough for prefetch to matter yet short enough
-  // for many JMH iterations. 64 MiB / 1 MiB quantum = 64 chunks; 8 prefetch threads.
+  // for many JMH iterations. 64 MiB / 1 MiB quantum = 64 chunks.
   private static final int LOAD_QUANTUM = 1 << 20; // 1 MiB
   private static final long FILE_SIZE = 64L << 20; // 64 MiB
-  private static final int PREFETCH_THREADS = 8;
   private static final int READ_BUFFER = 1 << 20; // consumer reads one quantum at a time
 
   private CachedFileSystem cfs;
@@ -121,7 +128,7 @@ public class PrefetchMultiplierBenchmark {
     conf.set(CachedFsConfig.INNER_IMPL, InMemoryLatencyFileSystem.class.getName());
     conf.setInt(CachedFsConfig.LOAD_QUANTUM_BYTES, LOAD_QUANTUM);
     conf.setBoolean(CachedFsConfig.PREFETCH_ENABLED, true);
-    conf.setInt(CachedFsConfig.PREFETCH_THREADS, PREFETCH_THREADS);
+    conf.setInt(CachedFsConfig.PREFETCH_THREADS, prefetchThreads);
     conf.setInt(CachedFsConfig.PREFETCH_MAX_PENDING_MULTIPLIER, multiplier);
     // Density gate off (threshold 0) so the multiplier — not the density heuristic — is what
     // governs admission in this benchmark.
