@@ -142,6 +142,19 @@ public class PrefetchMultiplierBenchmark {
     this.readBuf = new byte[READ_BUFFER];
   }
 
+  @Setup(Level.Invocation)
+  public void clearCacheBeforeEachScan() {
+    // The RAM cache never auto-evicts (aging is TTL-controller-driven, never invoked here), every
+    // scan() uses a UNIQUE path, and the chunk payload is OFF-HEAP direct memory (allocateDirect).
+    // Without intervention each scan leaks ~64 MiB of direct memory for the fork's life; at low
+    // latency a 2 s iteration is tens of scans (a couple GiB), enough to exhaust the default
+    // MaxDirectMemorySize. clear() drops the refs; the JDK Cleaner reclaims the native memory on
+    // direct-memory pressure, so clearing before EVERY scan (untimed; scans are tens-to-hundreds of
+    // ms, fine for Level.Invocation) keeps the live footprint to roughly one scan and every scan a
+    // genuine cold miss (a unique path is never resident).
+    CacheBootstrap.get().ifPresent(b -> b.ramCache().clear());
+  }
+
   @TearDown(Level.Trial)
   public void tearDown() throws IOException {
     if (cfs != null) {
