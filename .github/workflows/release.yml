@@ -47,7 +47,13 @@ jobs:
       - name: Deploy (sign + upload to Central Portal)
         # Tests already gate the tagged commit via ci.yml, so skip them here for a fast, deterministic
         # publish. Drop -DskipTests if you want the release build to re-run the suite.
-        run: mvn -B -ntp -Prelease -DskipTests clean deploy
+        # -pl restricts the reactor to the five publishable library modules (+ parent via -am); the
+        # benchmark module is left out entirely so it can never reach the Central bundle. (The central
+        # plugin ignores maven.deploy.skip, and excludeArtifacts is only belt-and-suspenders.)
+        run: >-
+          mvn -B -ntp -Prelease -DskipTests
+          -pl cached-fs-core,cached-fs-hadoop,cached-fs-metrics,cached-fs-spark,cached-fs-cli -am
+          clean deploy
         env:
           MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
           MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
