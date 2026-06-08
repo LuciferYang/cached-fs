@@ -430,11 +430,15 @@
             <configuration>
               <!-- Server id in settings.xml that holds the Central Portal user token. -->
               <publishingServerId>central</publishingServerId>
-              <!-- false = upload a validated deployment that you confirm/"Publish" manually on
-                   central.sonatype.com for the first release. Flip to true once you trust the
-                   pipeline to auto-release after validation. -->
+              <!-- false = the deployment is left for you to confirm/"Publish" manually on
+                   central.sonatype.com. Flip to true once you trust the pipeline. -->
               <autoPublish>false</autoPublish>
-              <waitUntil>validated</waitUntil>
+              <!-- 'uploaded' returns once the bundle is uploaded, WITHOUT blocking on validation.
+                   'validated' was discarding the deployment when validation failed, so the
+                   per-component errors were never readable; with 'uploaded' the deployment stays on
+                   the Portal (VALIDATING -> VALIDATED or FAILED) to inspect there. -->
+              <waitUntil>uploaded</waitUntil>
+              <deploymentName>cached-fs ${project.version}</deploymentName>
             </configuration>
           </plugin>
         </plugins>
