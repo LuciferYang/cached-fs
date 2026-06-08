@@ -6,7 +6,7 @@
 
   <groupId>io.github.luciferyang</groupId>
   <artifactId>cached-fs-parent</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
+  <version>0.1.0</version>
   <packaging>pom</packaging>
 
   <name>cached-fs (parent)</name>
@@ -15,7 +15,7 @@
     two-tier (RAM + local SSD) read cache exposed as a transparent
     Hadoop FileSystem decorator.
   </description>
-  <url>https://github.com/luciferyang/cached-fs</url>
+  <url>https://github.com/LuciferYang/cached-fs</url>
 
   <licenses>
     <license>
@@ -24,6 +24,21 @@
       <distribution>repo</distribution>
     </license>
   </licenses>
+
+  <developers>
+    <developer>
+      <id>LuciferYang</id>
+      <name>LuciferYang</name>
+      <url>https://github.com/LuciferYang</url>
+    </developer>
+  </developers>
+
+  <scm>
+    <connection>scm:git:https://github.com/LuciferYang/cached-fs.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/LuciferYang/cached-fs.git</developerConnection>
+    <url>https://github.com/LuciferYang/cached-fs</url>
+    <tag>HEAD</tag>
+  </scm>
 
   <modules>
     <module>cached-fs-core</module>
@@ -345,4 +360,85 @@
       </plugin>
     </plugins>
   </build>
+
+  <profiles>
+    <!-- Activated only for publishing to Maven Central (`mvn -Prelease deploy`, or the release CI
+         workflow). Kept out of the default build so day-to-day `mvn verify` never needs a GPG key
+         or builds javadoc/sources jars. Requires: a verified io.github.luciferyang namespace on the
+         Central Portal, a published GPG signing key, and a `central` server (Portal user token) in
+         settings.xml. cached-fs-bench sets maven.deploy.skip=true so only the library + cli
+         artifacts are published. -->
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <version>3.3.1</version>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals><goal>jar-no-fork</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <version>3.11.2</version>
+            <configuration>
+              <!-- Central requires a javadoc jar; don't let strict doclint or a single bad @link
+                   fail the whole release. -->
+              <doclint>none</doclint>
+              <failOnError>false</failOnError>
+              <quiet>true</quiet>
+            </configuration>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals><goal>jar</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>3.2.7</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals><goal>sign</goal></goals>
+                <configuration>
+                  <!-- Non-interactive signing for CI: read the passphrase from the gpg.passphrase
+                       property (set by setup-java from the GPG_PASSPHRASE secret) via loopback
+                       pinentry instead of a TTY prompt. -->
+                  <gpgArguments>
+                    <arg>--pinentry-mode</arg>
+                    <arg>loopback</arg>
+                  </gpgArguments>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>0.7.0</version>
+            <extensions>true</extensions>
+            <configuration>
+              <!-- Server id in settings.xml that holds the Central Portal user token. -->
+              <publishingServerId>central</publishingServerId>
+              <!-- false = upload a validated deployment that you confirm/"Publish" manually on
+                   central.sonatype.com for the first release. Flip to true once you trust the
+                   pipeline to auto-release after validation. -->
+              <autoPublish>false</autoPublish>
+              <waitUntil>validated</waitUntil>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>

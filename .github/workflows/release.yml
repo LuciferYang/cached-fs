@@ -1,0 +1,43 @@
+name: Release to Maven Central
+
+# Manual trigger so a failed/missing-secret run can never fire automatically on a tag push.
+# To publish: in the Actions tab, run this workflow and pick the tag (e.g. v0.1.0) under
+# "Use workflow from". It builds that exact ref and uploads a signed deployment to the Central
+# Portal. With autoPublish=false (see the release profile), the deployment waits in
+# https://central.sonatype.com for you to click "Publish"; flip autoPublish to true once you trust it.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up JDK 21 + Maven settings + GPG
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          # Writes ~/.m2/settings.xml with a <server id=central> whose username/password read from
+          # the named env vars below — matches <publishingServerId>central</publishingServerId>.
+          server-id: central
+          server-username: MAVEN_CENTRAL_USERNAME
+          server-password: MAVEN_CENTRAL_PASSWORD
+          # Imports the signing key into the runner's keyring; the passphrase env is read by
+          # maven-gpg-plugin (loopback pinentry, configured in the release profile).
+          gpg-private-key: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+
+      - name: Deploy (sign + upload to Central Portal)
+        # Tests already gate the tagged commit via ci.yml, so skip them here for a fast, deterministic
+        # publish. Drop -DskipTests if you want the release build to re-run the suite.
+        run: mvn -B -ntp -Prelease -DskipTests clean deploy
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
