@@ -20,8 +20,9 @@
          reactor build. JaCoCo would otherwise weave the benchmark fork and skew every number; no
          coverage is meaningful for a benchmark module, so disable the agent here. -->
     <jacoco.skip>true</jacoco.skip>
-    <!-- Benchmark tooling, not a shipped artifact: never publish it to Maven Central. The release
-         profile's central-publishing plugin honors maven.deploy.skip and excludes this module. -->
+    <!-- Benchmark tooling, not a shipped artifact. maven.deploy.skip keeps the regular deploy goal
+         off it; the central-publishing plugin ignores that flag, so the parent release profile also
+         lists this module under <excludeArtifacts> to keep it out of the Central bundle. -->
     <maven.deploy.skip>true</maven.deploy.skip>
   </properties>
 

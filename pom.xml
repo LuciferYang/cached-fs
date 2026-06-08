@@ -439,6 +439,15 @@
                    the Portal (VALIDATING -> VALIDATED or FAILED) to inspect there. -->
               <waitUntil>uploaded</waitUntil>
               <deploymentName>cached-fs ${project.version}</deploymentName>
+              <!-- The central plugin does NOT honor maven.deploy.skip — it stages every reactor
+                   module into the bundle regardless. Explicitly drop the benchmark module here so it
+                   never ships to Maven Central (which is immutable). -->
+              <excludeArtifacts>
+                <artifact>
+                  <groupId>io.github.luciferyang</groupId>
+                  <artifactId>cached-fs-bench</artifactId>
+                </artifact>
+              </excludeArtifacts>
             </configuration>
           </plugin>
         </plugins>
