@@ -1,12 +1,18 @@
 name: Release to Maven Central
 
 # Manual trigger so a failed/missing-secret run can never fire automatically on a tag push.
-# To publish: in the Actions tab, run this workflow and pick the tag (e.g. v0.1.0) under
-# "Use workflow from". It builds that exact ref and uploads a signed deployment to the Central
-# Portal. With autoPublish=false (see the release profile), the deployment waits in
-# https://central.sonatype.com for you to click "Publish"; flip autoPublish to true once you trust it.
+# Run this from the DEFAULT branch (main) and pass the tag to publish via the `ref` input — that way
+# the latest workflow definition (with the environment wiring below) is always used, while the build
+# checks out and publishes the exact tagged commit. Signing + Portal credentials come from the
+# `Cached-FS` GitHub Environment. With autoPublish=false (see the release profile), the upload waits
+# in https://central.sonatype.com for you to click "Publish".
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Tag (or ref) to build and publish, e.g. v0.1.0'
+        required: true
+        default: 'v0.1.0'
 
 permissions:
   contents: read
@@ -14,8 +20,13 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # The four MAVEN_* secrets live in this Environment, not at repo level; the job must opt in to
+    # read them.
+    environment: Cached-FS
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Set up JDK 21 + Maven settings + GPG
         uses: actions/setup-java@v5
